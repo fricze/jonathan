@@ -1,140 +1,168 @@
-use std::io::stdout;
+use arboard::Clipboard;
+use iocraft::prelude::*;
+use std::cmp;
 
-use crate::terminal::EnterAlternateScreen;
-use crate::terminal::LeaveAlternateScreen;
-
-use clap::Parser;
-use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
-    execute, terminal,
-};
-use csv::Reader;
-use csv::StringRecord;
-use tui::{
-    Terminal,
-    backend::CrosstermBackend,
-    layout::Constraint,
-    style::Color,
-    style::Modifier,
-    style::Style,
-    widgets::{Block, Borders, Row, Table},
-};
-
-/// CSV TUI Viewer
-#[derive(Parser, Debug)]
-#[command(author, version, about)]
-struct Args {
-    /// Path to the CSV file
-    file: String,
+#[derive(Clone)]
+struct User {
+    id: i32,
+    name: String,
+    email: String,
 }
 
-mod state;
+impl User {
+    fn new(id: i32, name: &str, email: &str) -> Self {
+        Self {
+            id,
+            name: name.to_string(),
+            email: email.to_string(),
+        }
+    }
+}
 
-fn read_csv(path: &str) -> csv::Result<(Vec<Vec<String>>, StringRecord)> {
-    let mut rdr = Reader::from_path(path)?;
-    let mut rows = vec![];
+#[derive(Default, Props)]
+struct UsersTableProps<'a> {
+    users: Option<&'a Vec<User>>,
+}
 
-    let headers = rdr.headers()?.clone();
+#[component]
+fn UsersTable<'a>(mut hooks: Hooks, props: &UsersTableProps<'a>) -> impl Into<AnyElement<'a>> {
+    let length = props.users.as_ref().map_or(0, |users| users.len());
 
-    for result in rdr.records() {
-        let record = result?;
-        rows.push(record.iter().map(String::from).collect());
+    let mut clipboard = Clipboard::new().unwrap();
+
+    let mut system = hooks.use_context_mut::<SystemContext>();
+
+    let (width, height) = hooks.use_terminal_size();
+    let mut selected_rows = hooks.use_state(|| (0, 0));
+    let mut should_exit = hooks.use_state(|| false);
+
+    if should_exit.get() {
+        system.exit();
     }
 
-    Ok((rows, headers))
-}
+    let users = match props.users {
+        Some(users) => users.clone(),
+        None => vec![],
+    };
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let args = Args::parse();
+    hooks.use_terminal_events({
+        move |event| match event {
+            TerminalEvent::Key(KeyEvent {
+                modifiers,
+                code,
+                kind,
+                ..
+            }) if kind != KeyEventKind::Release => {
+                let shift_pressed = modifiers.contains(KeyModifiers::SHIFT);
+                let alt_pressed = modifiers.contains(KeyModifiers::ALT);
+                // let cmd_pressed = modifiers.contains(KeyModifiers::META);
 
-    let (data, headers) = read_csv(&args.file)?;
+                let (up, down) = selected_rows.get();
 
-    let borrowed = data
-        .iter()
-        .map(|inner| inner.iter().map(|s| s.as_str()).collect())
-        .collect::<Vec<Vec<&str>>>();
-
-    let mut app = state::App::new(borrowed);
-
-    // Setup terminal
-    terminal::enable_raw_mode()?;
-    let mut stdout = stdout();
-    // execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let mut row_offset = 0;
-    let mut col_offset = 0;
-
-    loop {
-        terminal.draw(|f| {
-            let size = f.size();
-            let rows: Vec<Row> = data
-                .iter()
-                // .skip(row_offset)
-                // .take(40)
-                .enumerate()
-                .map(|(index, r)| {
-                    let sliced = r.iter().skip(col_offset).take(size.width as usize / 10);
-
-                    if index % 2 == 0 {
-                        Row::new(sliced.cloned().collect::<Vec<String>>())
-                            .style(Style::default().fg(Color::White))
-                    } else {
-                        Row::new(sliced.cloned().collect::<Vec<String>>())
+                match code {
+                    KeyCode::Char('c') => {
+                        let val = users
+                            .clone()
+                            .into_iter()
+                            .skip(up)
+                            .take(down - up + 1)
+                            .map(|user| user.email)
+                            .collect::<Vec<String>>()
+                            .join(", ");
+                        clipboard.set_text(val).unwrap();
                     }
-
-                    // Row::new(sliced.cloned().collect::<Vec<String>>())
-                })
-                .collect();
-
-            let table = Table::new(rows)
-                .block(Block::default().title("CSV Viewer").borders(Borders::ALL))
-                .widths(&[Constraint::Length(10); 10])
-                .style(Style::default())
-                .header(Row::new(headers.into_iter()))
-                .highlight_style(Style::default().add_modifier(Modifier::BOLD))
-                .highlight_symbol(">");
-
-            f.render_stateful_widget(table, size, &mut app.state);
-        })?;
-
-        if event::poll(std::time::Duration::from_millis(200))? {
-            if let Event::Key(key) = event::read()? {
-                match key.code {
-                    KeyCode::Char('q') => break,
-                    KeyCode::Char('j') | KeyCode::Down => {
-                        app.next();
-                        // row_offset += 1;
-                    }
-                    KeyCode::Char('k') | KeyCode::Up => {
-                        app.previous();
-
-                        // if row_offset > 0 {
-                        //     row_offset -= 1;
-                        // }
-                    }
-                    KeyCode::Char('l') | KeyCode::Right => col_offset += 1,
-                    KeyCode::Char('h') | KeyCode::Left => {
-                        if col_offset > 0 {
-                            col_offset -= 1;
+                    KeyCode::Char('q') => should_exit.set(true),
+                    KeyCode::Up => {
+                        if up > 0 {
+                            if shift_pressed {
+                                selected_rows.set((cmp::max(up - 1, 0), down));
+                            } else if alt_pressed {
+                                selected_rows.set((up, cmp::max(down - 1, up)));
+                            } else {
+                                selected_rows.set((cmp::max(up - 1, 0), down - 1));
+                            }
                         }
                     }
+                    KeyCode::Down => {
+                        if shift_pressed {
+                            selected_rows.set((cmp::min(up + 1, down), down));
+                        } else if alt_pressed {
+                            selected_rows.set((up, cmp::min(down + 1, length - 1)));
+                        } else {
+                            selected_rows.set((up + 1, cmp::min(down + 1, length - 1)));
+                        }
+                    }
+                    KeyCode::PageUp => {
+                        selected_rows.set((up - 3, down - 3));
+                    }
+                    KeyCode::PageDown => {
+                        selected_rows.set((up + 3, down + 3));
+                    }
+                    // KeyCode::Left => x.set((x.get() as i32 - 1).max(0) as _),
+                    // KeyCode::Right => x.set((x.get() + 1).min(AREA_WIDTH - FACE.width() as u32)),
                     _ => {}
                 }
             }
+            _ => {}
+        }
+    });
+
+    element! {
+        View(
+            margin_top: 3,
+            margin_bottom: 1,
+            flex_direction: FlexDirection::Column,
+            height: height - 1,
+            width: width,
+            border_style: BorderStyle::Round,
+            border_color: Color::Cyan,
+        ) {
+            View(border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: Color::Grey) {
+                View(width: 20pct, justify_content: JustifyContent::End, padding_right: 2) {
+                    Text(content: "Id", weight: Weight::Bold, decoration: TextDecoration::Underline)
+                }
+
+                View(width: 20pct) {
+                    Text(content: "Name", weight: Weight::Bold, decoration: TextDecoration::Underline)
+                }
+
+                View(width: 20pct) {
+                    Text(content: "Email", weight: Weight::Bold, decoration: TextDecoration::Underline)
+                }
+            }
+
+            #(props.users.map(|users| users.iter().enumerate().map(|(i, user)| element! {
+                View(background_color: if i >= selected_rows.get().0 && i <= selected_rows.get().1 { None } else { Some(Color::DarkGrey) }) {
+                    View(width: 20pct, justify_content: JustifyContent::End, padding_right: 2) {
+                        Text(content: user.id.to_string())
+                    }
+
+                    View(width: 20pct) {
+                        Text(content: user.name.clone())
+                    }
+
+                    View(width: 20pct) {
+                        Text(content: user.email.clone())
+                    }
+                }
+            })).into_iter().flatten())
         }
     }
+}
 
-    // Restore terminal
-    terminal::disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
+fn main() {
+    let users = vec![
+        User::new(1, "Alice", "alice@example.com"),
+        User::new(2, "Bob", "bob@example.com"),
+        User::new(3, "Charlie", "charlie@example.com"),
+        User::new(4, "David", "david@example.com"),
+        User::new(5, "Eve", "eve@example.com"),
+        User::new(6, "Frank", "frank@example.com"),
+        User::new(7, "Grace", "grace@example.com"),
+        User::new(8, "Heidi", "heidi@example.com"),
+    ];
 
-    Ok(())
+    // element!(UsersTable(users: &users)).print();
+
+    smol::block_on(element!(UsersTable(users: &users)).fullscreen()).unwrap();
 }
