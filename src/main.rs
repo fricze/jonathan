@@ -1,32 +1,20 @@
 use arboard::Clipboard;
+use clap::Parser;
+use csv::Reader;
+
+use csv::StringRecord;
 use iocraft::prelude::*;
 use std::cmp;
 
-#[derive(Clone)]
-struct User {
-    id: i32,
-    name: String,
-    email: String,
-}
-
-impl User {
-    fn new(id: i32, name: &str, email: &str) -> Self {
-        Self {
-            id,
-            name: name.to_string(),
-            email: email.to_string(),
-        }
-    }
-}
-
 #[derive(Default, Props)]
-struct UsersTableProps<'a> {
-    users: Option<&'a Vec<User>>,
+struct CsvTableProps {
+    headers: StringRecord,
+    data: Vec<StringRecord>,
 }
 
 #[component]
-fn UsersTable<'a>(mut hooks: Hooks, props: &UsersTableProps<'a>) -> impl Into<AnyElement<'a>> {
-    let length = props.users.as_ref().map_or(0, |users| users.len());
+fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'static>> {
+    let length = props.data.len();
 
     let mut clipboard = Clipboard::new().unwrap();
 
@@ -40,10 +28,7 @@ fn UsersTable<'a>(mut hooks: Hooks, props: &UsersTableProps<'a>) -> impl Into<An
         system.exit();
     }
 
-    let users = match props.users {
-        Some(users) => users.clone(),
-        None => vec![],
-    };
+    let data = props.data.clone();
 
     hooks.use_terminal_events({
         move |event| match event {
@@ -61,12 +46,12 @@ fn UsersTable<'a>(mut hooks: Hooks, props: &UsersTableProps<'a>) -> impl Into<An
 
                 match code {
                     KeyCode::Char('c') => {
-                        let val = users
+                        let val = data
                             .clone()
-                            .into_iter()
+                            .iter()
                             .skip(up)
                             .take(down - up + 1)
-                            .map(|user| user.name + " " + &user.email)
+                            .map(|inner| inner.iter().collect::<Vec<&str>>().join(", "))
                             .collect::<Vec<String>>()
                             .join(", ");
                         clipboard.set_text(val).unwrap();
@@ -118,51 +103,53 @@ fn UsersTable<'a>(mut hooks: Hooks, props: &UsersTableProps<'a>) -> impl Into<An
             border_color: Color::Cyan,
         ) {
             View(border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: Color::Grey) {
-                View(width: 20pct, justify_content: JustifyContent::End, padding_right: 2) {
-                    Text(content: "Id", weight: Weight::Bold, decoration: TextDecoration::Underline)
-                }
-
-                View(width: 20pct) {
-                    Text(content: "Name", weight: Weight::Bold, decoration: TextDecoration::Underline)
-                }
-
-                View(width: 20pct) {
-                    Text(content: "Email", weight: Weight::Bold, decoration: TextDecoration::Underline)
-                }
+                #(props.headers.into_iter().map(|header| element! {
+                    View(width: 20pct, justify_content: JustifyContent::End, padding_right: 2) {
+                        Text(content: header.to_string(), weight: Weight::Bold, decoration: TextDecoration::Underline)
+                    }
+                }))
             }
 
-            #(props.users.map(|users| users.iter().enumerate().map(|(i, user)| element! {
+            #(props.data.iter().take(100).enumerate().map(|(i, row)| element! {
                 View(background_color: if i >= selected_rows.get().0 && i <= selected_rows.get().1 { None } else { Some(Color::DarkGrey) }) {
-                    View(width: 20pct, justify_content: JustifyContent::End, padding_right: 2) {
-                        Text(content: user.id.to_string())
-                    }
-
-                    View(width: 20pct) {
-                        Text(content: user.name.clone())
-                    }
-
-                    View(width: 20pct) {
-                        Text(content: user.email.clone())
-                    }
+                    #(row.iter().map(|cell| element! {
+                        View(width: 20pct, justify_content: JustifyContent::End, padding_right: 2) {
+                            Text(content: cell.to_string())
+                        }
+                    }))
                 }
-            })).into_iter().flatten())
+            }))
         }
     }
 }
 
-fn main() {
-    let users = vec![
-        User::new(1, "Alice", "alice@example.com"),
-        User::new(2, "Bob", "bob@example.com"),
-        User::new(3, "Charlie", "charlie@example.com"),
-        User::new(4, "David", "david@example.com"),
-        User::new(5, "Eve", "eve@example.com"),
-        User::new(6, "Frank", "frank@example.com"),
-        User::new(7, "Grace", "grace@example.com"),
-        User::new(8, "Heidi", "heidi@example.com"),
-    ];
+fn read_csv(path: &str) -> csv::Result<(Vec<StringRecord>, StringRecord)> {
+    let mut rdr = Reader::from_path(path)?;
+    let mut rows = vec![];
 
-    // element!(UsersTable(users: &users)).print();
+    let headers = rdr.headers()?.clone();
 
-    smol::block_on(element!(UsersTable(users: &users)).fullscreen()).unwrap();
+    for result in rdr.records() {
+        let record = result?;
+        rows.push(record);
+    }
+
+    Ok((rows, headers))
+}
+
+#[derive(Parser, Debug)]
+#[command(author, version, about)]
+struct Args {
+    /// Path to the CSV file
+    file: String,
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let args = Args::parse();
+
+    let (data, headers) = read_csv(&args.file)?;
+
+    smol::block_on(element!(CsvTable(headers: headers, data: data)).fullscreen()).unwrap();
+
+    Ok(())
 }
