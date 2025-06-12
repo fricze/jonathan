@@ -66,7 +66,7 @@ fn UsersTable<'a>(mut hooks: Hooks, props: &UsersTableProps<'a>) -> impl Into<An
                             .into_iter()
                             .skip(up)
                             .take(down - up + 1)
-                            .map(|user| user.email)
+                            .map(|user| user.name + " " + &user.email)
                             .collect::<Vec<String>>()
                             .join(", ");
                         clipboard.set_text(val).unwrap();
