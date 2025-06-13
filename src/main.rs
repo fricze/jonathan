@@ -29,6 +29,22 @@ fn get_background(
     }
 }
 
+fn get_color(select_mode: bool, i: usize, selected_rows: (usize, usize), offset: usize) -> Color {
+    let diff = selected_rows.1 - selected_rows.0;
+    let middle = selected_rows.0 + diff / 2;
+    let selected = i == middle - offset;
+
+    if !select_mode {
+        if selected {
+            Color::Yellow
+        } else {
+            Color::White
+        }
+    } else {
+        Color::White
+    }
+}
+
 #[component]
 fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'static>> {
     let length = props.data.len();
@@ -77,15 +93,21 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
                     }
                     KeyCode::Char('q') => should_exit.set(true),
                     KeyCode::Char('s') => select_mode.set(!select_mode.get()),
-                    KeyCode::Home => {
-                        let new_down = down - up;
-                        selected_rows.set((0, new_down));
+                    KeyCode::Home | KeyCode::Char('u') => {
+                        let current_numbers_str = numbers_pressed.clone().to_string();
+                        let move_by = current_numbers_str.parse().unwrap_or(0);
+
+                        let new_down = down - up + move_by;
+                        selected_rows.set((move_by, new_down));
                     }
-                    KeyCode::End => {
+                    KeyCode::End | KeyCode::Char('d') => {
+                        let current_numbers_str = numbers_pressed.clone().to_string();
+                        let move_by = current_numbers_str.parse().unwrap_or(0);
+
                         let distance = down - up;
-                        selected_rows.set((length - distance - 1, length - 1));
+                        selected_rows.set((length - distance - 1 - move_by, length - 1 - move_by));
                     }
-                    KeyCode::Up => {
+                    KeyCode::Up | KeyCode::Char('k') => {
                         let current_numbers_str = numbers_pressed.clone().to_string();
                         let move_by = current_numbers_str.parse().unwrap_or(1);
 
@@ -99,7 +121,7 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
                             }
                         }
                     }
-                    KeyCode::Down => {
+                    KeyCode::Down | KeyCode::Char('j') => {
                         let current_numbers_str = numbers_pressed.clone().to_string();
                         let move_by = current_numbers_str.parse().unwrap_or(1);
 
@@ -197,7 +219,7 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
                 View(background_color: get_background(select_mode.get(), i, selected_rows.get(), offset)) {
                     #(row.iter().map(|cell| element! {
                         View(width: 20pct, justify_content: JustifyContent::End, padding_right: 2) {
-                            Text(content: cell.to_string())
+                            Text(content: cell.to_string(), color: get_color(select_mode.get(), i, selected_rows.get(), offset))
                         }
                     }))
                 }
