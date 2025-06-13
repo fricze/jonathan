@@ -12,6 +12,23 @@ struct CsvTableProps {
     data: Vec<StringRecord>,
 }
 
+fn get_background(
+    select_mode: bool,
+    i: usize,
+    selected_rows: (usize, usize),
+    offset: usize,
+) -> Option<Color> {
+    if !select_mode {
+        return None;
+    }
+
+    if i >= selected_rows.0 - offset && i <= selected_rows.1 - offset {
+        None
+    } else {
+        Some(Color::DarkGrey)
+    }
+}
+
 #[component]
 fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'static>> {
     let length = props.data.len();
@@ -23,6 +40,8 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
     let (width, height) = hooks.use_terminal_size();
     let mut selected_rows = hooks.use_state(|| (0, 0));
     let mut should_exit = hooks.use_state(|| false);
+    let mut select_mode = hooks.use_state(|| false);
+    let mut numbers_pressed = hooks.use_state(|| "".to_string());
 
     if should_exit.get() {
         system.exit();
@@ -57,40 +76,87 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
                         clipboard.set_text(val).unwrap();
                     }
                     KeyCode::Char('q') => should_exit.set(true),
+                    KeyCode::Char('s') => select_mode.set(!select_mode.get()),
+                    KeyCode::Home => {
+                        let new_down = down - up;
+                        selected_rows.set((0, new_down));
+                    }
+                    KeyCode::End => {
+                        let distance = down - up;
+                        selected_rows.set((length - distance - 1, length - 1));
+                    }
                     KeyCode::Up => {
+                        let current_numbers_str = numbers_pressed.clone().to_string();
+                        let move_by = current_numbers_str.parse().unwrap_or(1);
+
                         if up > 0 {
                             if shift_pressed {
-                                selected_rows.set((cmp::max(up - 1, 0), down));
+                                selected_rows.set((cmp::max(up - move_by, 0), down));
                             } else if alt_pressed {
-                                selected_rows.set((up, cmp::max(down - 1, up)));
+                                selected_rows.set((up, cmp::max(down - move_by, up)));
                             } else {
-                                selected_rows.set((cmp::max(up - 1, 0), down - 1));
+                                selected_rows.set((cmp::max(up - move_by, 0), down - move_by));
                             }
                         }
                     }
                     KeyCode::Down => {
+                        let current_numbers_str = numbers_pressed.clone().to_string();
+                        let move_by = current_numbers_str.parse().unwrap_or(1);
+
                         if shift_pressed {
-                            selected_rows.set((cmp::min(up + 1, down), down));
+                            selected_rows.set((cmp::min(up + move_by, down), down));
                         } else if alt_pressed {
-                            selected_rows.set((up, cmp::min(down + 1, length - 1)));
+                            selected_rows.set((up, cmp::min(down + move_by, length - move_by)));
                         } else {
-                            selected_rows.set((up + 1, cmp::min(down + 1, length - 1)));
+                            let distance = down - up;
+                            selected_rows.set((
+                                cmp::min(up + move_by, length - distance - move_by),
+                                cmp::min(down + move_by, length - move_by),
+                            ));
                         }
                     }
                     KeyCode::PageUp => {
-                        selected_rows.set((up - 3, down - 3));
+                        selected_rows.set((cmp::max(up - 10, 0), cmp::max(down - 10, 0)));
                     }
                     KeyCode::PageDown => {
-                        selected_rows.set((up + 3, down + 3));
+                        let distance = down - up;
+                        selected_rows.set((
+                            cmp::min(up + 10, length - distance - 1),
+                            cmp::min(down + 10, length - 1),
+                        ));
                     }
                     // KeyCode::Left => x.set((x.get() as i32 - 1).max(0) as _),
                     // KeyCode::Right => x.set((x.get() + 1).min(AREA_WIDTH - FACE.width() as u32)),
                     _ => {}
                 }
+
+                match code {
+                    KeyCode::Char(c) if c.is_ascii_digit() => {
+                        let mut current_numbers_str = numbers_pressed.clone().to_string();
+                        current_numbers_str.push(c);
+                        numbers_pressed.set(current_numbers_str);
+                    }
+                    _ => {
+                        numbers_pressed.set(String::new());
+                    }
+                }
             }
             _ => {}
         }
     });
+
+    let scroll_start_distance = 20;
+    let (up, down) = selected_rows.get();
+    let selection_middle = (up + down) / 2;
+    let offset = if selection_middle > scroll_start_distance {
+        selection_middle - scroll_start_distance
+    } else {
+        0
+    };
+
+    let visible_rows = props.data.iter().skip(0 + offset).take(40);
+
+    let move_by = numbers_pressed.clone().to_string();
 
     element! {
         View(
@@ -102,6 +168,23 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
             border_style: BorderStyle::Round,
             border_color: Color::Cyan,
         ) {
+
+            View(border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: Color::Grey) {
+                #(if move_by.is_empty() {
+                    element! {
+                        View {
+                            Text(content: "No move")
+                        }
+                    }
+                } else {
+                    element! {
+                        View {
+                            Text(content: "Move by ".to_string() + &move_by)
+                        }
+                    }
+                })
+            }
+
             View(border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: Color::Grey) {
                 #(props.headers.into_iter().map(|header| element! {
                     View(width: 20pct, justify_content: JustifyContent::End, padding_right: 2) {
@@ -110,8 +193,8 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
                 }))
             }
 
-            #(props.data.iter().take(100).enumerate().map(|(i, row)| element! {
-                View(background_color: if i >= selected_rows.get().0 && i <= selected_rows.get().1 { None } else { Some(Color::DarkGrey) }) {
+            #(visible_rows.enumerate().map(|(i, row)| element! {
+                View(background_color: get_background(select_mode.get(), i, selected_rows.get(), offset)) {
                     #(row.iter().map(|cell| element! {
                         View(width: 20pct, justify_content: JustifyContent::End, padding_right: 2) {
                             Text(content: cell.to_string())
