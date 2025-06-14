@@ -4,7 +4,6 @@ use csv::Reader;
 
 use csv::StringRecord;
 use iocraft::prelude::*;
-use rand::distr;
 use std::cmp;
 
 #[derive(Default, Props)]
@@ -48,7 +47,6 @@ fn get_color(select_mode: bool, i: usize, selected_rows: (usize, usize), offset:
 
 #[component]
 fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'static>> {
-    let size = hooks.use_terminal_size();
     let length = props.data.len();
 
     let mut clipboard = Clipboard::new().unwrap();
@@ -181,7 +179,7 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
         }
     });
 
-    let rows_number = size.1 as usize;
+    let rows_number = height as usize;
 
     let scroll_start_distance = rows_number / 2;
     let (up, down) = selected_rows.get();
@@ -196,6 +194,10 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
 
     let move_by = numbers_pressed.clone().to_string();
 
+    let columns = props.headers.len();
+    let column_width = 15;
+    let total_width = columns * column_width;
+
     element! {
         View(
             margin_top: 3,
@@ -203,7 +205,7 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
             flex_direction: FlexDirection::Column,
             flex_wrap: FlexWrap::NoWrap,
             height: height - 1,
-            width: width,
+            width: total_width as u16,
         ) {
             View(border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: Color::Grey) {
                 #(if move_by.is_empty() {
@@ -223,7 +225,7 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
 
             View(border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: Color::Grey) {
                 #(props.headers.into_iter().map(|header| element! {
-                    View(width: 20pct, justify_content: JustifyContent::End, padding_right: 2) {
+                    View(width: 20pct, justify_content: JustifyContent::Start, padding_right: 2) {
                         Text(content: header.to_string(), weight: Weight::Bold, decoration: TextDecoration::Underline)
                     }
                 }))
@@ -232,7 +234,7 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
             #(visible_rows.enumerate().map(|(i, row)| element! {
                 View(background_color: get_background(select_mode.get(), i, selected_rows.get(), offset)) {
                     #(row.iter().map(|cell| element! {
-                        View(width: 20pct, justify_content: JustifyContent::End, padding_right: 2) {
+                        View(width: 20pct, justify_content: JustifyContent::Start, padding_right: 2) {
                             Text(content: cell.to_string(), color: get_color(select_mode.get(), i, selected_rows.get(), offset))
                         }
                     }))
