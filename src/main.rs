@@ -59,11 +59,41 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
     let mut select_mode = hooks.use_state(|| false);
     let mut numbers_pressed = hooks.use_state(|| "".to_string());
 
+    let mut x_offset = hooks.use_state(|| 0 as usize);
+
     if should_exit.get() {
         system.exit();
     }
 
     let data = props.data.clone();
+
+    let rows_number = height as usize;
+
+    let scroll_start_distance = rows_number / 2;
+    let (up, down) = selected_rows.get();
+    let selection_middle = (up + down) / 2;
+    let offset = if selection_middle > scroll_start_distance {
+        selection_middle - scroll_start_distance
+    } else {
+        0
+    };
+
+    let visible_rows = props.data.iter().skip(0 + offset).take(rows_number);
+
+    let move_by = numbers_pressed.clone().to_string();
+
+    let columns_no = props.headers.len();
+    let column_width = 15;
+
+    let visible_columns = columns_no.min(width as usize / column_width);
+
+    let total_width = columns_no * column_width;
+
+    let skip_columns = if total_width > width as usize {
+        x_offset.get()
+    } else {
+        0
+    };
 
     hooks.use_terminal_events({
         move |event| match event {
@@ -79,6 +109,9 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
 
                 let (up, down) = selected_rows.get();
 
+                let current_numbers_str = numbers_pressed.clone().to_string();
+                let user_move = current_numbers_str.parse().unwrap_or(1);
+
                 match code {
                     KeyCode::Char('c') => {
                         let val = data
@@ -93,56 +126,42 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
                     }
                     KeyCode::Char('q') => should_exit.set(true),
                     KeyCode::Char('g') => {
-                        let current_numbers_str = numbers_pressed.clone().to_string();
-                        let move_to = current_numbers_str.parse().unwrap_or(0);
-
                         let distance = down - up;
-                        let bottom = move_to + distance;
+                        let bottom = user_move + distance;
                         if bottom > length {
                             selected_rows.set((length - distance - 1, length - 1));
                         } else {
-                            selected_rows.set((move_to, bottom));
+                            selected_rows.set((user_move, bottom));
                         }
                     }
                     KeyCode::Char('s') => select_mode.set(!select_mode.get()),
                     KeyCode::Home | KeyCode::Char('u') => {
-                        let current_numbers_str = numbers_pressed.clone().to_string();
-                        let move_by = current_numbers_str.parse().unwrap_or(0);
-
-                        let new_down = down - up + move_by;
-                        selected_rows.set((move_by, new_down));
+                        let new_down = down - up + user_move;
+                        selected_rows.set((user_move, new_down));
                     }
                     KeyCode::End | KeyCode::Char('d') => {
-                        let current_numbers_str = numbers_pressed.clone().to_string();
-                        let move_by = current_numbers_str.parse().unwrap_or(0);
-
                         let distance = down - up;
-                        selected_rows.set((length - distance - 1 - move_by, length - 1 - move_by));
+                        selected_rows
+                            .set((length - distance - 1 - user_move, length - 1 - user_move));
                     }
                     KeyCode::Up | KeyCode::Char('k') => {
-                        let current_numbers_str = numbers_pressed.clone().to_string();
-                        let move_by = current_numbers_str.parse().unwrap_or(1);
-
                         if up > 0 {
                             if shift_pressed {
-                                selected_rows.set((cmp::max(up - move_by, 0), down));
+                                selected_rows.set((cmp::max(up - user_move, 0), down));
                             } else if alt_pressed {
-                                selected_rows.set((up, cmp::max(down - move_by, up)));
+                                selected_rows.set((up, cmp::max(down - user_move, up)));
                             } else {
                                 let distance = down - up;
-                                let new_up = up.saturating_sub(move_by);
+                                let new_up = up.saturating_sub(user_move);
                                 selected_rows.set((new_up, new_up + distance));
                             }
                         }
                     }
                     KeyCode::Down | KeyCode::Char('j') => {
-                        let current_numbers_str = numbers_pressed.clone().to_string();
-                        let move_by = current_numbers_str.parse().unwrap_or(1);
-
                         if shift_pressed {
-                            selected_rows.set((cmp::min(up + move_by, down), down));
+                            selected_rows.set((cmp::min(up + user_move, down), down));
                         } else if alt_pressed {
-                            selected_rows.set((up, cmp::min(down + move_by, length - move_by)));
+                            selected_rows.set((up, cmp::min(down + user_move, length - user_move)));
                         } else {
                             let distance = down - up;
                             let new_down = cmp::min(down + 1, length - 1);
@@ -159,8 +178,11 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
                         let new_down = cmp::min(down + 10, length - 1);
                         selected_rows.set((new_down - distance, new_down));
                     }
-                    // KeyCode::Left => x.set((x.get() as i32 - 1).max(0) as _),
-                    // KeyCode::Right => x.set((x.get() + 1).min(AREA_WIDTH - FACE.width() as u32)),
+                    KeyCode::Left => x_offset.set(x_offset.get().saturating_sub(user_move)),
+                    KeyCode::Right => {
+                        let val = x_offset.get() + user_move;
+                        x_offset.set(val.min(columns_no - 1));
+                    }
                     _ => {}
                 }
 
@@ -179,25 +201,6 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
         }
     });
 
-    let rows_number = height as usize;
-
-    let scroll_start_distance = rows_number / 2;
-    let (up, down) = selected_rows.get();
-    let selection_middle = (up + down) / 2;
-    let offset = if selection_middle > scroll_start_distance {
-        selection_middle - scroll_start_distance
-    } else {
-        0
-    };
-
-    let visible_rows = props.data.iter().skip(0 + offset).take(rows_number);
-
-    let move_by = numbers_pressed.clone().to_string();
-
-    let columns = props.headers.len();
-    let column_width = 15;
-    let total_width = columns * column_width;
-
     element! {
         View(
             margin_top: 3,
@@ -205,13 +208,15 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
             flex_direction: FlexDirection::Column,
             flex_wrap: FlexWrap::NoWrap,
             height: height - 1,
-            width: total_width as u16,
+            width: width,
+            // width: total_width as u16,
         ) {
             View(border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: Color::Grey) {
                 #(if move_by.is_empty() {
                     element! {
                         View {
                             Text(content: "No move")
+                            // Text(content: "Total width: ".to_string() + &total_width.to_string() + &" Width: " + &width.to_string())
                         }
                     }
                 } else {
@@ -224,8 +229,8 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
             }
 
             View(border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: Color::Grey) {
-                #(props.headers.into_iter().map(|header| element! {
-                    View(width: 20pct, justify_content: JustifyContent::Start, padding_right: 2) {
+                #(props.headers.into_iter().skip(skip_columns).take(visible_columns).map(|header| element! {
+                    View(width: 15, justify_content: JustifyContent::Start, padding_right: 2) {
                         Text(content: header.to_string(), weight: Weight::Bold, decoration: TextDecoration::Underline)
                     }
                 }))
@@ -233,8 +238,8 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
 
             #(visible_rows.enumerate().map(|(i, row)| element! {
                 View(background_color: get_background(select_mode.get(), i, selected_rows.get(), offset)) {
-                    #(row.iter().map(|cell| element! {
-                        View(width: 20pct, justify_content: JustifyContent::Start, padding_right: 2) {
+                    #(row.iter().skip(skip_columns).take(visible_columns).map(|cell| element! {
+                        View(width: 15, justify_content: JustifyContent::Start, padding_right: 2) {
                             Text(content: cell.to_string(), color: get_color(select_mode.get(), i, selected_rows.get(), offset))
                         }
                     }))
