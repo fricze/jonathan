@@ -147,12 +147,8 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
                             selected_rows.set((up, cmp::min(down + move_by, length - move_by)));
                         } else {
                             let distance = down - up;
-                            let new_down = down + move_by;
-                            if new_down > length {
-                                selected_rows.set((length - distance - 1, length - 1));
-                            } else {
-                                selected_rows.set((up + move_by, new_down));
-                            }
+                            let new_down = cmp::min(down + 1, length - 1);
+                            selected_rows.set((new_down - distance, new_down));
                         }
                     }
                     KeyCode::PageUp => {
@@ -162,10 +158,8 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
                     }
                     KeyCode::PageDown => {
                         let distance = down - up;
-                        selected_rows.set((
-                            cmp::min(up + 10, length - distance - 1),
-                            cmp::min(down + 10, length - 1),
-                        ));
+                        let new_down = cmp::min(down + 10, length - 1);
+                        selected_rows.set((new_down - distance, new_down));
                     }
                     // KeyCode::Left => x.set((x.get() as i32 - 1).max(0) as _),
                     // KeyCode::Right => x.set((x.get() + 1).min(AREA_WIDTH - FACE.width() as u32)),
