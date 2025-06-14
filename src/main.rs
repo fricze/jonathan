@@ -4,6 +4,7 @@ use csv::Reader;
 
 use csv::StringRecord;
 use iocraft::prelude::*;
+use rand::distr;
 use std::cmp;
 
 #[derive(Default, Props)]
@@ -155,7 +156,9 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
                         }
                     }
                     KeyCode::PageUp => {
-                        selected_rows.set((cmp::max(up - 10, 0), cmp::max(down - 10, 0)));
+                        let distance = down - up;
+                        let new_up = up.saturating_sub(10);
+                        selected_rows.set((new_up, new_up + distance));
                     }
                     KeyCode::PageDown => {
                         let distance = down - up;
@@ -204,6 +207,7 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
             margin_top: 3,
             margin_bottom: 1,
             flex_direction: FlexDirection::Column,
+            flex_wrap: FlexWrap::NoWrap,
             height: height - 1,
             width: width,
         ) {
