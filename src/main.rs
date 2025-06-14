@@ -47,6 +47,7 @@ fn get_color(select_mode: bool, i: usize, selected_rows: (usize, usize), offset:
 
 #[component]
 fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'static>> {
+    let size = hooks.use_terminal_size();
     let length = props.data.len();
 
     let mut clipboard = Clipboard::new().unwrap();
@@ -92,6 +93,18 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
                         clipboard.set_text(val).unwrap();
                     }
                     KeyCode::Char('q') => should_exit.set(true),
+                    KeyCode::Char('g') => {
+                        let current_numbers_str = numbers_pressed.clone().to_string();
+                        let move_to = current_numbers_str.parse().unwrap_or(0);
+
+                        let distance = down - up;
+                        let bottom = move_to + distance;
+                        if bottom > length {
+                            selected_rows.set((length - distance - 1, length - 1));
+                        } else {
+                            selected_rows.set((move_to, bottom));
+                        }
+                    }
                     KeyCode::Char('s') => select_mode.set(!select_mode.get()),
                     KeyCode::Home | KeyCode::Char('u') => {
                         let current_numbers_str = numbers_pressed.clone().to_string();
@@ -117,7 +130,9 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
                             } else if alt_pressed {
                                 selected_rows.set((up, cmp::max(down - move_by, up)));
                             } else {
-                                selected_rows.set((cmp::max(up - move_by, 0), down - move_by));
+                                let distance = down - up;
+                                let new_up = up.saturating_sub(move_by);
+                                selected_rows.set((new_up, new_up + distance));
                             }
                         }
                     }
@@ -131,10 +146,12 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
                             selected_rows.set((up, cmp::min(down + move_by, length - move_by)));
                         } else {
                             let distance = down - up;
-                            selected_rows.set((
-                                cmp::min(up + move_by, length - distance - move_by),
-                                cmp::min(down + move_by, length - move_by),
-                            ));
+                            let new_down = down + move_by;
+                            if new_down > length {
+                                selected_rows.set((length - distance - 1, length - 1));
+                            } else {
+                                selected_rows.set((up + move_by, new_down));
+                            }
                         }
                     }
                     KeyCode::PageUp => {
@@ -167,7 +184,9 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
         }
     });
 
-    let scroll_start_distance = 20;
+    let rows_number = size.1 as usize;
+
+    let scroll_start_distance = rows_number / 2;
     let (up, down) = selected_rows.get();
     let selection_middle = (up + down) / 2;
     let offset = if selection_middle > scroll_start_distance {
@@ -176,7 +195,7 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
         0
     };
 
-    let visible_rows = props.data.iter().skip(0 + offset).take(40);
+    let visible_rows = props.data.iter().skip(0 + offset).take(rows_number);
 
     let move_by = numbers_pressed.clone().to_string();
 
@@ -187,10 +206,7 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
             flex_direction: FlexDirection::Column,
             height: height - 1,
             width: width,
-            border_style: BorderStyle::Round,
-            border_color: Color::Cyan,
         ) {
-
             View(border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: Color::Grey) {
                 #(if move_by.is_empty() {
                     element! {
