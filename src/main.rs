@@ -136,10 +136,14 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
                     }
                     KeyCode::Char('s') => select_mode.set(!select_mode.get()),
                     KeyCode::Home | KeyCode::Char('u') => {
+                        let user_move = current_numbers_str.parse().unwrap_or(0);
+
                         let new_down = down - up + user_move;
                         selected_rows.set((user_move, new_down));
                     }
                     KeyCode::End | KeyCode::Char('d') => {
+                        let user_move = current_numbers_str.parse().unwrap_or(0);
+
                         let distance = down - up;
                         selected_rows
                             .set((length - distance - 1 - user_move, length - 1 - user_move));
@@ -164,7 +168,7 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
                             selected_rows.set((up, cmp::min(down + user_move, length - user_move)));
                         } else {
                             let distance = down - up;
-                            let new_down = cmp::min(down + 1, length - 1);
+                            let new_down = cmp::min(down + user_move, length - 1);
                             selected_rows.set((new_down - distance, new_down));
                         }
                     }
