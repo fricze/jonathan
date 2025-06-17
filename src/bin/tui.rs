@@ -10,6 +10,7 @@ use std::cmp;
 struct CsvTableProps {
     headers: StringRecord,
     data: Vec<StringRecord>,
+    filename: String,
 }
 
 fn get_background(
@@ -223,7 +224,11 @@ fn CsvTable(mut hooks: Hooks, props: &CsvTableProps) -> impl Into<AnyElement<'st
             View(border_style: BorderStyle::Single, border_edges: Edges::Bottom, border_color: Color::Grey) {
                 #(if move_by.is_empty() {
                     element! {
-                        View {
+                        View(
+                            flex_direction: FlexDirection::Column,
+                            gap: 1,
+                        ) {
+                            Text(content: format!("CSV reader :: {}", props.filename), color: Color::Cyan)
                             Text(content: "No move")
                             // Text(content: "Total width: ".to_string() + &total_width.to_string() + &" Width: " + &width.to_string())
                         }
@@ -283,7 +288,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let (data, headers) = read_csv(&args.file)?;
 
-    smol::block_on(element!(CsvTable(headers: headers, data: data)).fullscreen()).unwrap();
+    smol::block_on(
+        element!(CsvTable(headers: headers, data: data, filename: args.file)).fullscreen(),
+    )
+    .unwrap();
 
     Ok(())
 }

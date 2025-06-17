@@ -63,6 +63,8 @@ impl Default for MyApp {
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
+            ui.label(format!("CSV reader :: {}", self.filename));
+
             let mut table = TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true)
