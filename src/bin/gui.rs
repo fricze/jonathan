@@ -1,8 +1,13 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
-#![allow(rustdoc::missing_crate_level_docs)] // it's an example
 
 use clap::Parser;
 use csv::StringRecord;
+use egui::Key;
+use std::{
+    collections::HashSet,
+    ops::{Add, Sub},
+};
+
 use egui_extras::{Column, TableBuilder};
 
 use eframe::egui;
@@ -33,29 +38,46 @@ fn main() -> eframe::Result {
 
     let app = MyApp {
         filename: args.file,
-        headers,
+        headers: headers
+            .into_iter()
+            .map(|name| FileHeader {
+                name: name.to_string(),
+                visible: true,
+            })
+            .collect(),
         data,
+        scroll_y: 0.0,
+        inner_rect: 0.0,
     };
 
     eframe::run_native(
-        "My egui App",
+        &format!("Jonathan CSV Reader. File: {}", app.filename),
         options,
         Box::new(|_cc| Ok(Box::<MyApp>::new(app))),
     )
 }
 
+struct FileHeader {
+    name: String,
+    visible: bool,
+}
+
 struct MyApp {
     filename: String,
-    headers: StringRecord,
+    headers: Vec<FileHeader>,
     data: Vec<StringRecord>,
+    scroll_y: f32,
+    inner_rect: f32,
 }
 
 impl Default for MyApp {
     fn default() -> Self {
         Self {
             filename: "data.csv".to_owned(),
-            headers: StringRecord::default(),
+            headers: Vec::new(),
             data: Vec::new(),
+            scroll_y: 0.0,
+            inner_rect: 0.0,
         }
     }
 }
@@ -63,38 +85,72 @@ impl Default for MyApp {
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label(format!("CSV reader :: {}", self.filename));
+            ui.label(format!(
+                "CSV reader :: {}, {}",
+                self.filename, self.scroll_y
+            ));
+
+            ui.horizontal(|ui| {
+                for file_header in self.headers.iter_mut() {
+                    ui.checkbox(&mut file_header.visible, &file_header.name)
+                        .on_hover_text(format!("Show/hide column {}", file_header.name));
+                }
+            });
+
+            ui.separator();
 
             let mut table = TableBuilder::new(ui)
                 .striped(true)
                 .resizable(true)
                 .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                 .min_scrolled_height(0.0);
-            // .max_scroll_height(500.0);
 
-            for _ in 0..self.headers.len() {
-                table = table.column(Column::auto());
+            let mut hidden = HashSet::new();
+
+            for (index, file_header) in self.headers.iter().enumerate() {
+                if file_header.visible {
+                    table = table.column(Column::auto());
+                } else {
+                    hidden.insert(index);
+                }
             }
 
-            table
-                .header(20.0, |mut header| {
-                    self.headers.iter().for_each(|content| {
-                        header.col(|ui| {
-                            ui.heading(content);
-                        });
+            if ctx.input(|i| i.key_pressed(Key::PageUp)) {
+                table =
+                    table.vertical_scroll_offset(self.scroll_y.sub(self.inner_rect / 2.0).max(0.0));
+            }
+
+            if ctx.input(|i| i.key_pressed(Key::PageDown)) {
+                table = table.vertical_scroll_offset(self.scroll_y.add(self.inner_rect / 2.0));
+            }
+
+            let table_ui = table.header(20.0, |mut header| {
+                for file_header in self.headers.iter().filter(|header| header.visible) {
+                    header.col(|ui| {
+                        ui.heading(&file_header.name);
                     });
-                })
-                .body(|mut body| {
-                    for row_data in &self.data {
-                        body.row(20.0, |mut row| {
-                            row_data.iter().for_each(|data| {
+                }
+            });
+
+            let scroll_area = table_ui.body(|mut body| {
+                for row_data in &self.data {
+                    body.row(20.0, |mut row| {
+                        row_data
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| !hidden.contains(index))
+                            .for_each(|(_, data)| {
                                 row.col(|ui| {
                                     ui.label(data);
                                 });
                             });
-                        });
-                    }
-                });
+                    });
+                }
+            });
+
+            let offset = scroll_area.state.offset[1];
+            self.scroll_y = offset;
+            self.inner_rect = scroll_area.inner_rect.height();
         });
     }
 }
