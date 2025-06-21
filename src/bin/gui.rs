@@ -48,6 +48,8 @@ fn main() -> eframe::Result {
         data,
         scroll_y: 0.0,
         inner_rect: 0.0,
+        content_height: 0.0,
+        filter: "".to_owned(),
     };
 
     eframe::run_native(
@@ -68,6 +70,8 @@ struct MyApp {
     data: Vec<StringRecord>,
     scroll_y: f32,
     inner_rect: f32,
+    content_height: f32,
+    filter: String,
 }
 
 impl Default for MyApp {
@@ -78,6 +82,8 @@ impl Default for MyApp {
             data: Vec::new(),
             scroll_y: 0.0,
             inner_rect: 0.0,
+            content_height: 0.0,
+            filter: "".to_owned(),
         }
     }
 }
@@ -96,6 +102,10 @@ impl eframe::App for MyApp {
                         .on_hover_text(format!("Show/hide column {}", file_header.name));
                 }
             });
+
+            ui.separator();
+
+            ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Write something here"));
 
             ui.separator();
 
@@ -124,6 +134,14 @@ impl eframe::App for MyApp {
                 table = table.vertical_scroll_offset(self.scroll_y.add(self.inner_rect / 2.0));
             }
 
+            if ctx.input(|i| i.key_pressed(Key::Home)) {
+                table = table.vertical_scroll_offset(0.0);
+            }
+
+            if ctx.input(|i| i.key_pressed(Key::End)) {
+                table = table.vertical_scroll_offset(self.content_height);
+            }
+
             let table_ui = table.header(20.0, |mut header| {
                 for file_header in self.headers.iter().filter(|header| header.visible) {
                     header.col(|ui| {
@@ -133,7 +151,14 @@ impl eframe::App for MyApp {
             });
 
             let scroll_area = table_ui.body(|mut body| {
-                for row_data in &self.data {
+                let rows = &self.data;
+                let filtered_rows = rows.iter().filter(|row| {
+                    row.iter()
+                        .find(|text| text.contains(&self.filter))
+                        .is_some()
+                });
+
+                for row_data in filtered_rows {
                     body.row(20.0, |mut row| {
                         row_data
                             .iter()
@@ -147,6 +172,10 @@ impl eframe::App for MyApp {
                     });
                 }
             });
+
+            let content_height = scroll_area.content_size[1];
+
+            self.content_height = content_height;
 
             let offset = scroll_area.state.offset[1];
             self.scroll_y = offset;
