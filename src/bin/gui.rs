@@ -172,57 +172,59 @@ impl eframe::App for MyApp {
                 table = table.vertical_scroll_offset(self.content_height);
             }
 
-            if let Some(headers) = self.headers.as_ref() {
-                let mut hidden = HashSet::new();
+            let empty_headers: Vec<FileHeader> = vec![];
+            let headers = self.headers.as_ref().unwrap_or(&empty_headers);
 
-                for (index, file_header) in headers.iter().enumerate() {
-                    if file_header.visible {
-                        table = table.column(Column::auto());
-                    } else {
-                        hidden.insert(index);
-                    }
-                }
+            let mut hidden = HashSet::new();
 
-                let table_ui = table.header(20.0, |mut header| {
-                    for file_header in headers.iter().filter(|header| header.visible) {
-                        header.col(|ui| {
-                            ui.heading(&file_header.name);
-                        });
-                    }
-                });
-
-                if let Some(data) = self.data.as_ref() {
-                    let scroll_area = table_ui.body(|mut body| {
-                        let filtered_rows = data.iter().filter(|row| {
-                            row.iter()
-                                .find(|text| text.contains(&self.filter))
-                                .is_some()
-                        });
-
-                        for row_data in filtered_rows {
-                            body.row(20.0, |mut row| {
-                                row_data
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(index, _)| !hidden.contains(index))
-                                    .for_each(|(_, data)| {
-                                        row.col(|ui| {
-                                            ui.label(data);
-                                        });
-                                    });
-                            });
-                        }
-                    });
-
-                    let content_height = scroll_area.content_size[1];
-
-                    self.content_height = content_height;
-
-                    let offset = scroll_area.state.offset[1];
-                    self.scroll_y = offset;
-                    self.inner_rect = scroll_area.inner_rect.height();
+            for (index, file_header) in headers.iter().enumerate() {
+                if file_header.visible {
+                    table = table.column(Column::auto());
+                } else {
+                    hidden.insert(index);
                 }
             }
+
+            let table_ui = table.header(20.0, |mut header| {
+                for file_header in headers.iter().filter(|header| header.visible) {
+                    header.col(|ui| {
+                        ui.heading(&file_header.name);
+                    });
+                }
+            });
+
+            let empty_data: Vec<StringRecord> = vec![];
+            let data = self.data.as_ref().unwrap_or(&empty_data);
+
+            let scroll_area = table_ui.body(|mut body| {
+                let filtered_rows = data.iter().filter(|row| {
+                    row.iter()
+                        .find(|text| text.contains(&self.filter))
+                        .is_some()
+                });
+
+                for row_data in filtered_rows {
+                    body.row(20.0, |mut row| {
+                        row_data
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| !hidden.contains(index))
+                            .for_each(|(_, data)| {
+                                row.col(|ui| {
+                                    ui.label(data);
+                                });
+                            });
+                    });
+                }
+            });
+
+            let content_height = scroll_area.content_size[1];
+
+            self.content_height = content_height;
+
+            let offset = scroll_area.state.offset[1];
+            self.scroll_y = offset;
+            self.inner_rect = scroll_area.inner_rect.height();
         });
     }
 }
