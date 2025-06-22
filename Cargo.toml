@@ -11,8 +11,14 @@ path = "src/bin/gui.rs"
 name = "tui"
 path = "src/bin/tui.rs"
 
+[[bin]]
+name = "re_gui"
+path = "src/bin/re_gui.rs"
 
 [dependencies]
+egui_file = "0.22.1"
+tinyfiledialogs = "3.0"
+gpui = { git = "https://github.com/zed-industries/zed" }
 crossterm = "0.27"
 csv = "1.3"
 clap = { version = "4", features = ["derive"] }
