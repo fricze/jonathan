@@ -1,8 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
-use clap::Parser;
 use csv::StringRecord;
-use egui::Key;
+use egui::{Event, Key};
 use egui_file::FileDialog;
 use std::{
     collections::HashSet,
@@ -18,31 +17,14 @@ use egui_extras::{Column, TableBuilder};
 use eframe::egui;
 use jonathan::read_csv;
 
-#[derive(Parser, Debug)]
-#[command(author, version, about)]
-struct Args {
-    /// Path to the CSV file
-    file: String,
-}
-
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default().with_inner_size([320.0, 240.0]),
         ..Default::default()
     };
 
-    let args = Args::parse();
-
-    let (data, headers) = match read_csv::read_csv(&args.file) {
-        Ok((data, headers)) => (data, headers),
-        Err(err) => {
-            eprintln!("Error reading CSV file: {}", err);
-            std::process::exit(1);
-        }
-    };
-
     let app = MyApp {
-        filename: args.file,
+        filename: "".to_owned(),
         // headers: Some(
         //     headers
         //         .into_iter()
@@ -63,11 +45,9 @@ fn main() -> eframe::Result {
         open_file_dialog: None,
     };
 
-    eframe::run_native(
-        &format!("Jonathan CSV Reader. File: {}", app.filename),
-        options,
-        Box::new(|_cc| Ok(Box::<MyApp>::new(app))),
-    )
+    let title = &format!("CSV Reader. {}", app.filename);
+
+    eframe::run_native(title, options, Box::new(|_cc| Ok(Box::<MyApp>::new(app))))
 }
 
 struct FileHeader {
@@ -119,6 +99,11 @@ impl eframe::App for MyApp {
                         self.opened_file = Some(file.to_path_buf());
 
                         let path = file.to_path_buf();
+
+                        let file_name = path.file_name().map_or("".to_string(), |name| {
+                            name.to_str().unwrap_or("").to_string()
+                        });
+
                         let read_path = path.to_str().unwrap_or("");
 
                         match read_csv::read_csv(&read_path) {
@@ -133,6 +118,8 @@ impl eframe::App for MyApp {
                                         })
                                         .collect(),
                                 );
+
+                                ctx.send_viewport_cmd(egui::ViewportCommand::Title(file_name));
                             }
                             Err(err) => {
                                 eprintln!("Error reading CSV file: {}", err);
