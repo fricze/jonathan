@@ -1,15 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
 use csv::StringRecord;
-use egui::{Event, Key};
-use egui_file::FileDialog;
+use egui::Key;
+use std::path::PathBuf;
 use std::{
     collections::HashSet,
     ops::{Add, Sub},
-};
-use std::{
-    ffi::OsStr,
-    path::{Path, PathBuf},
 };
 
 use egui_extras::{Column, TableBuilder};
@@ -19,30 +15,22 @@ use jonathan::read_csv;
 
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default().with_inner_size([320.0, 240.0]),
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([640.0, 240.0]) // wide enough for the drag-drop overlay text
+            .with_drag_and_drop(true),
         ..Default::default()
     };
 
     let app = MyApp {
         filename: "".to_owned(),
-        // headers: Some(
-        //     headers
-        //         .into_iter()
-        //         .map(|name| FileHeader {
-        //             name: name.to_string(),
-        //             visible: true,
-        //         })
-        //         .collect(),
-        // ),
-        // data: Some(data),
         headers: None,
         data: None,
         scroll_y: 0.0,
         inner_rect: 0.0,
         content_height: 0.0,
         filter: "".to_owned(),
-        opened_file: None,
-        open_file_dialog: None,
+        dropped_files: Vec::new(),
+        picked_path: None,
     };
 
     let title = &format!("CSV Reader. {}", app.filename);
@@ -64,8 +52,63 @@ struct MyApp {
     inner_rect: f32,
     content_height: f32,
     filter: String,
-    opened_file: Option<PathBuf>,
-    open_file_dialog: Option<FileDialog>,
+    dropped_files: Vec<egui::DroppedFile>,
+    picked_path: Option<String>,
+}
+
+fn open_csv_file(app: &mut MyApp, path: &str) {
+    match read_csv::read_csv(path) {
+        Ok((data, headers)) => {
+            app.data = Some(data);
+            app.headers = Some(
+                headers
+                    .into_iter()
+                    .map(|name| FileHeader {
+                        name: name.to_string(),
+                        visible: true,
+                    })
+                    .collect(),
+            );
+        }
+        Err(err) => {
+            eprintln!("Error reading CSV file: {}", err);
+            std::process::exit(1);
+        }
+    };
+}
+
+fn preview_files_being_dropped(ctx: &egui::Context) {
+    use egui::{Align2, Color32, Id, LayerId, Order, TextStyle};
+    use std::fmt::Write as _;
+
+    if !ctx.input(|i| i.raw.hovered_files.is_empty()) {
+        let text = ctx.input(|i| {
+            let mut text = "Dropping files:\n".to_owned();
+            for file in &i.raw.hovered_files {
+                if let Some(path) = &file.path {
+                    write!(text, "\n{}", path.display()).ok();
+                } else if !file.mime.is_empty() {
+                    write!(text, "\n{}", file.mime).ok();
+                } else {
+                    text += "\n???";
+                }
+            }
+            text
+        });
+
+        let painter =
+            ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("file_drop_target")));
+
+        let screen_rect = ctx.screen_rect();
+        painter.rect_filled(screen_rect, 0.0, Color32::from_black_alpha(192));
+        painter.text(
+            screen_rect.center(),
+            Align2::CENTER_CENTER,
+            text,
+            TextStyle::Heading.resolve(&ctx.style()),
+            Color32::WHITE,
+        );
+    }
 }
 
 impl eframe::App for MyApp {
@@ -82,52 +125,59 @@ impl eframe::App for MyApp {
                 });
             }
 
-            if (ui.button("Open")).clicked() {
-                let filter = Box::new({
-                    let ext = Some(OsStr::new("csv"));
-                    move |path: &Path| -> bool { path.extension() == ext }
-                });
-                let mut dialog =
-                    FileDialog::open_file(self.opened_file.clone()).show_files_filter(filter);
-                dialog.open();
-                self.open_file_dialog = Some(dialog);
+            ui.label("Drag-and-drop files onto the window!");
+
+            if ui.button("Open file…").clicked() {
+                if let Some(path) = rfd::FileDialog::new().pick_file() {
+                    let str_path = path.to_str().unwrap_or("");
+                    let file_name = path.display().to_string();
+                    self.picked_path = Some(file_name.clone());
+
+                    open_csv_file(self, str_path);
+
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Title(file_name));
+                }
             }
 
-            if let Some(dialog) = &mut self.open_file_dialog {
-                if dialog.show(ctx).selected() {
-                    if let Some(file) = dialog.path() {
-                        self.opened_file = Some(file.to_path_buf());
+            if let Some(picked_path) = &self.picked_path {
+                ui.horizontal(|ui| {
+                    ui.label("Picked file:");
+                    ui.monospace(picked_path);
+                });
+            }
 
-                        let path = file.to_path_buf();
+            if !self.dropped_files.is_empty() {
+                ui.group(|ui| {
+                    ui.label("Dropped files:");
 
-                        let file_name = path.file_name().map_or("".to_string(), |name| {
-                            name.to_str().unwrap_or("").to_string()
-                        });
-
-                        let read_path = path.to_str().unwrap_or("");
-
-                        match read_csv::read_csv(&read_path) {
-                            Ok((data, headers)) => {
-                                self.data = Some(data);
-                                self.headers = Some(
-                                    headers
-                                        .into_iter()
-                                        .map(|name| FileHeader {
-                                            name: name.to_string(),
-                                            visible: true,
-                                        })
-                                        .collect(),
-                                );
-
-                                ctx.send_viewport_cmd(egui::ViewportCommand::Title(file_name));
-                            }
-                            Err(err) => {
-                                eprintln!("Error reading CSV file: {}", err);
-                                std::process::exit(1);
-                            }
+                    for file in &self.dropped_files {
+                        let mut info = if let Some(path) = &file.path {
+                            path.display().to_string()
+                        } else if !file.name.is_empty() {
+                            file.name.clone()
+                        } else {
+                            "???".to_owned()
                         };
+
+                        let mut additional_info = vec![];
+
+                        if file.mime != "csv" {
+                            additional_info.push(format!("type: {}", file.mime));
+                        }
+
+                        if !file.mime.is_empty() {
+                            additional_info.push(format!("type: {}", file.mime));
+                        }
+                        if let Some(bytes) = &file.bytes {
+                            additional_info.push(format!("{} bytes", bytes.len()));
+                        }
+                        if !additional_info.is_empty() {
+                            info += &format!(" ({})", additional_info.join(", "));
+                        }
+
+                        ui.label(info);
                     }
-                }
+                });
             }
 
             ui.separator();
@@ -213,5 +263,28 @@ impl eframe::App for MyApp {
             self.scroll_y = offset;
             self.inner_rect = scroll_area.inner_rect.height();
         });
+
+        preview_files_being_dropped(ctx);
+
+        let mut file_name = None;
+        // Collect dropped files:
+        ctx.input(|i| {
+            if !i.raw.dropped_files.is_empty() {
+                let files = &i.raw.dropped_files;
+                self.dropped_files.clone_from(files);
+
+                let default_path = PathBuf::default();
+                let path = files[0].path.as_ref().unwrap_or(&default_path);
+                file_name = Some(path.display().to_string());
+
+                let str_path = path.to_str().unwrap_or("");
+
+                open_csv_file(self, str_path);
+            }
+        });
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(
+            file_name.unwrap_or("".to_string()),
+        ));
     }
 }
