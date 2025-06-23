@@ -2,13 +2,14 @@
 
 use csv::StringRecord;
 use egui::Key;
+use egui::scroll_area::ScrollAreaOutput;
 use std::path::PathBuf;
 use std::{
     collections::HashSet,
     ops::{Add, Sub},
 };
 
-use egui_extras::{Column, TableBuilder};
+use egui_extras::{Column, Table, TableBuilder};
 
 use eframe::egui;
 use jonathan::read_csv;
@@ -111,6 +112,69 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
     }
 }
 
+fn display_table(
+    table_ui: Table,
+    filter: &str,
+    data: &Vec<StringRecord>,
+    hidden: HashSet<usize>,
+) -> ScrollAreaOutput<()> {
+    return table_ui.body(|mut body| {
+        let filtered_rows = data
+            .iter()
+            .filter(|row| row.iter().find(|text| text.contains(filter)).is_some());
+
+        for row_data in filtered_rows {
+            body.row(20.0, |mut row| {
+                row_data
+                    .iter()
+                    .enumerate()
+                    .filter(|(index, _)| !hidden.contains(index))
+                    .for_each(|(_, data)| {
+                        row.col(|ui| {
+                            ui.label(data);
+                        });
+                    });
+            });
+        }
+    });
+}
+
+fn show_dropped_files(ui: &mut egui::Ui, dropped_files: &Vec<egui::DroppedFile>) {
+    if !dropped_files.is_empty() {
+        ui.group(|ui| {
+            ui.label("Dropped files:");
+
+            for file in dropped_files {
+                let mut info = if let Some(path) = &file.path {
+                    path.display().to_string()
+                } else if !file.name.is_empty() {
+                    file.name.clone()
+                } else {
+                    "???".to_owned()
+                };
+
+                let mut additional_info = vec![];
+
+                if file.mime != "csv" {
+                    additional_info.push(format!("type: {}", file.mime));
+                }
+
+                if !file.mime.is_empty() {
+                    additional_info.push(format!("type: {}", file.mime));
+                }
+                if let Some(bytes) = &file.bytes {
+                    additional_info.push(format!("{} bytes", bytes.len()));
+                }
+                if !additional_info.is_empty() {
+                    info += &format!(" ({})", additional_info.join(", "));
+                }
+
+                ui.label(info);
+            }
+        });
+    }
+}
+
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -146,39 +210,7 @@ impl eframe::App for MyApp {
                 });
             }
 
-            if !self.dropped_files.is_empty() {
-                ui.group(|ui| {
-                    ui.label("Dropped files:");
-
-                    for file in &self.dropped_files {
-                        let mut info = if let Some(path) = &file.path {
-                            path.display().to_string()
-                        } else if !file.name.is_empty() {
-                            file.name.clone()
-                        } else {
-                            "???".to_owned()
-                        };
-
-                        let mut additional_info = vec![];
-
-                        if file.mime != "csv" {
-                            additional_info.push(format!("type: {}", file.mime));
-                        }
-
-                        if !file.mime.is_empty() {
-                            additional_info.push(format!("type: {}", file.mime));
-                        }
-                        if let Some(bytes) = &file.bytes {
-                            additional_info.push(format!("{} bytes", bytes.len()));
-                        }
-                        if !additional_info.is_empty() {
-                            info += &format!(" ({})", additional_info.join(", "));
-                        }
-
-                        ui.label(info);
-                    }
-                });
-            }
+            show_dropped_files(ui, &self.dropped_files);
 
             ui.separator();
 
@@ -233,27 +265,7 @@ impl eframe::App for MyApp {
             let empty_data: Vec<StringRecord> = vec![];
             let data = self.data.as_ref().unwrap_or(&empty_data);
 
-            let scroll_area = table_ui.body(|mut body| {
-                let filtered_rows = data.iter().filter(|row| {
-                    row.iter()
-                        .find(|text| text.contains(&self.filter))
-                        .is_some()
-                });
-
-                for row_data in filtered_rows {
-                    body.row(20.0, |mut row| {
-                        row_data
-                            .iter()
-                            .enumerate()
-                            .filter(|(index, _)| !hidden.contains(index))
-                            .for_each(|(_, data)| {
-                                row.col(|ui| {
-                                    ui.label(data);
-                                });
-                            });
-                    });
-                }
-            });
+            let scroll_area = display_table(table_ui, &self.filter, data, hidden);
 
             let content_height = scroll_area.content_size[1];
 
