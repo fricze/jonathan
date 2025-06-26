@@ -15,3 +15,11 @@ pub fn read_csv(path: &str) -> csv::Result<(Vec<StringRecord>, StringRecord)> {
 
     Ok((rows, headers))
 }
+
+pub fn iterate_csv(path: &str) -> csv::Result<(Reader<std::fs::File>, StringRecord)> {
+    let mut rdr = Reader::from_path(path)?;
+
+    let headers = rdr.headers()?.clone();
+
+    Ok((rdr, headers))
+}

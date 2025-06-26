@@ -3,6 +3,7 @@
 use csv::StringRecord;
 use egui::Key;
 use egui::scroll_area::ScrollAreaOutput;
+use std::fs::File;
 use std::path::PathBuf;
 use std::{
     collections::HashSet,
@@ -32,6 +33,9 @@ fn main() -> eframe::Result {
         filter: "".to_owned(),
         dropped_files: Vec::new(),
         picked_path: None,
+        page: 0,
+        loading: false,
+        reader: None,
     };
 
     let title = &format!("CSV Reader. {}", app.filename);
@@ -55,12 +59,15 @@ struct MyApp {
     filter: String,
     dropped_files: Vec<egui::DroppedFile>,
     picked_path: Option<String>,
+    page: usize,
+    loading: bool,
+    reader: Option<csv::Reader<File>>,
 }
 
 fn open_csv_file(app: &mut MyApp, path: &str) {
-    match read_csv::read_csv(path) {
-        Ok((data, headers)) => {
-            app.data = Some(data);
+    match read_csv::iterate_csv(path) {
+        Ok((csv_reader, headers)) => {
+            app.reader = Some(csv_reader);
             app.headers = Some(
                 headers
                     .into_iter()
@@ -178,7 +185,14 @@ fn show_dropped_files(ui: &mut egui::Ui, dropped_files: &Vec<egui::DroppedFile>)
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label(format!("CSV reader :: {}", self.filename));
+            ui.label(format!(
+                "CSV reader :: {}, {}, {}, {}, {}",
+                self.filename,
+                self.content_height,
+                self.inner_rect.add(self.scroll_y),
+                self.page,
+                self.loading
+            ));
 
             if let Some(headers) = self.headers.as_mut() {
                 ui.horizontal(|ui| {
@@ -191,6 +205,34 @@ impl eframe::App for MyApp {
 
             ui.label("Drag-and-drop files onto the window!");
 
+            if let Some(picked_path) = &self.picked_path {
+                if self.inner_rect.add(self.scroll_y) >= self.content_height {
+                    let page_no = self.page + 1;
+
+                    let page_size = 100;
+                    // Reader keeps state, so if I've taken some amount of records already
+                    // from it, I should not call .skip when taking next records.
+                    // The position is already moved.
+                    let data = self.reader.as_mut().unwrap().records().take(page_size);
+                    let filtered_data = data
+                        .filter_map(|record| match record {
+                            Ok(result) => Some(result),
+                            Err(_) => None,
+                        })
+                        .collect::<Vec<_>>();
+
+                    if !filtered_data.is_empty() {
+                        self.data.as_mut().unwrap().extend(filtered_data);
+                        self.page = page_no;
+                    }
+                }
+
+                ui.horizontal(|ui| {
+                    ui.label("Picked file:");
+                    ui.monospace(picked_path);
+                });
+            }
+
             if ui.button("Open file…").clicked() {
                 if let Some(path) = rfd::FileDialog::new().pick_file() {
                     let str_path = path.to_str().unwrap_or("");
@@ -199,15 +241,19 @@ impl eframe::App for MyApp {
 
                     open_csv_file(self, str_path);
 
+                    let page_size = 100;
+                    let data = self.reader.as_mut().unwrap().records().take(page_size);
+                    let filtered_data = data
+                        .filter_map(|record| match record {
+                            Ok(result) => Some(result),
+                            Err(_) => None,
+                        })
+                        .collect::<Vec<_>>();
+
+                    self.data = Some(filtered_data);
+
                     ctx.send_viewport_cmd(egui::ViewportCommand::Title(file_name));
                 }
-            }
-
-            if let Some(picked_path) = &self.picked_path {
-                ui.horizontal(|ui| {
-                    ui.label("Picked file:");
-                    ui.monospace(picked_path);
-                });
             }
 
             show_dropped_files(ui, &self.dropped_files);
