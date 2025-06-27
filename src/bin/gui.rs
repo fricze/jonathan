@@ -207,7 +207,9 @@ impl eframe::App for MyApp {
             ui.label("Drag-and-drop files onto the window!");
 
             if let Some(picked_path) = &self.picked_path {
-                if self.inner_rect.add(self.scroll_y) >= self.content_height {
+                if self.filter.is_empty()
+                    && self.inner_rect.add(self.scroll_y) >= self.content_height
+                {
                     let page_no = self.page + 1;
 
                     let page_size = 100;
