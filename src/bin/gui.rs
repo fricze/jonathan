@@ -2,6 +2,7 @@
 
 use csv::StringRecord;
 use egui::Key;
+use egui::ScrollArea;
 use egui::scroll_area::ScrollAreaOutput;
 use std::fs::File;
 use std::path::PathBuf;
@@ -195,7 +196,7 @@ impl eframe::App for MyApp {
             ));
 
             if let Some(headers) = self.headers.as_mut() {
-                ui.horizontal(|ui| {
+                ui.horizontal_wrapped(|ui| {
                     for file_header in headers.iter_mut() {
                         ui.checkbox(&mut file_header.visible, &file_header.name)
                             .on_hover_text(format!("Show/hide column {}", file_header.name));
@@ -214,12 +215,7 @@ impl eframe::App for MyApp {
                     // from it, I should not call .skip when taking next records.
                     // The position is already moved.
                     let data = self.reader.as_mut().unwrap().records().take(page_size);
-                    let filtered_data = data
-                        .filter_map(|record| match record {
-                            Ok(result) => Some(result),
-                            Err(_) => None,
-                        })
-                        .collect::<Vec<_>>();
+                    let filtered_data = data.filter_map(|record| record.ok()).collect::<Vec<_>>();
 
                     if !filtered_data.is_empty() {
                         self.data.as_mut().unwrap().extend(filtered_data);
@@ -243,12 +239,7 @@ impl eframe::App for MyApp {
 
                     let page_size = 100;
                     let data = self.reader.as_mut().unwrap().records().take(page_size);
-                    let filtered_data = data
-                        .filter_map(|record| match record {
-                            Ok(result) => Some(result),
-                            Err(_) => None,
-                        })
-                        .collect::<Vec<_>>();
+                    let filtered_data = data.filter_map(|record| record.ok()).collect::<Vec<_>>();
 
                     self.data = Some(filtered_data);
 
@@ -264,62 +255,64 @@ impl eframe::App for MyApp {
 
             ui.separator();
 
-            let mut table = TableBuilder::new(ui)
-                .striped(true)
-                .resizable(true)
-                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                .min_scrolled_height(0.0);
+            ScrollArea::horizontal().show(ui, |ui| {
+                let mut table = TableBuilder::new(ui)
+                    .striped(true)
+                    .resizable(true)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .min_scrolled_height(0.0);
 
-            if ctx.input(|i| i.key_pressed(Key::PageUp)) {
-                table =
-                    table.vertical_scroll_offset(self.scroll_y.sub(self.inner_rect / 2.0).max(0.0));
-            }
-
-            if ctx.input(|i| i.key_pressed(Key::PageDown)) {
-                table = table.vertical_scroll_offset(self.scroll_y.add(self.inner_rect / 2.0));
-            }
-
-            if ctx.input(|i| i.key_pressed(Key::Home)) {
-                table = table.vertical_scroll_offset(0.0);
-            }
-
-            if ctx.input(|i| i.key_pressed(Key::End)) {
-                table = table.vertical_scroll_offset(self.content_height);
-            }
-
-            let empty_headers: Vec<FileHeader> = vec![];
-            let headers = self.headers.as_ref().unwrap_or(&empty_headers);
-
-            let mut hidden = HashSet::new();
-
-            for (index, file_header) in headers.iter().enumerate() {
-                if file_header.visible {
-                    table = table.column(Column::auto());
-                } else {
-                    hidden.insert(index);
+                if ctx.input(|i| i.key_pressed(Key::PageUp)) {
+                    table = table
+                        .vertical_scroll_offset(self.scroll_y.sub(self.inner_rect / 2.0).max(0.0));
                 }
-            }
 
-            let table_ui = table.header(20.0, |mut header| {
-                for file_header in headers.iter().filter(|header| header.visible) {
-                    header.col(|ui| {
-                        ui.heading(&file_header.name);
-                    });
+                if ctx.input(|i| i.key_pressed(Key::PageDown)) {
+                    table = table.vertical_scroll_offset(self.scroll_y.add(self.inner_rect / 2.0));
                 }
+
+                if ctx.input(|i| i.key_pressed(Key::Home)) {
+                    table = table.vertical_scroll_offset(0.0);
+                }
+
+                if ctx.input(|i| i.key_pressed(Key::End)) {
+                    table = table.vertical_scroll_offset(self.content_height);
+                }
+
+                let empty_headers: Vec<FileHeader> = vec![];
+                let headers = self.headers.as_ref().unwrap_or(&empty_headers);
+
+                let mut hidden = HashSet::new();
+
+                for (index, file_header) in headers.iter().enumerate() {
+                    if file_header.visible {
+                        table = table.column(Column::auto());
+                    } else {
+                        hidden.insert(index);
+                    }
+                }
+
+                let table_ui = table.header(20.0, |mut header| {
+                    for file_header in headers.iter().filter(|header| header.visible) {
+                        header.col(|ui| {
+                            ui.heading(&file_header.name);
+                        });
+                    }
+                });
+
+                let empty_data: Vec<StringRecord> = vec![];
+                let data = self.data.as_ref().unwrap_or(&empty_data);
+
+                let scroll_area = display_table(table_ui, &self.filter, data, hidden);
+
+                let content_height = scroll_area.content_size[1];
+
+                self.content_height = content_height;
+
+                let offset = scroll_area.state.offset[1];
+                self.scroll_y = offset;
+                self.inner_rect = scroll_area.inner_rect.height();
             });
-
-            let empty_data: Vec<StringRecord> = vec![];
-            let data = self.data.as_ref().unwrap_or(&empty_data);
-
-            let scroll_area = display_table(table_ui, &self.filter, data, hidden);
-
-            let content_height = scroll_area.content_size[1];
-
-            self.content_height = content_height;
-
-            let offset = scroll_area.state.offset[1];
-            self.scroll_y = offset;
-            self.inner_rect = scroll_area.inner_rect.height();
         });
 
         preview_files_being_dropped(ctx);
