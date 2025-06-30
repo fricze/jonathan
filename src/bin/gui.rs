@@ -1,11 +1,20 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
+use csv::Reader;
 use csv::StringRecord;
 use egui::Key;
 use egui::ScrollArea;
+use std::rc::Rc;
+
+use std::cell::RefCell;
+
+use egui::Ui;
 use egui::scroll_area::ScrollAreaOutput;
 use std::fs::File;
 use std::path::PathBuf;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread;
+use std::time::Duration;
 use std::{
     collections::HashSet,
     ops::{Add, Sub},
@@ -16,6 +25,117 @@ use egui_extras::{Column, Table, TableBuilder};
 use eframe::egui;
 use jonathan::read_csv;
 
+enum WorkerMessage {
+    FilteredData(Vec<String>),
+    SetHeaders(Vec<FileHeader>),
+    SetData(Vec<StringRecord>),
+    // Could add other messages like Progress(f32), Error(String), etc.
+}
+
+enum UiMessage {
+    OpenFile(String),
+    LoadPage(usize),
+    FilterData(String),
+}
+
+fn open_csv_file(path: &str) -> (Reader<File>, Vec<FileHeader>) {
+    match read_csv::iterate_csv(path) {
+        Ok((csv_reader, headers)) => {
+            let headers = headers
+                .into_iter()
+                .map(|name| FileHeader {
+                    name: name.to_string(),
+                    visible: true,
+                })
+                .collect::<Vec<_>>();
+            return (csv_reader, headers);
+        }
+        Err(err) => {
+            eprintln!("Error reading CSV file: {}", err);
+            std::process::exit(1);
+        }
+    };
+}
+
+impl MyApp {
+    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let (tx_to_worker, rx_from_ui) = mpsc::channel::<UiMessage>();
+        let (tx_to_ui, rx_from_worker) = mpsc::channel::<WorkerMessage>();
+
+        thread::spawn(move || {
+            let mut file_reader: Option<Reader<File>> = None;
+            let data: Rc<RefCell<Vec<StringRecord>>> = Rc::new(RefCell::new(vec![]));
+            // The background thread will continuously listen for new filter text
+            for ui_message in rx_from_ui {
+                match ui_message {
+                    UiMessage::OpenFile(file_name) => {
+                        let (reader, headers) = open_csv_file(&file_name);
+                        file_reader = Some(reader);
+
+                        let new_data = file_reader
+                            .as_mut()
+                            .unwrap()
+                            .records()
+                            .filter_map(|record| record.ok())
+                            .collect::<Vec<_>>();
+
+                        // let first_page = new_data.iter().take(10000).cloned().collect();
+                        let first_page = new_data.iter().cloned().collect();
+
+                        let mut mut_data = data.borrow_mut();
+                        *mut_data = new_data;
+
+                        if let Err(e) = tx_to_ui.send(WorkerMessage::SetData(first_page)) {
+                            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                            break; // UI thread probably disconnected, exit worker
+                        }
+
+                        if let Err(e) = tx_to_ui.send(WorkerMessage::SetHeaders(headers)) {
+                            eprintln!("Worker: Failed to send filtered data to UI thread: {:?}", e);
+                            break; // UI thread probably disconnected, exit worker
+                        }
+                    }
+                    UiMessage::LoadPage(page_number) => {
+                        let page_handle = data.borrow();
+                        let page = page_handle
+                            .iter()
+                            .cloned()
+                            .skip(page_number * 100)
+                            .take(100)
+                            .collect::<Vec<_>>();
+
+                        if let Err(e) = tx_to_ui.send(WorkerMessage::SetData(page)) {
+                            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                            break; // UI thread probably disconnected, exit worker
+                        }
+                    }
+                    UiMessage::FilterData(filter) => {}
+                }
+            }
+
+            println!("Worker: Exiting.");
+        });
+
+        MyApp {
+            filename: "".to_owned(),
+            headers: None,
+            data: None,
+            scroll_y: 0.0,
+            inner_rect: 0.0,
+            content_height: 0.0,
+            filter: "".to_owned(),
+            dropped_files: Vec::new(),
+            picked_path: None,
+            page: 0,
+            loading: false,
+            reader: None,
+            sender_to_worker: tx_to_worker,
+            receiver_from_worker: rx_from_worker,
+            reversed: false,
+        }
+    }
+}
+
 fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -24,24 +144,13 @@ fn main() -> eframe::Result {
         ..Default::default()
     };
 
-    let app = MyApp {
-        filename: "".to_owned(),
-        headers: None,
-        data: None,
-        scroll_y: 0.0,
-        inner_rect: 0.0,
-        content_height: 0.0,
-        filter: "".to_owned(),
-        dropped_files: Vec::new(),
-        picked_path: None,
-        page: 0,
-        loading: false,
-        reader: None,
-    };
+    let title = &format!("CSV Reader.");
 
-    let title = &format!("CSV Reader. {}", app.filename);
-
-    eframe::run_native(title, options, Box::new(|_cc| Ok(Box::<MyApp>::new(app))))
+    eframe::run_native(
+        title,
+        options,
+        Box::new(|cc| Ok(Box::new(MyApp::new(cc)))), // <-- Wrap in Ok()
+    )
 }
 
 struct FileHeader {
@@ -49,7 +158,6 @@ struct FileHeader {
     visible: bool,
 }
 
-#[derive(Default)]
 struct MyApp {
     filename: String,
     headers: Option<Vec<FileHeader>>,
@@ -63,27 +171,11 @@ struct MyApp {
     page: usize,
     loading: bool,
     reader: Option<csv::Reader<File>>,
-}
-
-fn open_csv_file(app: &mut MyApp, path: &str) {
-    match read_csv::iterate_csv(path) {
-        Ok((csv_reader, headers)) => {
-            app.reader = Some(csv_reader);
-            app.headers = Some(
-                headers
-                    .into_iter()
-                    .map(|name| FileHeader {
-                        name: name.to_string(),
-                        visible: true,
-                    })
-                    .collect(),
-            );
-        }
-        Err(err) => {
-            eprintln!("Error reading CSV file: {}", err);
-            std::process::exit(1);
-        }
-    };
+    // Channel for sending messages from the UI thread to the background thread
+    sender_to_worker: Sender<UiMessage>,
+    // Channel for receiving messages from the background thread to the UI thread
+    receiver_from_worker: Receiver<WorkerMessage>,
+    reversed: bool,
 }
 
 fn preview_files_being_dropped(ctx: &egui::Context) {
@@ -126,24 +218,27 @@ fn display_table(
     data: &Vec<StringRecord>,
     hidden: HashSet<usize>,
 ) -> ScrollAreaOutput<()> {
-    return table_ui.body(|mut body| {
+    return table_ui.body(|body| {
         let filtered_rows = data
             .iter()
-            .filter(|row| row.iter().find(|text| text.contains(filter)).is_some());
+            .filter(|row| row.iter().find(|text| text.contains(filter)).is_some())
+            .collect::<Vec<_>>();
 
-        for row_data in filtered_rows {
-            body.row(20.0, |mut row| {
-                row_data
-                    .iter()
-                    .enumerate()
-                    .filter(|(index, _)| !hidden.contains(index))
-                    .for_each(|(_, data)| {
-                        row.col(|ui| {
-                            ui.label(data);
-                        });
+        body.rows(18.0, filtered_rows.len(), |mut row| {
+            let row_index = row.index();
+
+            let row_data = &filtered_rows[row_index];
+
+            row_data
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| !hidden.contains(index))
+                .for_each(|(_, data)| {
+                    row.col(|ui| {
+                        ui.label(data);
                     });
-            });
-        }
+                });
+        });
     });
 }
 
@@ -186,14 +281,21 @@ fn show_dropped_files(ui: &mut egui::Ui, dropped_files: &Vec<egui::DroppedFile>)
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(ctx, |ui| {
-            ui.label(format!(
-                "CSV reader :: {}, {}, {}, {}, {}",
-                self.filename,
-                self.content_height,
-                self.inner_rect.add(self.scroll_y),
-                self.page,
-                self.loading
-            ));
+            while let Ok(message) = self.receiver_from_worker.try_recv() {
+                match message {
+                    WorkerMessage::SetHeaders(data) => {
+                        self.headers = Some(data);
+                        ctx.request_repaint();
+                    }
+                    WorkerMessage::FilteredData(data) => {}
+                    WorkerMessage::SetData(data) => {
+                        self.data = Some(data);
+                        ctx.request_repaint();
+                    }
+                }
+            }
+
+            ui.label(format!("CSV reader :: {}", self.filename,));
 
             if let Some(headers) = self.headers.as_mut() {
                 ui.horizontal_wrapped(|ui| {
@@ -212,17 +314,11 @@ impl eframe::App for MyApp {
                 {
                     let page_no = self.page + 1;
 
-                    let page_size = 100;
-                    // Reader keeps state, so if I've taken some amount of records already
-                    // from it, I should not call .skip when taking next records.
-                    // The position is already moved.
-                    let data = self.reader.as_mut().unwrap().records().take(page_size);
-                    let filtered_data = data.filter_map(|record| record.ok()).collect::<Vec<_>>();
-
-                    if !filtered_data.is_empty() {
-                        self.data.as_mut().unwrap().extend(filtered_data);
-                        self.page = page_no;
-                    }
+                    // if let Err(e) = self.sender_to_worker.send(UiMessage::LoadPage(page_no)) {
+                    //     eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                    // } else {
+                    //     self.page = self.page + 1;
+                    // }
                 }
 
                 ui.horizontal(|ui| {
@@ -237,13 +333,12 @@ impl eframe::App for MyApp {
                     let file_name = path.display().to_string();
                     self.picked_path = Some(file_name.clone());
 
-                    open_csv_file(self, str_path);
-
-                    let page_size = 100;
-                    let data = self.reader.as_mut().unwrap().records().take(page_size);
-                    let filtered_data = data.filter_map(|record| record.ok()).collect::<Vec<_>>();
-
-                    self.data = Some(filtered_data);
+                    if let Err(e) = self
+                        .sender_to_worker
+                        .send(UiMessage::OpenFile(file_name.clone()))
+                    {
+                        eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                    }
 
                     ctx.send_viewport_cmd(egui::ViewportCommand::Title(file_name));
                 }
@@ -253,7 +348,10 @@ impl eframe::App for MyApp {
 
             ui.separator();
 
-            ui.add(egui::TextEdit::singleline(&mut self.filter).hint_text("Write something here"));
+            let response = ui.text_edit_singleline(&mut self.filter);
+            if response.changed() {
+                // self.filter_data();
+            }
 
             ui.separator();
 
@@ -297,7 +395,16 @@ impl eframe::App for MyApp {
                 let table_ui = table.header(20.0, |mut header| {
                     for file_header in headers.iter().filter(|header| header.visible) {
                         header.col(|ui| {
-                            ui.heading(&file_header.name);
+                            egui::Sides::new().show(
+                                ui,
+                                |ui| {
+                                    ui.heading(&file_header.name);
+                                },
+                                |ui| {
+                                    self.reversed ^=
+                                        ui.button(if self.reversed { "⬆" } else { "⬇" }).clicked();
+                                },
+                            );
                         });
                     }
                 });
@@ -332,7 +439,7 @@ impl eframe::App for MyApp {
 
                 let str_path = path.to_str().unwrap_or("");
 
-                open_csv_file(self, str_path);
+                // open_csv_file(self, str_path);
             }
         });
 
