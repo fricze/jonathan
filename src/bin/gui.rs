@@ -4,17 +4,16 @@ use csv::Reader;
 use csv::StringRecord;
 use egui::Key;
 use egui::ScrollArea;
+use itertools::Itertools;
 use std::rc::Rc;
 
 use std::cell::RefCell;
 
-use egui::Ui;
 use egui::scroll_area::ScrollAreaOutput;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
-use std::time::Duration;
 use std::{
     collections::HashSet,
     ops::{Add, Sub},
@@ -46,6 +45,8 @@ fn open_csv_file(path: &str) -> (Reader<File>, Vec<FileHeader>) {
                 .map(|name| FileHeader {
                     name: name.to_string(),
                     visible: true,
+                    sort: None,
+                    sort_dir: None,
                 })
                 .collect::<Vec<_>>();
             return (csv_reader, headers);
@@ -132,6 +133,8 @@ impl MyApp {
             sender_to_worker: tx_to_worker,
             receiver_from_worker: rx_from_worker,
             reversed: false,
+            sort_by_column: None,
+            sort_order: None,
         }
     }
 }
@@ -153,9 +156,17 @@ fn main() -> eframe::Result {
     )
 }
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub enum SortOrder {
+    Asc,
+    Dsc,
+}
+
 struct FileHeader {
     name: String,
     visible: bool,
+    sort: Option<SortOrder>,
+    sort_dir: Option<bool>,
 }
 
 struct MyApp {
@@ -176,6 +187,8 @@ struct MyApp {
     // Channel for receiving messages from the background thread to the UI thread
     receiver_from_worker: Receiver<WorkerMessage>,
     reversed: bool,
+    sort_by_column: Option<usize>,
+    sort_order: Option<SortOrder>,
 }
 
 fn preview_files_being_dropped(ctx: &egui::Context) {
@@ -216,18 +229,35 @@ fn display_table(
     table_ui: Table,
     filter: &str,
     data: &Vec<StringRecord>,
-    hidden: HashSet<usize>,
+    hidden: &HashSet<usize>,
+    sort_order: SortOrder,
+    sort_by_column: Option<usize>,
 ) -> ScrollAreaOutput<()> {
     return table_ui.body(|body| {
         let filtered_rows = data
             .iter()
-            .filter(|row| row.iter().find(|text| text.contains(filter)).is_some())
-            .collect::<Vec<_>>();
+            .filter(|row| row.iter().find(|text| text.contains(filter)).is_some());
 
-        body.rows(18.0, filtered_rows.len(), |mut row| {
+        let rows = if let Some(column) = sort_by_column {
+            filtered_rows
+                .sorted_by(|a, b| {
+                    let a = a.get(column).unwrap_or("");
+                    let b = b.get(column).unwrap_or("");
+
+                    match sort_order {
+                        SortOrder::Asc => a.cmp(b),
+                        SortOrder::Dsc => b.cmp(a),
+                    }
+                })
+                .collect::<Vec<_>>()
+        } else {
+            filtered_rows.collect::<Vec<_>>()
+        };
+
+        body.rows(18.0, rows.len(), |mut row| {
             let row_index = row.index();
 
-            let row_data = &filtered_rows[row_index];
+            let row_data = &rows[row_index];
 
             row_data
                 .iter()
@@ -348,10 +378,7 @@ impl eframe::App for MyApp {
 
             ui.separator();
 
-            let response = ui.text_edit_singleline(&mut self.filter);
-            if response.changed() {
-                // self.filter_data();
-            }
+            ui.text_edit_singleline(&mut self.filter);
 
             ui.separator();
 
@@ -379,8 +406,8 @@ impl eframe::App for MyApp {
                     table = table.vertical_scroll_offset(self.content_height);
                 }
 
-                let empty_headers: Vec<FileHeader> = vec![];
-                let headers = self.headers.as_ref().unwrap_or(&empty_headers);
+                let mut empty_headers: Vec<FileHeader> = vec![];
+                let headers = self.headers.as_mut().unwrap_or(&mut empty_headers);
 
                 let mut hidden = HashSet::new();
 
@@ -393,26 +420,49 @@ impl eframe::App for MyApp {
                 }
 
                 let table_ui = table.header(20.0, |mut header| {
-                    for file_header in headers.iter().filter(|header| header.visible) {
-                        header.col(|ui| {
-                            egui::Sides::new().show(
-                                ui,
-                                |ui| {
-                                    ui.heading(&file_header.name);
-                                },
-                                |ui| {
-                                    self.reversed ^=
-                                        ui.button(if self.reversed { "⬆" } else { "⬇" }).clicked();
-                                },
-                            );
+                    headers
+                        .iter_mut()
+                        .enumerate()
+                        .filter(|(_, file_header)| file_header.visible)
+                        .for_each(|(idx, file_header)| {
+                            header.col(|ui| {
+                                egui::Sides::new().show(
+                                    ui,
+                                    |ui| {
+                                        let name = &file_header.name;
+                                        ui.heading(name);
+                                    },
+                                    |ui| {
+                                        let asc = file_header.sort_dir.unwrap_or(false);
+
+                                        if ui.button(if asc { "⬆" } else { "⬇" }).clicked() {
+                                            file_header.sort_dir = Some(!asc);
+
+                                            if asc {
+                                                self.sort_order = Some(SortOrder::Asc);
+                                                self.sort_by_column = Some(idx);
+                                            } else {
+                                                self.sort_order = Some(SortOrder::Dsc);
+                                                self.sort_by_column = Some(idx);
+                                            }
+                                        }
+                                    },
+                                );
+                            });
                         });
-                    }
                 });
 
                 let empty_data: Vec<StringRecord> = vec![];
                 let data = self.data.as_ref().unwrap_or(&empty_data);
 
-                let scroll_area = display_table(table_ui, &self.filter, data, hidden);
+                let scroll_area = display_table(
+                    table_ui,
+                    &self.filter,
+                    data,
+                    &hidden,
+                    self.sort_order.unwrap_or(SortOrder::Dsc),
+                    self.sort_by_column,
+                );
 
                 let content_height = scroll_area.content_size[1];
 
