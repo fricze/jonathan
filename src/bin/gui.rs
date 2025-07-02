@@ -2,8 +2,7 @@
 
 use csv::Reader;
 use csv::StringRecord;
-use egui::Key;
-use egui::ScrollArea;
+use egui::{Color32, Key, ScrollArea, TextFormat};
 use itertools::Itertools;
 use std::cmp::Ordering;
 use std::rc::Rc;
@@ -270,9 +269,60 @@ fn display_table(
                 .iter()
                 .enumerate()
                 .filter(|(index, _)| !hidden.contains(index))
-                .for_each(|(_, data)| {
+                .for_each(|(_, text)| {
                     row.col(|ui| {
-                        ui.label(data);
+                        if filter.is_empty() {
+                            ui.label(text);
+                        } else {
+                            use egui::text::LayoutJob;
+
+                            if text.contains(&filter) {
+                                let mut job = LayoutJob::default();
+
+                                if text == filter {
+                                    job.append(
+                                        text,
+                                        0.0,
+                                        TextFormat {
+                                            color: Color32::YELLOW,
+                                            ..Default::default()
+                                        },
+                                    );
+
+                                    ui.label(job);
+                                } else {
+                                    let text: Vec<&str> = text.split(filter).collect();
+
+                                    if text.len() == 1 {
+                                        job.append(
+                                            filter,
+                                            0.0,
+                                            TextFormat {
+                                                color: Color32::YELLOW,
+                                                ..Default::default()
+                                            },
+                                        );
+                                        job.append(text[0], 0.0, TextFormat::default());
+                                        ui.label(job);
+                                    } else if text.len() == 2 {
+                                        job.append(text[0], 0.0, TextFormat::default());
+                                        job.append(
+                                            filter,
+                                            0.0,
+                                            TextFormat {
+                                                color: Color32::YELLOW,
+                                                ..Default::default()
+                                            },
+                                        );
+                                        job.append(text[1], 0.0, TextFormat::default());
+
+                                        ui.label(job);
+                                    }
+                                }
+                            } else {
+                                ui.label(text);
+                            }
+                        }
                     });
                 });
         });
