@@ -5,7 +5,9 @@ use csv::StringRecord;
 use egui::Key;
 use egui::ScrollArea;
 use itertools::Itertools;
+use std::cmp::Ordering;
 use std::rc::Rc;
+use std::str::FromStr;
 
 use std::cell::RefCell;
 
@@ -80,7 +82,6 @@ impl MyApp {
                             .filter_map(|record| record.ok())
                             .collect::<Vec<_>>();
 
-                        // let first_page = new_data.iter().take(10000).cloned().collect();
                         let first_page = new_data.iter().cloned().collect();
 
                         let mut mut_data = data.borrow_mut();
@@ -244,9 +245,15 @@ fn display_table(
                     let a = a.get(column).unwrap_or("");
                     let b = b.get(column).unwrap_or("");
 
-                    match sort_order {
-                        SortOrder::Asc => a.cmp(b),
-                        SortOrder::Dsc => b.cmp(a),
+                    match (f32::from_str(a), f32::from_str(b)) {
+                        (Ok(a_f), Ok(b_f)) => match sort_order {
+                            SortOrder::Asc => a_f.partial_cmp(&b_f).unwrap_or(Ordering::Equal),
+                            SortOrder::Dsc => b_f.partial_cmp(&a_f).unwrap_or(Ordering::Equal),
+                        },
+                        (_, _) => match sort_order {
+                            SortOrder::Asc => a.cmp(b),
+                            SortOrder::Dsc => b.cmp(a),
+                        },
                     }
                 })
                 .collect::<Vec<_>>()
