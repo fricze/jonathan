@@ -36,6 +36,7 @@ enum UiMessage {
     OpenFile(String),
     LoadPage(usize),
     FilterData(String),
+    FilterColumns(HashSet<usize>),
 }
 
 fn open_csv_file(path: &str) -> (Reader<File>, Vec<FileHeader>) {
@@ -67,6 +68,7 @@ impl MyApp {
         thread::spawn(move || {
             let mut file_reader: Option<Reader<File>> = None;
             let data: Rc<RefCell<Vec<StringRecord>>> = Rc::new(RefCell::new(vec![]));
+            let header_ref: Rc<RefCell<Vec<FileHeader>>> = Rc::new(RefCell::new(vec![]));
             // The background thread will continuously listen for new filter text
             for ui_message in rx_from_ui {
                 match ui_message {
@@ -81,12 +83,15 @@ impl MyApp {
                             .filter_map(|record| record.ok())
                             .collect::<Vec<_>>();
 
-                        let first_page = new_data.iter().cloned().collect();
-
+                        let mut header_ref = header_ref.borrow_mut();
                         let mut mut_data = data.borrow_mut();
-                        *mut_data = new_data;
+                        // This has to become Arc at some point, so I can just move Arc ref instead
+                        // of cloning. I cannot clone whole dataset everytime there's some change
+                        // I'll optimize later
+                        *mut_data = new_data.clone();
+                        *header_ref = headers.clone();
 
-                        if let Err(e) = tx_to_ui.send(WorkerMessage::SetData(first_page)) {
+                        if let Err(e) = tx_to_ui.send(WorkerMessage::SetData(new_data)) {
                             eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
                             break; // UI thread probably disconnected, exit worker
                         }
@@ -111,6 +116,41 @@ impl MyApp {
                         }
                     }
                     UiMessage::FilterData(filter) => {}
+                    UiMessage::FilterColumns(hidden) => {
+                        let headers = Rc::clone(&header_ref)
+                            .borrow()
+                            .clone()
+                            .iter()
+                            .enumerate()
+                            .filter(|(index, _)| !hidden.contains(index))
+                            .map(|(_, row)| row.to_owned())
+                            .collect::<Vec<_>>();
+
+                        let new_data = Rc::clone(&data)
+                            .borrow()
+                            .clone()
+                            .iter()
+                            .map(|record| {
+                                let vec = record
+                                    .iter()
+                                    .enumerate()
+                                    .filter(|(index, _)| !hidden.contains(index))
+                                    .map(|(_, value)| value.to_string())
+                                    .collect::<Vec<_>>();
+                                StringRecord::from(vec)
+                            })
+                            .collect::<Vec<_>>();
+
+                        if let Err(e) = tx_to_ui.send(WorkerMessage::SetData(new_data)) {
+                            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                            break; // UI thread probably disconnected, exit worker
+                        }
+
+                        if let Err(e) = tx_to_ui.send(WorkerMessage::SetHeaders(headers)) {
+                            eprintln!("Worker: Failed to send filtered data to UI thread: {:?}", e);
+                            break; // UI thread probably disconnected, exit worker
+                        }
+                    }
                 }
             }
 
@@ -120,6 +160,7 @@ impl MyApp {
         MyApp {
             filename: "".to_owned(),
             headers: None,
+            columns: None,
             data: None,
             scroll_y: 0.0,
             inner_rect: 0.0,
@@ -162,6 +203,7 @@ pub enum SortOrder {
     Dsc,
 }
 
+#[derive(Clone)]
 struct FileHeader {
     name: String,
     visible: bool,
@@ -172,6 +214,7 @@ struct FileHeader {
 struct MyApp {
     filename: String,
     headers: Option<Vec<FileHeader>>,
+    columns: Option<Vec<FileHeader>>,
     data: Option<Vec<StringRecord>>,
     scroll_y: f32,
     inner_rect: f32,
@@ -229,7 +272,6 @@ fn display_table(
     table_ui: Table,
     filter: &str,
     data: &Vec<StringRecord>,
-    hidden: &HashSet<usize>,
     sort_order: SortOrder,
     sort_by_column: Option<usize>,
 ) -> ScrollAreaOutput<()> {
@@ -265,66 +307,62 @@ fn display_table(
 
             let row_data = &rows[row_index];
 
-            row_data
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| !hidden.contains(index))
-                .for_each(|(_, text)| {
-                    row.col(|ui| {
-                        if filter.is_empty() {
-                            ui.label(text);
-                        } else {
-                            use egui::text::LayoutJob;
+            row_data.iter().enumerate().for_each(|(_, text)| {
+                row.col(|ui| {
+                    if filter.is_empty() {
+                        ui.label(text);
+                    } else {
+                        use egui::text::LayoutJob;
 
-                            if text.contains(&filter) {
-                                let mut job = LayoutJob::default();
+                        if text.contains(&filter) {
+                            let mut job = LayoutJob::default();
 
-                                if text == filter {
+                            if text == filter {
+                                job.append(
+                                    text,
+                                    0.0,
+                                    TextFormat {
+                                        color: Color32::YELLOW,
+                                        ..Default::default()
+                                    },
+                                );
+
+                                ui.label(job);
+                            } else {
+                                let text: Vec<&str> = text.split(filter).collect();
+
+                                if text.len() == 1 {
                                     job.append(
-                                        text,
+                                        filter,
                                         0.0,
                                         TextFormat {
                                             color: Color32::YELLOW,
                                             ..Default::default()
                                         },
                                     );
+                                    job.append(text[0], 0.0, TextFormat::default());
+                                    ui.label(job);
+                                } else if text.len() == 2 {
+                                    job.append(text[0], 0.0, TextFormat::default());
+                                    job.append(
+                                        filter,
+                                        0.0,
+                                        TextFormat {
+                                            color: Color32::YELLOW,
+                                            ..Default::default()
+                                        },
+                                    );
+                                    job.append(text[1], 0.0, TextFormat::default());
 
                                     ui.label(job);
-                                } else {
-                                    let text: Vec<&str> = text.split(filter).collect();
-
-                                    if text.len() == 1 {
-                                        job.append(
-                                            filter,
-                                            0.0,
-                                            TextFormat {
-                                                color: Color32::YELLOW,
-                                                ..Default::default()
-                                            },
-                                        );
-                                        job.append(text[0], 0.0, TextFormat::default());
-                                        ui.label(job);
-                                    } else if text.len() == 2 {
-                                        job.append(text[0], 0.0, TextFormat::default());
-                                        job.append(
-                                            filter,
-                                            0.0,
-                                            TextFormat {
-                                                color: Color32::YELLOW,
-                                                ..Default::default()
-                                            },
-                                        );
-                                        job.append(text[1], 0.0, TextFormat::default());
-
-                                        ui.label(job);
-                                    }
                                 }
-                            } else {
-                                ui.label(text);
                             }
+                        } else {
+                            ui.label(text);
                         }
-                    });
+                    }
                 });
+            });
         });
     });
 }
@@ -382,18 +420,44 @@ impl eframe::App for MyApp {
                 }
             }
 
-            ui.label(format!("CSV reader :: {}", self.filename,));
+            if let Some(picked_path) = &self.picked_path {
+                ui.label(format!("CSV reader :: {}", picked_path));
+            } else {
+                ui.label(format!("CSV reader"));
+            }
 
-            if let Some(headers) = self.headers.as_mut() {
+            if let Some(headers) = self.columns.as_mut() {
                 ui.horizontal_wrapped(|ui| {
-                    for file_header in headers.iter_mut() {
-                        ui.checkbox(&mut file_header.visible, &file_header.name)
-                            .on_hover_text(format!("Show/hide column {}", file_header.name));
+                    let mut hidden = HashSet::new();
+
+                    for (index, file_header) in headers.iter_mut().enumerate() {
+                        if file_header.visible {
+                            hidden.remove(&index);
+                        } else {
+                            hidden.insert(index);
+                        }
+
+                        if ui
+                            .checkbox(&mut file_header.visible, &file_header.name)
+                            .on_hover_text(format!("Show/hide column {}", file_header.name))
+                            .clicked()
+                        {
+                            if file_header.visible {
+                                hidden.remove(&index);
+                            } else {
+                                hidden.insert(index);
+                            }
+
+                            if let Err(e) = self
+                                .sender_to_worker
+                                .send(UiMessage::FilterColumns(hidden.clone()))
+                            {
+                                eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                            }
+                        }
                     }
                 });
             }
-
-            ui.label("Drag-and-drop files onto the window!");
 
             if let Some(picked_path) = &self.picked_path {
                 if self.filter.is_empty()
@@ -407,11 +471,6 @@ impl eframe::App for MyApp {
                     //     self.page = self.page + 1;
                     // }
                 }
-
-                ui.horizontal(|ui| {
-                    ui.label("Picked file:");
-                    ui.monospace(picked_path);
-                });
             }
 
             if ui.button("Open file…").clicked() {
@@ -419,6 +478,10 @@ impl eframe::App for MyApp {
                     let str_path = path.to_str().unwrap_or("");
                     let file_name = path.display().to_string();
                     self.picked_path = Some(file_name.clone());
+
+                    let (_, headers) = open_csv_file(&file_name);
+
+                    self.columns = Some(headers);
 
                     if let Err(e) = self
                         .sender_to_worker
@@ -466,21 +529,14 @@ impl eframe::App for MyApp {
                 let mut empty_headers: Vec<FileHeader> = vec![];
                 let headers = self.headers.as_mut().unwrap_or(&mut empty_headers);
 
-                let mut hidden = HashSet::new();
-
-                for (index, file_header) in headers.iter().enumerate() {
-                    if file_header.visible {
-                        table = table.column(Column::auto());
-                    } else {
-                        hidden.insert(index);
-                    }
+                for _ in headers.iter().enumerate() {
+                    table = table.column(Column::auto());
                 }
 
                 let table_ui = table.header(20.0, |mut header| {
                     headers
                         .iter_mut()
                         .enumerate()
-                        .filter(|(_, file_header)| file_header.visible)
                         .for_each(|(idx, file_header)| {
                             header.col(|ui| {
                                 egui::Sides::new().show(
@@ -516,7 +572,6 @@ impl eframe::App for MyApp {
                     table_ui,
                     &self.filter,
                     data,
-                    &hidden,
                     self.sort_order.unwrap_or(SortOrder::Dsc),
                     self.sort_by_column,
                 );
