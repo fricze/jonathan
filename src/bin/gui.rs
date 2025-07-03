@@ -29,6 +29,7 @@ enum WorkerMessage {
     FilteredData(Vec<String>),
     SetHeaders(Vec<FileHeader>),
     SetData(Vec<StringRecord>),
+    SetHeadersAndData(Vec<FileHeader>, Vec<StringRecord>),
     // Could add other messages like Progress(f32), Error(String), etc.
 }
 
@@ -141,13 +142,10 @@ impl MyApp {
                             })
                             .collect::<Vec<_>>();
 
-                        if let Err(e) = tx_to_ui.send(WorkerMessage::SetData(new_data)) {
+                        if let Err(e) =
+                            tx_to_ui.send(WorkerMessage::SetHeadersAndData(headers, new_data))
+                        {
                             eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                            break; // UI thread probably disconnected, exit worker
-                        }
-
-                        if let Err(e) = tx_to_ui.send(WorkerMessage::SetHeaders(headers)) {
-                            eprintln!("Worker: Failed to send filtered data to UI thread: {:?}", e);
                             break; // UI thread probably disconnected, exit worker
                         }
                     }
@@ -408,6 +406,11 @@ impl eframe::App for MyApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             while let Ok(message) = self.receiver_from_worker.try_recv() {
                 match message {
+                    WorkerMessage::SetHeadersAndData(headers, data) => {
+                        self.data = Some(data);
+                        self.headers = Some(headers);
+                        ctx.request_repaint();
+                    }
                     WorkerMessage::SetHeaders(data) => {
                         self.headers = Some(data);
                         ctx.request_repaint();
