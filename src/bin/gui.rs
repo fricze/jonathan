@@ -5,10 +5,10 @@ use csv::StringRecord;
 use egui::{Color32, Key, ScrollArea, TextFormat};
 use itertools::Itertools;
 use std::cmp::Ordering;
-use std::rc::Rc;
 use std::str::FromStr;
+use std::sync::Arc;
 
-use std::cell::RefCell;
+use std::sync::Mutex;
 
 use egui::scroll_area::ScrollAreaOutput;
 use std::fs::File;
@@ -26,11 +26,7 @@ use eframe::egui;
 use jonathan::read_csv;
 
 enum WorkerMessage {
-    FilteredData(Vec<String>),
-    SetHeaders(Vec<FileHeader>),
-    SetData(Vec<StringRecord>),
-    SetHeadersAndData(Vec<FileHeader>, Vec<StringRecord>),
-    // Could add other messages like Progress(f32), Error(String), etc.
+    SetData(()),
 }
 
 enum UiMessage {
@@ -62,14 +58,23 @@ fn open_csv_file(path: &str) -> (Reader<File>, Vec<FileHeader>) {
 }
 
 impl MyApp {
-    fn new(cc: &eframe::CreationContext<'_>) -> Self {
+    fn new(
+        cc: &eframe::CreationContext<'_>,
+        sheet_data: Arc<Mutex<Vec<StringRecord>>>,
+        header_data: Arc<Mutex<Vec<FileHeader>>>,
+    ) -> Self {
         let (tx_to_worker, rx_from_ui) = mpsc::channel::<UiMessage>();
         let (tx_to_ui, rx_from_worker) = mpsc::channel::<WorkerMessage>();
 
+        let sheet = Arc::clone(&sheet_data);
+        let header = Arc::clone(&header_data);
+
+        let sheet_data = Arc::clone(&sheet_data);
+        let header_data = Arc::clone(&header_data);
+
         thread::spawn(move || {
             let mut file_reader: Option<Reader<File>> = None;
-            let data: Rc<RefCell<Vec<StringRecord>>> = Rc::new(RefCell::new(vec![]));
-            let header_ref: Rc<RefCell<Vec<FileHeader>>> = Rc::new(RefCell::new(vec![]));
+
             // The background thread will continuously listen for new filter text
             for ui_message in rx_from_ui {
                 match ui_message {
@@ -84,70 +89,60 @@ impl MyApp {
                             .filter_map(|record| record.ok())
                             .collect::<Vec<_>>();
 
-                        let mut header_ref = header_ref.borrow_mut();
-                        let mut mut_data = data.borrow_mut();
-                        // This has to become Arc at some point, so I can just move Arc ref instead
-                        // of cloning. I cannot clone whole dataset everytime there's some change
-                        // I'll optimize later
+                        let mut mut_data = sheet_data.lock().unwrap();
+                        let mut header_ref = header_data.lock().unwrap();
                         *mut_data = new_data.clone();
                         *header_ref = headers.clone();
 
-                        if let Err(e) = tx_to_ui.send(WorkerMessage::SetData(new_data)) {
+                        if let Err(e) = tx_to_ui.send(WorkerMessage::SetData(())) {
                             eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                            break; // UI thread probably disconnected, exit worker
-                        }
-
-                        if let Err(e) = tx_to_ui.send(WorkerMessage::SetHeaders(headers)) {
-                            eprintln!("Worker: Failed to send filtered data to UI thread: {:?}", e);
                             break; // UI thread probably disconnected, exit worker
                         }
                     }
                     UiMessage::LoadPage(page_number) => {
-                        let page_handle = data.borrow();
-                        let page = page_handle
-                            .iter()
-                            .cloned()
-                            .skip(page_number * 100)
-                            .take(100)
-                            .collect::<Vec<_>>();
+                        // let page_handle = sheet_data.lock().unwrap();
+                        // let page = page_handle
+                        //     .iter()
+                        //     .skip(page_number * 100)
+                        //     .take(100)
+                        //     .collect::<Vec<_>>();
 
-                        if let Err(e) = tx_to_ui.send(WorkerMessage::SetData(page)) {
-                            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                            break; // UI thread probably disconnected, exit worker
-                        }
+                        // if let Err(e) = tx_to_ui.send(WorkerMessage::SetData(page)) {
+                        //     eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                        //     break; // UI thread probably disconnected, exit worker
+                        // }
                     }
                     UiMessage::FilterData(filter) => {}
                     UiMessage::FilterColumns(hidden) => {
-                        let headers = Rc::clone(&header_ref)
-                            .borrow()
-                            .clone()
-                            .iter()
-                            .enumerate()
-                            .filter(|(index, _)| !hidden.contains(index))
-                            .map(|(_, row)| row.to_owned())
-                            .collect::<Vec<_>>();
+                        // let headers = header_data
+                        //     .lock()
+                        //     .unwrap()
+                        //     .iter()
+                        //     .enumerate()
+                        //     .filter(|(index, _)| !hidden.contains(index))
+                        //     .map(|(_, row)| row)
+                        //     .collect::<Vec<_>>();
 
-                        let new_data = Rc::clone(&data)
-                            .borrow()
-                            .clone()
-                            .iter()
-                            .map(|record| {
-                                let vec = record
-                                    .iter()
-                                    .enumerate()
-                                    .filter(|(index, _)| !hidden.contains(index))
-                                    .map(|(_, value)| value.to_string())
-                                    .collect::<Vec<_>>();
-                                StringRecord::from(vec)
-                            })
-                            .collect::<Vec<_>>();
+                        // let new_data = sheet_data
+                        //     .lock()
+                        //     .unwrap()
+                        //     .iter()
+                        //     .map(|record| {
+                        //         return record
+                        //             .iter()
+                        //             .enumerate()
+                        //             .filter(|(index, _)| !hidden.contains(index))
+                        //             .map(|(_, value)| value)
+                        //             .collect::<Vec<_>>();
+                        //     })
+                        //     .collect::<Vec<_>>();
 
-                        if let Err(e) =
-                            tx_to_ui.send(WorkerMessage::SetHeadersAndData(headers, new_data))
-                        {
-                            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                            break; // UI thread probably disconnected, exit worker
-                        }
+                        // if let Err(e) =
+                        //     tx_to_ui.send(WorkerMessage::SetHeadersAndData(headers, new_data))
+                        // {
+                        //     eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                        //     break; // UI thread probably disconnected, exit worker
+                        // }
                     }
                 }
             }
@@ -159,7 +154,6 @@ impl MyApp {
             filename: "".to_owned(),
             headers: None,
             columns: None,
-            data: None,
             scroll_y: 0.0,
             inner_rect: 0.0,
             content_height: 0.0,
@@ -174,6 +168,8 @@ impl MyApp {
             reversed: false,
             sort_by_column: None,
             sort_order: None,
+            sheet_data: Arc::clone(&sheet),
+            header_data: Arc::clone(&header),
         }
     }
 }
@@ -187,11 +183,13 @@ fn main() -> eframe::Result {
     };
 
     let title = &format!("CSV Reader.");
+    let sheet_data: Arc<Mutex<Vec<StringRecord>>> = Arc::new(Mutex::new(vec![]));
+    let header_data: Arc<Mutex<Vec<FileHeader>>> = Arc::new(Mutex::new(vec![]));
 
     eframe::run_native(
         title,
         options,
-        Box::new(|cc| Ok(Box::new(MyApp::new(cc)))), // <-- Wrap in Ok()
+        Box::new(|cc| Ok(Box::new(MyApp::new(cc, sheet_data, header_data)))), // <-- Wrap in Ok()
     )
 }
 
@@ -213,7 +211,6 @@ struct MyApp {
     filename: String,
     headers: Option<Vec<FileHeader>>,
     columns: Option<Vec<FileHeader>>,
-    data: Option<Vec<StringRecord>>,
     scroll_y: f32,
     inner_rect: f32,
     content_height: f32,
@@ -230,6 +227,8 @@ struct MyApp {
     reversed: bool,
     sort_by_column: Option<usize>,
     sort_order: Option<SortOrder>,
+    sheet_data: Arc<Mutex<Vec<StringRecord>>>,
+    header_data: Arc<Mutex<Vec<FileHeader>>>,
 }
 
 fn preview_files_being_dropped(ctx: &egui::Context) {
@@ -269,17 +268,16 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
 fn display_table(
     table_ui: Table,
     filter: &str,
-    data: &Vec<StringRecord>,
+    sheet_data: &Arc<Mutex<Vec<StringRecord>>>,
     sort_order: SortOrder,
     sort_by_column: Option<usize>,
 ) -> ScrollAreaOutput<()> {
     return table_ui.body(|body| {
-        let filtered_rows = data
-            .iter()
-            .filter(|row| row.iter().find(|text| text.contains(filter)).is_some());
+        let guard = sheet_data.lock().unwrap();
 
         let rows = if let Some(column) = sort_by_column {
-            filtered_rows
+            guard
+                .iter()
                 .sorted_by(|a, b| {
                     let a = a.get(column).unwrap_or("");
                     let b = b.get(column).unwrap_or("");
@@ -297,7 +295,7 @@ fn display_table(
                 })
                 .collect::<Vec<_>>()
         } else {
-            filtered_rows.collect::<Vec<_>>()
+            guard.iter().collect::<Vec<_>>()
         };
 
         body.rows(18.0, rows.len(), |mut row| {
@@ -406,18 +404,7 @@ impl eframe::App for MyApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             while let Ok(message) = self.receiver_from_worker.try_recv() {
                 match message {
-                    WorkerMessage::SetHeadersAndData(headers, data) => {
-                        self.data = Some(data);
-                        self.headers = Some(headers);
-                        ctx.request_repaint();
-                    }
-                    WorkerMessage::SetHeaders(data) => {
-                        self.headers = Some(data);
-                        ctx.request_repaint();
-                    }
-                    WorkerMessage::FilteredData(data) => {}
                     WorkerMessage::SetData(data) => {
-                        self.data = Some(data);
                         ctx.request_repaint();
                     }
                 }
@@ -478,7 +465,6 @@ impl eframe::App for MyApp {
 
             if ui.button("Open file…").clicked() {
                 if let Some(path) = rfd::FileDialog::new().pick_file() {
-                    let str_path = path.to_str().unwrap_or("");
                     let file_name = path.display().to_string();
                     self.picked_path = Some(file_name.clone());
 
@@ -529,8 +515,13 @@ impl eframe::App for MyApp {
                     table = table.vertical_scroll_offset(self.content_height);
                 }
 
-                let mut empty_headers: Vec<FileHeader> = vec![];
-                let headers = self.headers.as_mut().unwrap_or(&mut empty_headers);
+                let mut headers = self
+                    .header_data
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<FileHeader>>();
 
                 for _ in headers.iter().enumerate() {
                     table = table.column(Column::auto());
@@ -568,13 +559,10 @@ impl eframe::App for MyApp {
                         });
                 });
 
-                let empty_data: Vec<StringRecord> = vec![];
-                let data = self.data.as_ref().unwrap_or(&empty_data);
-
                 let scroll_area = display_table(
                     table_ui,
                     &self.filter,
-                    data,
+                    &self.sheet_data,
                     self.sort_order.unwrap_or(SortOrder::Dsc),
                     self.sort_by_column,
                 );
