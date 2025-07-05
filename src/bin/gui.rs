@@ -4,6 +4,7 @@ use csv::Reader;
 use csv::StringRecord;
 use egui::{Color32, Key, ScrollArea, TextFormat};
 use itertools::Itertools;
+use shared_arena::{ArenaArc, SharedArena};
 use std::cmp::Ordering;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -36,6 +37,36 @@ enum UiMessage {
     FilterColumns(HashSet<usize>),
 }
 
+// let headers = header_data
+//     .lock()
+//     .unwrap()
+//     .iter()
+//     .enumerate()
+//     .filter(|(index, _)| !hidden.contains(index))
+//     .map(|(_, row)| row)
+//     .collect::<Vec<_>>();
+
+// let new_data = sheet_data
+//     .lock()
+//     .unwrap()
+//     .iter()
+//     .map(|record| {
+//         return record
+//             .iter()
+//             .enumerate()
+//             .filter(|(index, _)| !hidden.contains(index))
+//             .map(|(_, value)| value)
+//             .collect::<Vec<_>>();
+//     })
+//     .collect::<Vec<_>>();
+
+// if let Err(e) =
+//     tx_to_ui.send(WorkerMessage::SetHeadersAndData(headers, new_data))
+// {
+//     eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+//     break; // UI thread probably disconnected, exit worker
+// }
+
 fn open_csv_file(path: &str) -> (Reader<File>, Vec<FileHeader>) {
     match read_csv::iterate_csv(path) {
         Ok((csv_reader, headers)) => {
@@ -57,121 +88,10 @@ fn open_csv_file(path: &str) -> (Reader<File>, Vec<FileHeader>) {
     };
 }
 
-impl MyApp {
-    fn new(
-        cc: &eframe::CreationContext<'_>,
-        sheet_data: Arc<Mutex<Vec<StringRecord>>>,
-        header_data: Arc<Mutex<Vec<FileHeader>>>,
-    ) -> Self {
-        let (tx_to_worker, rx_from_ui) = mpsc::channel::<UiMessage>();
-        let (tx_to_ui, rx_from_worker) = mpsc::channel::<WorkerMessage>();
-
-        let sheet = Arc::clone(&sheet_data);
-        let header = Arc::clone(&header_data);
-
-        let sheet_data = Arc::clone(&sheet_data);
-        let header_data = Arc::clone(&header_data);
-
-        thread::spawn(move || {
-            let mut file_reader: Option<Reader<File>> = None;
-
-            // The background thread will continuously listen for new filter text
-            for ui_message in rx_from_ui {
-                match ui_message {
-                    UiMessage::OpenFile(file_name) => {
-                        let (reader, headers) = open_csv_file(&file_name);
-                        file_reader = Some(reader);
-
-                        let new_data = file_reader
-                            .as_mut()
-                            .unwrap()
-                            .records()
-                            .filter_map(|record| record.ok())
-                            .collect::<Vec<_>>();
-
-                        let mut mut_data = sheet_data.lock().unwrap();
-                        let mut header_ref = header_data.lock().unwrap();
-                        *mut_data = new_data.clone();
-                        *header_ref = headers.clone();
-
-                        if let Err(e) = tx_to_ui.send(WorkerMessage::SetData(())) {
-                            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                            break; // UI thread probably disconnected, exit worker
-                        }
-                    }
-                    UiMessage::LoadPage(page_number) => {
-                        // let page_handle = sheet_data.lock().unwrap();
-                        // let page = page_handle
-                        //     .iter()
-                        //     .skip(page_number * 100)
-                        //     .take(100)
-                        //     .collect::<Vec<_>>();
-
-                        // if let Err(e) = tx_to_ui.send(WorkerMessage::SetData(page)) {
-                        //     eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                        //     break; // UI thread probably disconnected, exit worker
-                        // }
-                    }
-                    UiMessage::FilterData(filter) => {}
-                    UiMessage::FilterColumns(hidden) => {
-                        // let headers = header_data
-                        //     .lock()
-                        //     .unwrap()
-                        //     .iter()
-                        //     .enumerate()
-                        //     .filter(|(index, _)| !hidden.contains(index))
-                        //     .map(|(_, row)| row)
-                        //     .collect::<Vec<_>>();
-
-                        // let new_data = sheet_data
-                        //     .lock()
-                        //     .unwrap()
-                        //     .iter()
-                        //     .map(|record| {
-                        //         return record
-                        //             .iter()
-                        //             .enumerate()
-                        //             .filter(|(index, _)| !hidden.contains(index))
-                        //             .map(|(_, value)| value)
-                        //             .collect::<Vec<_>>();
-                        //     })
-                        //     .collect::<Vec<_>>();
-
-                        // if let Err(e) =
-                        //     tx_to_ui.send(WorkerMessage::SetHeadersAndData(headers, new_data))
-                        // {
-                        //     eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                        //     break; // UI thread probably disconnected, exit worker
-                        // }
-                    }
-                }
-            }
-
-            println!("Worker: Exiting.");
-        });
-
-        MyApp {
-            filename: "".to_owned(),
-            headers: None,
-            columns: None,
-            scroll_y: 0.0,
-            inner_rect: 0.0,
-            content_height: 0.0,
-            filter: "".to_owned(),
-            dropped_files: Vec::new(),
-            picked_path: None,
-            page: 0,
-            loading: false,
-            reader: None,
-            sender_to_worker: tx_to_worker,
-            receiver_from_worker: rx_from_worker,
-            reversed: false,
-            sort_by_column: None,
-            sort_order: None,
-            sheet_data: Arc::clone(&sheet),
-            header_data: Arc::clone(&header),
-        }
-    }
+struct SheetData {
+    master: Vec<ArenaArc<StringRecord>>,
+    filtered: Vec<ArenaArc<StringRecord>>,
+    // filtered: Vec<&'arena StringRecord>,
 }
 
 fn main() -> eframe::Result {
@@ -183,13 +103,112 @@ fn main() -> eframe::Result {
     };
 
     let title = &format!("CSV Reader.");
-    let sheet_data: Arc<Mutex<Vec<StringRecord>>> = Arc::new(Mutex::new(vec![]));
+
+    let sheet_data: Arc<Mutex<SheetData>> = Arc::new(Mutex::new(SheetData {
+        master: vec![],
+        filtered: vec![],
+    }));
     let header_data: Arc<Mutex<Vec<FileHeader>>> = Arc::new(Mutex::new(vec![]));
+
+    let csv_arena: Arc<Mutex<SharedArena<StringRecord>>> = Arc::new(Mutex::new(SharedArena::new()));
+
+    let ui_chan = mpsc::channel::<UiMessage>();
+    let worker_chan = mpsc::channel::<WorkerMessage>();
+
+    let arena = Arc::clone(&csv_arena);
 
     eframe::run_native(
         title,
         options,
-        Box::new(|cc| Ok(Box::new(MyApp::new(cc, sheet_data, header_data)))), // <-- Wrap in Ok()
+        Box::new(|cc| {
+            let t_sheet_data = Arc::clone(&sheet_data);
+            let t_header_data = Arc::clone(&header_data);
+            let t_csv_arena = Arc::clone(&arena); // Clone arena for worker thread
+
+            thread::spawn(move || {
+                // The background thread will continuously listen for new filter text
+                for ui_message in ui_chan.1 {
+                    match ui_message {
+                        UiMessage::OpenFile(file_name) => {
+                            let (mut reader, headers) = open_csv_file(&file_name);
+
+                            // Acquire lock on the arena *before* parsing
+                            let mut arena_guard = t_csv_arena.lock().unwrap();
+                            // Clear the old arena contents (effectively deallocates all previous records)
+                            *arena_guard = SharedArena::new();
+
+                            let new_record_refs = reader
+                                .records()
+                                .filter_map(|record| record.ok())
+                                .map(|record| arena_guard.alloc_arc(record))
+                                .collect::<Vec<_>>();
+
+                            let mut mut_data = t_sheet_data.lock().unwrap();
+                            let mut header_ref = t_header_data.lock().unwrap();
+
+                            let filtered = new_record_refs
+                                .iter()
+                                .map(|r| r.clone())
+                                .collect::<Vec<_>>();
+
+                            *mut_data = SheetData {
+                                master: new_record_refs,
+                                filtered,
+                            };
+                            *header_ref = headers.clone();
+
+                            if let Err(e) = worker_chan.0.send(WorkerMessage::SetData(())) {
+                                eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                                break; // UI thread probably disconnected, exit worker
+                            }
+                        }
+                        UiMessage::LoadPage(page_number) => {}
+                        UiMessage::FilterData(filter) => {
+                            let mut mut_data = t_sheet_data.lock().unwrap();
+
+                            let filtered = mut_data
+                                .master
+                                .iter()
+                                .filter(|r| r.iter().any(|c| c.contains(&filter)))
+                                .map(|r| r.clone())
+                                .collect::<Vec<_>>();
+
+                            mut_data.filtered = filtered;
+
+                            if let Err(e) = worker_chan.0.send(WorkerMessage::SetData(())) {
+                                eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                                break; // UI thread probably disconnected, exit worker
+                            }
+                        }
+                        UiMessage::FilterColumns(hidden) => {}
+                    }
+                }
+
+                println!("Worker: Exiting.");
+            });
+
+            Ok(Box::new(MyApp {
+                filename: "".to_owned(),
+                headers: None,
+                columns: None,
+                scroll_y: 0.0,
+                inner_rect: 0.0,
+                content_height: 0.0,
+                filter: "".to_owned(),
+                dropped_files: Vec::new(),
+                picked_path: None,
+                page: 0,
+                loading: false,
+                reader: None,
+                sender_to_worker: ui_chan.0,
+                receiver_from_worker: worker_chan.1,
+                reversed: false,
+                sort_by_column: None,
+                sort_order: None,
+                sheet_data,
+                header_data,
+            }))
+        }),
     )
 }
 
@@ -227,7 +246,7 @@ struct MyApp {
     reversed: bool,
     sort_by_column: Option<usize>,
     sort_order: Option<SortOrder>,
-    sheet_data: Arc<Mutex<Vec<StringRecord>>>,
+    sheet_data: Arc<Mutex<SheetData>>,
     header_data: Arc<Mutex<Vec<FileHeader>>>,
 }
 
@@ -268,7 +287,7 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
 fn display_table(
     table_ui: Table,
     filter: &str,
-    sheet_data: &Arc<Mutex<Vec<StringRecord>>>,
+    sheet_data: &Arc<Mutex<SheetData>>,
     sort_order: SortOrder,
     sort_by_column: Option<usize>,
 ) -> ScrollAreaOutput<()> {
@@ -277,6 +296,7 @@ fn display_table(
 
         let rows = if let Some(column) = sort_by_column {
             guard
+                .filtered
                 .iter()
                 .sorted_by(|a, b| {
                     let a = a.get(column).unwrap_or("");
@@ -295,7 +315,7 @@ fn display_table(
                 })
                 .collect::<Vec<_>>()
         } else {
-            guard.iter().collect::<Vec<_>>()
+            guard.filtered.iter().collect::<Vec<_>>()
         };
 
         body.rows(18.0, rows.len(), |mut row| {
@@ -487,7 +507,14 @@ impl eframe::App for MyApp {
 
             ui.separator();
 
-            ui.text_edit_singleline(&mut self.filter);
+            if ui.text_edit_singleline(&mut self.filter).changed() {
+                if let Err(e) = self
+                    .sender_to_worker
+                    .send(UiMessage::FilterData(self.filter.clone()))
+                {
+                    eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                }
+            };
 
             ui.separator();
 
