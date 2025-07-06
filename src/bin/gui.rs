@@ -286,11 +286,13 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
 
 fn display_table(
     table_ui: Table,
-    filter: &str,
-    sheet_data: &Arc<Mutex<SheetData>>,
+    app: &mut MyApp,
     sort_order: SortOrder,
     sort_by_column: Option<usize>,
 ) -> ScrollAreaOutput<()> {
+    let filter = app.filter.clone();
+    let sheet_data = &app.sheet_data;
+
     return table_ui.body(|body| {
         let guard = sheet_data.lock().unwrap();
 
@@ -325,8 +327,8 @@ fn display_table(
 
             row_data.iter().enumerate().for_each(|(_, text)| {
                 row.col(|ui| {
-                    if filter.is_empty() {
-                        ui.label(text);
+                    let label = if filter.is_empty() {
+                        ui.label(text)
                     } else {
                         use egui::text::LayoutJob;
 
@@ -343,13 +345,13 @@ fn display_table(
                                     },
                                 );
 
-                                ui.label(job);
+                                ui.label(job)
                             } else {
-                                let text: Vec<&str> = text.split(filter).collect();
+                                let text: Vec<&str> = text.split(&filter).collect();
 
                                 if text.len() == 1 {
                                     job.append(
-                                        filter,
+                                        &filter,
                                         0.0,
                                         TextFormat {
                                             color: Color32::YELLOW,
@@ -357,11 +359,11 @@ fn display_table(
                                         },
                                     );
                                     job.append(text[0], 0.0, TextFormat::default());
-                                    ui.label(job);
+                                    ui.label(job)
                                 } else if text.len() == 2 {
                                     job.append(text[0], 0.0, TextFormat::default());
                                     job.append(
-                                        filter,
+                                        &filter,
                                         0.0,
                                         TextFormat {
                                             color: Color32::YELLOW,
@@ -370,12 +372,18 @@ fn display_table(
                                     );
                                     job.append(text[1], 0.0, TextFormat::default());
 
-                                    ui.label(job);
+                                    ui.label(job)
+                                } else {
+                                    ui.label(job)
                                 }
                             }
                         } else {
-                            ui.label(text);
+                            ui.label(text)
                         }
+                    };
+
+                    if label.clicked() {
+                        app.filter = text.to_string();
                     }
                 });
             });
@@ -503,7 +511,7 @@ impl eframe::App for MyApp {
                 }
             }
 
-            show_dropped_files(ui, &self.dropped_files);
+            // show_dropped_files(ui, &self.dropped_files);
 
             ui.separator();
 
@@ -588,8 +596,7 @@ impl eframe::App for MyApp {
 
                 let scroll_area = display_table(
                     table_ui,
-                    &self.filter,
-                    &self.sheet_data,
+                    self,
                     self.sort_order.unwrap_or(SortOrder::Dsc),
                     self.sort_by_column,
                 );
@@ -619,7 +626,12 @@ impl eframe::App for MyApp {
 
                 let str_path = path.to_str().unwrap_or("");
 
-                // open_csv_file(self, str_path);
+                if let Err(e) = self
+                    .sender_to_worker
+                    .send(UiMessage::OpenFile(str_path.to_string()))
+                {
+                    eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                }
             }
         });
 
