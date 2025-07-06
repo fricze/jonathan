@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
+use crate::egui::Context;
 use csv::Reader;
 use csv::StringRecord;
 use egui::{Color32, Key, ScrollArea, TextFormat};
@@ -91,7 +92,6 @@ fn open_csv_file(path: &str) -> (Reader<File>, Vec<FileHeader>) {
 struct SheetData {
     master: Vec<ArenaArc<StringRecord>>,
     filtered: Vec<ArenaArc<StringRecord>>,
-    // filtered: Vec<&'arena StringRecord>,
 }
 
 fn main() -> eframe::Result {
@@ -188,7 +188,6 @@ fn main() -> eframe::Result {
             });
 
             Ok(Box::new(MyApp {
-                filename: "".to_owned(),
                 headers: None,
                 columns: None,
                 scroll_y: 0.0,
@@ -202,7 +201,6 @@ fn main() -> eframe::Result {
                 reader: None,
                 sender_to_worker: ui_chan.0,
                 receiver_from_worker: worker_chan.1,
-                reversed: false,
                 sort_by_column: None,
                 sort_order: None,
                 sheet_data,
@@ -227,7 +225,6 @@ struct FileHeader {
 }
 
 struct MyApp {
-    filename: String,
     headers: Option<Vec<FileHeader>>,
     columns: Option<Vec<FileHeader>>,
     scroll_y: f32,
@@ -243,7 +240,6 @@ struct MyApp {
     sender_to_worker: Sender<UiMessage>,
     // Channel for receiving messages from the background thread to the UI thread
     receiver_from_worker: Receiver<WorkerMessage>,
-    reversed: bool,
     sort_by_column: Option<usize>,
     sort_order: Option<SortOrder>,
     sheet_data: Arc<Mutex<SheetData>>,
@@ -285,6 +281,7 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
 }
 
 fn display_table(
+    ctx: &Context,
     table_ui: Table,
     app: &mut MyApp,
     sort_order: SortOrder,
@@ -383,7 +380,22 @@ fn display_table(
                     };
 
                     if label.clicked() {
-                        app.filter = text.to_string();
+                        ctx.input(|input| {
+                            if input.modifiers.command {
+                            } else {
+                                app.filter = text.to_string();
+
+                                if let Err(e) = &app
+                                    .sender_to_worker
+                                    .send(UiMessage::FilterData(app.filter.clone()))
+                                {
+                                    eprintln!(
+                                        "Worker: Failed to send page data to UI thread: {:?}",
+                                        e
+                                    );
+                                }
+                            }
+                        });
                     }
                 });
             });
@@ -533,6 +545,16 @@ impl eframe::App for MyApp {
                     .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
                     .min_scrolled_height(0.0);
 
+                if ctx.input(|i| i.key_pressed(Key::Escape)) {
+                    self.filter = "".to_string();
+                    if let Err(e) = self
+                        .sender_to_worker
+                        .send(UiMessage::FilterData("".to_string()))
+                    {
+                        eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                    }
+                }
+
                 if ctx.input(|i| i.key_pressed(Key::PageUp)) {
                     table = table
                         .vertical_scroll_offset(self.scroll_y.sub(self.inner_rect / 2.0).max(0.0));
@@ -595,6 +617,7 @@ impl eframe::App for MyApp {
                 });
 
                 let scroll_area = display_table(
+                    ctx,
                     table_ui,
                     self,
                     self.sort_order.unwrap_or(SortOrder::Dsc),
@@ -635,8 +658,8 @@ impl eframe::App for MyApp {
             }
         });
 
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(
-            file_name.unwrap_or("".to_string()),
-        ));
+        if let Some(file_name) = file_name {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Title(file_name));
+        }
     }
 }
