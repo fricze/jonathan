@@ -12,25 +12,22 @@ name = "tui"
 path = "src/bin/tui.rs"
 
 [[bin]]
-name = "re_gui"
-path = "src/bin/re_gui.rs"
+name = "dock"
+path = "src/bin/dock.rs"
 
 [dependencies]
 egui_file = "0.22.1"
-tinyfiledialogs = "3.0"
-gpui = { git = "https://github.com/zed-industries/zed" }
 crossterm = "0.27"
 csv = "1.3"
 clap = { version = "4", features = ["derive"] }
-color-eyre = "0.6.5"
 itertools = "0.14.0"
 rand = "0.9.1"
 unicode-width = "0.2.0"
 fakeit = "1.3.0"
 iocraft = "0.7.9"
 smol = "2.0.2"
-egui = "0.31"
-eframe = { version = "0.31", default-features = false, features = [
+egui = "0.32"
+eframe = { version = "0.32", default-features = false, features = [
     "accesskit",     # Make egui compatible with screen readers. NOTE: adds a lot of dependencies.
     "default_fonts", # Embed the default egui fonts.
     "glow",          # Use the glow rendering backend. Alternative: "wgpu".
@@ -41,7 +38,16 @@ eframe = { version = "0.31", default-features = false, features = [
 log = "0.4.27"
 chrono = "0.4.41"
 arboard = "3.5.0"
-egui_extras = "0.31.1"
+egui_extras = "0.32.0"
 rfd = "0.15.3"
 sha2 = "0.10.9"
 shared_arena = "0.8.4"
+polars = { version = "0.49.1", features = [
+    "csv",
+    "lazy",
+    "simd",
+    "performant",
+    "dtype-date",
+    "dtype-datetime",
+] }
+egui_dock = "0.17.0"
