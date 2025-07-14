@@ -3,7 +3,7 @@
 use eframe::{NativeOptions, egui};
 
 use egui_dock::tab_viewer::OnCloseResponse;
-use egui_dock::{DockArea, DockState, NodeIndex, Style};
+use egui_dock::{DockArea, DockState, NodeIndex, Style, SurfaceIndex};
 
 fn main() -> eframe::Result<()> {
     let options = NativeOptions::default();
@@ -14,13 +14,15 @@ fn main() -> eframe::Result<()> {
     )
 }
 
-struct TabViewer {}
+struct TabViewer<'a> {
+    added_nodes: &'a mut Vec<(SurfaceIndex, NodeIndex)>,
+}
 
-impl egui_dock::TabViewer for TabViewer {
-    type Tab = String;
+impl egui_dock::TabViewer for TabViewer<'_> {
+    type Tab = usize;
 
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
-        (&*tab).into()
+        format!("Tab {tab}").into()
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
@@ -31,35 +33,43 @@ impl egui_dock::TabViewer for TabViewer {
         println!("Closed tab: {_tab}");
         OnCloseResponse::Close
     }
+
+    fn on_add(&mut self, surface: SurfaceIndex, node: NodeIndex) {
+        self.added_nodes.push((surface, node));
+    }
 }
 
 struct MyApp {
-    tree: DockState<String>,
+    tree: DockState<usize>,
+    counter: usize,
 }
 
 impl Default for MyApp {
     fn default() -> Self {
-        let mut tree = DockState::new(vec!["tab1".to_owned(), "tab2".to_owned()]);
+        let tree = DockState::new(vec![1, 2]);
 
-        // You can modify the tree before constructing the dock
-        let [a, b] =
-            tree.main_surface_mut()
-                .split_left(NodeIndex::root(), 0.3, vec!["tab3".to_owned()]);
-        let [_, _] = tree
-            .main_surface_mut()
-            .split_below(a, 0.7, vec!["tab4".to_owned()]);
-        let [_, _] = tree
-            .main_surface_mut()
-            .split_below(b, 0.5, vec!["tab5".to_owned()]);
-
-        Self { tree }
+        Self { tree, counter: 3 }
     }
 }
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        let mut added_nodes = Vec::new();
+
         DockArea::new(&mut self.tree)
             .style(Style::from_egui(ctx.style().as_ref()))
-            .show(ctx, &mut TabViewer {});
+            .show_add_buttons(true)
+            .show(
+                ctx,
+                &mut TabViewer {
+                    added_nodes: &mut added_nodes,
+                },
+            );
+
+        added_nodes.drain(..).for_each(|(surface, node)| {
+            self.tree.set_focused_node_and_surface((surface, node));
+            self.tree.push_to_focused_leaf(self.counter);
+            self.counter += 1;
+        });
     }
 }

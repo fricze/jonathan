@@ -134,50 +134,35 @@ fn main() -> eframe::Result {
                 for ui_message in ui_chan.1 {
                     match ui_message {
                         UiMessage::OpenFile(file_name) => {
-                            // let (mut reader, headers) = open_csv_file(&file_name);
+                            let (mut reader, headers) = open_csv_file(&file_name);
 
-                            let path = file_name.clone();
-                            let df = CsvReadOptions {
-                                ignore_errors: true,
-                                ..CsvReadOptions::default()
-                            }
-                            .try_into_reader_with_file_path(Some(path.into()))
-                            .unwrap()
-                            .finish()
-                            .unwrap();
+                            let mut arena_guard = t_csv_arena.lock().unwrap();
+                            *arena_guard = SharedArena::new();
 
-                            if let Err(e) = worker_chan.0.send(WorkerMessage::SetDf(df)) {
+                            let new_record_refs = reader
+                                .records()
+                                .filter_map(|record| record.ok())
+                                .map(|record| arena_guard.alloc_arc(record))
+                                .collect::<Vec<_>>();
+
+                            let filtered = new_record_refs
+                                .iter()
+                                .map(|r| r.clone())
+                                .collect::<Vec<_>>();
+
+                            let mut master_data = t_sheet_master.lock().unwrap();
+                            let mut filtered_data = t_sheet_filtered.lock().unwrap();
+                            let mut header_ref = t_header_data.lock().unwrap();
+
+                            *master_data = new_record_refs;
+                            *filtered_data = filtered;
+
+                            *header_ref = headers.clone();
+
+                            if let Err(e) = worker_chan.0.send(WorkerMessage::SetData(())) {
                                 eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
                                 break; // UI thread probably disconnected, exit worker
                             }
-
-                            // let mut arena_guard = t_csv_arena.lock().unwrap();
-                            // *arena_guard = SharedArena::new();
-
-                            // let new_record_refs = reader
-                            //     .records()
-                            //     .filter_map(|record| record.ok())
-                            //     .map(|record| arena_guard.alloc_arc(record))
-                            //     .collect::<Vec<_>>();
-
-                            // let filtered = new_record_refs
-                            //     .iter()
-                            //     .map(|r| r.clone())
-                            //     .collect::<Vec<_>>();
-
-                            // let mut master_data = t_sheet_master.lock().unwrap();
-                            // let mut filtered_data = t_sheet_filtered.lock().unwrap();
-                            // let mut header_ref = t_header_data.lock().unwrap();
-
-                            // *master_data = new_record_refs;
-                            // *filtered_data = filtered;
-
-                            // *header_ref = headers.clone();
-
-                            // if let Err(e) = worker_chan.0.send(WorkerMessage::SetData(())) {
-                            //     eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                            //     break; // UI thread probably disconnected, exit worker
-                            // }
                         }
                         UiMessage::FilterData(filter, column) => {
                             let master_data = t_sheet_master.lock().unwrap();
@@ -212,7 +197,6 @@ fn main() -> eframe::Result {
             });
 
             Ok(Box::new(MyApp {
-                headers: None,
                 columns: None,
                 scroll_y: 0.0,
                 inner_rect: 0.0,
@@ -253,7 +237,6 @@ struct FileHeader {
 }
 
 struct MyApp {
-    headers: Option<Vec<FileHeader>>,
     columns: Option<Vec<FileHeader>>,
     scroll_y: f32,
     inner_rect: f32,
@@ -318,7 +301,6 @@ fn display_table(
     sort_by_column: Option<usize>,
 ) -> ScrollAreaOutput<()> {
     let filter = app.filter.clone();
-    let df = &mut app.df;
 
     let default: Vec<FileHeader> = vec![];
 
@@ -327,87 +309,89 @@ fn display_table(
         .as_ref()
         .unwrap_or(&default)
         .iter()
-        .filter(|c| c.visible)
-        .map(|c| &c.name)
-        .collect::<Vec<&String>>();
+        .enumerate()
+        .filter(|(_, c)| c.visible)
+        .map(|(index, _)| index)
+        .collect::<Vec<usize>>();
 
-    if let Some(df) = df {
-        let df = df.select(visible_columns).unwrap();
+    let sheet = Arc::clone(&app.sheet_filtered);
 
-        let body = table_ui.body(|body| {
-            let height = df.height();
+    let filtered_data = sheet.lock().unwrap();
 
-            body.rows(18.0, height, |mut row| {
-                let row_index = row.index();
+    return table_ui.body(|body| {
+        let table_height = filtered_data.len();
 
-                let row_data = df.get_row(row_index).unwrap();
+        body.rows(18.0, table_height, |mut row| {
+            let row_index = row.index();
 
-                row_data
-                    .0
-                    .iter()
-                    .map(|text| text.str_value().to_string())
-                    .enumerate()
-                    .for_each(|(col_index, text)| {
-                        let text: &str = text.as_ref();
+            let row_data = filtered_data.get(row_index).unwrap();
 
-                        row.col(|ui| {
-                            let label = if filter.is_empty() {
-                                ui.label(text)
-                            } else {
-                                use egui::text::LayoutJob;
+            row_data
+                .iter()
+                .map(|text| text.to_string())
+                .enumerate()
+                .filter(|(index, _)| visible_columns.contains(index))
+                .for_each(|(col_index, text)| {
+                    let text: &str = text.as_ref();
 
-                                if text.contains(&filter) {
-                                    let mut job = LayoutJob::default();
+                    row.col(|ui| {
+                        let label = if filter.is_empty() {
+                            ui.label(text)
+                        } else {
+                            use egui::text::LayoutJob;
 
-                                    if text == filter {
+                            if text.contains(&filter) {
+                                let mut job = LayoutJob::default();
+
+                                if text == filter {
+                                    job.append(
+                                        text,
+                                        0.0,
+                                        TextFormat {
+                                            color: Color32::YELLOW,
+                                            ..Default::default()
+                                        },
+                                    );
+
+                                    ui.label(job)
+                                } else {
+                                    let text: Vec<&str> = text.split(&filter).collect();
+
+                                    if text.len() == 1 {
                                         job.append(
-                                            text,
+                                            &filter,
                                             0.0,
                                             TextFormat {
                                                 color: Color32::YELLOW,
                                                 ..Default::default()
                                             },
                                         );
+                                        job.append(text[0], 0.0, TextFormat::default());
+                                        ui.label(job)
+                                    } else if text.len() == 2 {
+                                        job.append(text[0], 0.0, TextFormat::default());
+                                        job.append(
+                                            &filter,
+                                            0.0,
+                                            TextFormat {
+                                                color: Color32::YELLOW,
+                                                ..Default::default()
+                                            },
+                                        );
+                                        job.append(text[1], 0.0, TextFormat::default());
 
                                         ui.label(job)
                                     } else {
-                                        let text: Vec<&str> = text.split(&filter).collect();
-
-                                        if text.len() == 1 {
-                                            job.append(
-                                                &filter,
-                                                0.0,
-                                                TextFormat {
-                                                    color: Color32::YELLOW,
-                                                    ..Default::default()
-                                                },
-                                            );
-                                            job.append(text[0], 0.0, TextFormat::default());
-                                            ui.label(job)
-                                        } else if text.len() == 2 {
-                                            job.append(text[0], 0.0, TextFormat::default());
-                                            job.append(
-                                                &filter,
-                                                0.0,
-                                                TextFormat {
-                                                    color: Color32::YELLOW,
-                                                    ..Default::default()
-                                                },
-                                            );
-                                            job.append(text[1], 0.0, TextFormat::default());
-
-                                            ui.label(job)
-                                        } else {
-                                            ui.label(job)
-                                        }
+                                        ui.label(job)
                                     }
-                                } else {
-                                    ui.label(text)
                                 }
-                            };
+                            } else {
+                                ui.label(text)
+                            }
+                        };
 
-                            if label.clicked() {
-                                ctx.input(|input| {
+                        if label.clicked() {
+                            ctx.input(|input| {
                                 app.filter = text.to_string();
                                 app.loading = true;
 
@@ -431,16 +415,11 @@ fn display_table(
                                     }
                                 }
                             })
-                            }
-                        });
+                        }
                     });
-            });
+                });
         });
-
-        return body;
-    } else {
-        return table_ui.body(|ui| {});
-    }
+    });
 }
 
 fn show_dropped_files(ui: &mut egui::Ui, dropped_files: &Vec<egui::DroppedFile>) {
@@ -616,6 +595,25 @@ impl eframe::App for MyApp {
                         self.loading = false;
                     }
                     WorkerMessage::SetDf(df) => {
+                        let columns = df.get_columns();
+
+                        let cols = columns
+                            .iter()
+                            .map(|c| FileHeader {
+                                unique_vals: c
+                                    .unique()
+                                    .unwrap_or(polars::prelude::Column::default())
+                                    .into_materialized_series()
+                                    .iter()
+                                    .map(|v| v.to_string())
+                                    .collect::<Vec<_>>(),
+                                name: c.name().to_string(),
+                                visible: true,
+                                dtype: Some(c.dtype().to_string()),
+                                ..FileHeader::default()
+                            })
+                            .collect::<Vec<_>>();
+
                         self.df = Some(df);
 
                         self.loading = false;
@@ -708,7 +706,12 @@ impl eframe::App for MyApp {
 
                 let str_path = path.to_str().unwrap_or("");
 
+                let (_, headers) = open_csv_file(str_path);
+
+                self.columns = Some(headers.clone());
+
                 self.loading = true;
+
                 if let Err(e) = self
                     .sender_to_worker
                     .send(UiMessage::OpenFile(str_path.to_string()))

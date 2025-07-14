@@ -8,6 +8,10 @@ name = "gui"
 path = "src/bin/gui.rs"
 
 [[bin]]
+name = "guicsv"
+path = "src/bin/guicsv.rs"
+
+[[bin]]
 name = "tui"
 path = "src/bin/tui.rs"
 
