@@ -2,6 +2,8 @@
 
 use polars::df;
 use polars::prelude::{AnyValue, CsvReadOptions, CsvWriter, DataFrame, SerReader, SerWriter};
+use poll_promise::Promise;
+use std::sync::Arc;
 
 use crate::egui::Context;
 use csv::Reader;
@@ -11,7 +13,6 @@ use itertools::Itertools;
 use shared_arena::{ArenaArc, SharedArena};
 use std::cmp::Ordering;
 use std::str::FromStr;
-use std::sync::Arc;
 
 use std::sync::Mutex;
 
@@ -19,7 +20,6 @@ use egui::scroll_area::ScrollAreaOutput;
 use std::fs::File;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::thread;
 use std::{
     collections::HashSet,
     ops::{Add, Sub},
@@ -30,15 +30,9 @@ use egui_extras::{Column, Table, TableBuilder};
 use eframe::egui;
 use jonathan::read_csv;
 
-enum WorkerMessage {
-    SetData(()),
-    SetDf(DataFrame),
-}
-
 enum UiMessage {
     OpenFile(String),
     FilterData(String, Option<usize>),
-    FilterColumns(HashSet<usize>),
 }
 
 // Demonstrates how to replace all fonts.
@@ -46,8 +40,6 @@ fn replace_fonts(ctx: &egui::Context) {
     // Start with the default fonts (we will be adding to them rather than replacing them).
     let mut fonts = egui::FontDefinitions::default();
 
-    // Install my own font (maybe supporting non-latin characters).
-    // .ttf and .otf files supported.
     fonts.font_data.insert(
         "IBMPlex".to_owned(),
         std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
@@ -55,21 +47,17 @@ fn replace_fonts(ctx: &egui::Context) {
         ))),
     );
 
-    // Put my font first (highest priority) for proportional text:
+    // Put font first (highest priority)
     fonts
         .families
         .entry(egui::FontFamily::Proportional)
         .or_default()
         .insert(0, "IBMPlex".to_owned());
-
-    // Put my font as last fallback for monospace:
     fonts
         .families
         .entry(egui::FontFamily::Monospace)
         .or_default()
         .insert(0, "IBMPlex".to_owned());
-
-    // .push("IBMPlex".to_owned());
 
     // Tell egui to use these fonts:
     ctx.set_fonts(fonts);
@@ -105,96 +93,15 @@ fn main() -> eframe::Result {
 
     let title = &format!("CSV Reader.");
 
-    let sheet_master: Arc<Mutex<Vec<ArenaArc<StringRecord>>>> = Arc::new(Mutex::new(vec![]));
     let sheet_filtered: Arc<Mutex<Vec<ArenaArc<StringRecord>>>> = Arc::new(Mutex::new(vec![]));
 
-    let header_data: Arc<Mutex<Vec<FileHeader>>> = Arc::new(Mutex::new(vec![]));
-
-    let csv_arena: Arc<Mutex<SharedArena<StringRecord>>> = Arc::new(Mutex::new(SharedArena::new()));
-
     let ui_chan = mpsc::channel::<UiMessage>();
-    let worker_chan = mpsc::channel::<WorkerMessage>();
-
-    let arena = Arc::clone(&csv_arena);
 
     eframe::run_native(
         title,
         options,
         Box::new(|cc| {
             replace_fonts(&cc.egui_ctx);
-
-            let t_sheet_master = Arc::clone(&sheet_master);
-            let t_sheet_filtered = Arc::clone(&sheet_filtered);
-
-            let t_header_data = Arc::clone(&header_data);
-            let t_csv_arena = Arc::clone(&arena); // Clone arena for worker thread
-
-            thread::spawn(move || {
-                // The background thread will continuously listen for new filter text
-                for ui_message in ui_chan.1 {
-                    match ui_message {
-                        UiMessage::OpenFile(file_name) => {
-                            let (mut reader, headers) = open_csv_file(&file_name);
-
-                            let mut arena_guard = t_csv_arena.lock().unwrap();
-                            *arena_guard = SharedArena::new();
-
-                            let new_record_refs = reader
-                                .records()
-                                .filter_map(|record| record.ok())
-                                .map(|record| arena_guard.alloc_arc(record))
-                                .collect::<Vec<_>>();
-
-                            let filtered = new_record_refs
-                                .iter()
-                                .map(|r| r.clone())
-                                .collect::<Vec<_>>();
-
-                            let mut master_data = t_sheet_master.lock().unwrap();
-                            let mut filtered_data = t_sheet_filtered.lock().unwrap();
-                            let mut header_ref = t_header_data.lock().unwrap();
-
-                            *master_data = new_record_refs;
-                            *filtered_data = filtered;
-
-                            *header_ref = headers.clone();
-
-                            if let Err(e) = worker_chan.0.send(WorkerMessage::SetData(())) {
-                                eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                                break; // UI thread probably disconnected, exit worker
-                            }
-                        }
-                        UiMessage::FilterData(filter, column) => {
-                            let master_data = t_sheet_master.lock().unwrap();
-
-                            let filtered = if let Some(column) = column {
-                                master_data
-                                    .iter()
-                                    .filter(|r| r.iter().nth(column).unwrap().contains(&filter))
-                                    .map(|r| r.clone())
-                                    .collect::<Vec<_>>()
-                            } else {
-                                master_data
-                                    .iter()
-                                    .filter(|r| r.iter().any(|c| c.contains(&filter)))
-                                    .map(|r| r.clone())
-                                    .collect::<Vec<_>>()
-                            };
-
-                            let mut filtered_data = t_sheet_filtered.lock().unwrap();
-                            *filtered_data = filtered;
-
-                            if let Err(e) = worker_chan.0.send(WorkerMessage::SetData(())) {
-                                eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                                break; // UI thread probably disconnected, exit worker
-                            }
-                        }
-                        UiMessage::FilterColumns(hidden) => {}
-                    }
-                }
-
-                println!("Worker: Exiting.");
-            });
 
             Ok(Box::new(MyApp {
                 columns: None,
@@ -204,17 +111,18 @@ fn main() -> eframe::Result {
                 filter: "".to_owned(),
                 dropped_files: Vec::new(),
                 picked_path: None,
-                page: 0,
                 loading: false,
-                reader: None,
-                sender_to_worker: ui_chan.0,
-                receiver_from_worker: worker_chan.1,
+                sender: ui_chan.0,
+                receiver: ui_chan.1,
                 sort_by_column: None,
                 sort_order: None,
-                sheet_master,
                 sheet_filtered,
-                header_data,
-                df: None,
+                promised_data: poll_promise::Promise::spawn_thread("empty_data", move || {
+                    Arc::new(vec![])
+                }),
+                filtered_data: poll_promise::Promise::spawn_thread("empty_data", move || {
+                    Arc::new(vec![])
+                }),
             }))
         }),
     )
@@ -236,6 +144,8 @@ struct FileHeader {
     sort_dir: Option<bool>,
 }
 
+type ArcSheet = Vec<Arc<StringRecord>>;
+
 struct MyApp {
     columns: Option<Vec<FileHeader>>,
     scroll_y: f32,
@@ -244,19 +154,14 @@ struct MyApp {
     filter: String,
     dropped_files: Vec<egui::DroppedFile>,
     picked_path: Option<String>,
-    page: usize,
     loading: bool,
-    reader: Option<csv::Reader<File>>,
-    // Channel for sending messages from the UI thread to the background thread
-    sender_to_worker: Sender<UiMessage>,
-    // Channel for receiving messages from the background thread to the UI thread
-    receiver_from_worker: Receiver<WorkerMessage>,
+    sender: Sender<UiMessage>,
+    receiver: Receiver<UiMessage>,
     sort_by_column: Option<usize>,
     sort_order: Option<SortOrder>,
-    sheet_master: Arc<Mutex<Vec<ArenaArc<StringRecord>>>>,
     sheet_filtered: Arc<Mutex<Vec<ArenaArc<StringRecord>>>>,
-    header_data: Arc<Mutex<Vec<FileHeader>>>,
-    df: Option<DataFrame>,
+    promised_data: Promise<Arc<ArcSheet>>,
+    filtered_data: Promise<Arc<ArcSheet>>,
 }
 
 fn preview_files_being_dropped(ctx: &egui::Context) {
@@ -314,17 +219,24 @@ fn display_table(
         .map(|(index, _)| index)
         .collect::<Vec<usize>>();
 
-    let sheet = Arc::clone(&app.sheet_filtered);
+    let filtered_data = app.filtered_data.ready();
+    let master_data = app.promised_data.ready();
 
-    let filtered_data = sheet.lock().unwrap();
+    let def_vec: Vec<Arc<StringRecord>> = vec![];
+    let default_data: Arc<Vec<Arc<StringRecord>>> = Arc::new(def_vec);
+
+    let sheet_data = match filtered_data {
+        Some(data) if !data.is_empty() => data,
+        _ => master_data.unwrap_or(&default_data),
+    };
 
     return table_ui.body(|body| {
-        let table_height = filtered_data.len();
+        let table_height = sheet_data.len();
 
         body.rows(18.0, table_height, |mut row| {
             let row_index = row.index();
 
-            let row_data = filtered_data.get(row_index).unwrap();
+            let row_data = sheet_data.get(row_index).unwrap();
 
             row_data
                 .iter()
@@ -396,18 +308,20 @@ fn display_table(
                                 app.loading = true;
 
                                 if input.modifiers.command {
-                                    if let Err(e) = &app.sender_to_worker.send(
-                                        UiMessage::FilterData(app.filter.clone(), Some(col_index)),
-                                    ) {
+                                    if let Err(e) = &app.sender.send(UiMessage::FilterData(
+                                        app.filter.clone(),
+                                        Some(col_index),
+                                    )) {
                                         eprintln!(
                                             "Worker: Failed to send page data to UI thread: {:?}",
                                             e
                                         );
                                     }
                                 } else {
-                                    if let Err(e) = &app.sender_to_worker.send(
-                                        UiMessage::FilterData(app.filter.clone(), Some(col_index)),
-                                    ) {
+                                    if let Err(e) = &app.sender.send(UiMessage::FilterData(
+                                        app.filter.clone(),
+                                        Some(col_index),
+                                    )) {
                                         eprintln!(
                                             "Worker: Failed to send page data to UI thread: {:?}",
                                             e
@@ -420,42 +334,6 @@ fn display_table(
                 });
         });
     });
-}
-
-fn show_dropped_files(ui: &mut egui::Ui, dropped_files: &Vec<egui::DroppedFile>) {
-    if !dropped_files.is_empty() {
-        ui.group(|ui| {
-            ui.label("Dropped files:");
-
-            for file in dropped_files {
-                let mut info = if let Some(path) = &file.path {
-                    path.display().to_string()
-                } else if !file.name.is_empty() {
-                    file.name.clone()
-                } else {
-                    "???".to_owned()
-                };
-
-                let mut additional_info = vec![];
-
-                if file.mime != "csv" {
-                    additional_info.push(format!("type: {}", file.mime));
-                }
-
-                if !file.mime.is_empty() {
-                    additional_info.push(format!("type: {}", file.mime));
-                }
-                if let Some(bytes) = &file.bytes {
-                    additional_info.push(format!("{} bytes", bytes.len()));
-                }
-                if !additional_info.is_empty() {
-                    info += &format!(" ({})", additional_info.join(", "));
-                }
-
-                ui.label(info);
-            }
-        });
-    }
 }
 
 fn display_headers(ui: &mut egui::Ui, headers: &mut Vec<FileHeader>) {
@@ -489,17 +367,21 @@ fn open_file(app: &mut MyApp, ctx: &egui::Context) {
         let file_name = path.display().to_string();
         app.picked_path = Some(file_name.clone());
 
-        let (_, headers) = open_csv_file(&file_name);
+        let (mut reader, headers) = open_csv_file(&file_name);
 
         app.columns = Some(headers.clone());
 
         app.loading = true;
-        if let Err(e) = app
-            .sender_to_worker
-            .send(UiMessage::OpenFile(file_name.clone()))
-        {
-            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-        }
+
+        app.promised_data = poll_promise::Promise::spawn_thread("slow_operation", move || {
+            Arc::new(
+                reader
+                    .records()
+                    .filter_map(|record| record.ok())
+                    .map(|r| Arc::new(r))
+                    .collect::<Vec<_>>(),
+            )
+        });
 
         ctx.send_viewport_cmd(egui::ViewportCommand::Title(file_name));
     }
@@ -589,40 +471,40 @@ fn display_table_headers<'a>(app: &mut MyApp, table: TableBuilder<'a>) -> Table<
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         egui::CentralPanel::default().show(&ctx, |ui| {
-            while let Ok(message) = self.receiver_from_worker.try_recv() {
+            while let Ok(message) = self.receiver.try_recv() {
                 match message {
-                    WorkerMessage::SetData(data) => {
-                        self.loading = false;
+                    UiMessage::FilterData(filter, column) => {
+                        if let Some(master_data) = self.promised_data.ready() {
+                            let cloned = Arc::clone(&master_data);
+                            let filter = self.filter.clone();
+
+                            self.filtered_data =
+                                poll_promise::Promise::spawn_thread("filter_sheet", move || {
+                                    Arc::new(
+                                        cloned
+                                            .iter()
+                                            .filter(|r| r.iter().any(|c| c.contains(&filter)))
+                                            .map(|r| r.clone())
+                                            .collect::<Vec<_>>(),
+                                    )
+                                });
+                        }
                     }
-                    WorkerMessage::SetDf(df) => {
-                        let columns = df.get_columns();
-
-                        let cols = columns
-                            .iter()
-                            .map(|c| FileHeader {
-                                unique_vals: c
-                                    .unique()
-                                    .unwrap_or(polars::prelude::Column::default())
-                                    .into_materialized_series()
-                                    .iter()
-                                    .map(|v| v.to_string())
-                                    .collect::<Vec<_>>(),
-                                name: c.name().to_string(),
-                                visible: true,
-                                dtype: Some(c.dtype().to_string()),
-                                ..FileHeader::default()
-                            })
-                            .collect::<Vec<_>>();
-
-                        self.df = Some(df);
-
-                        self.loading = false;
-                        ctx.request_repaint();
-                    }
+                    _ => {}
                 }
             }
 
-            ui.label(if self.loading { "Loading..." } else { "Ready" });
+            ui.label(if self.promised_data.ready().is_none() {
+                "Loading..."
+            } else {
+                "File loaded"
+            });
+
+            ui.label(if self.filtered_data.ready().is_none() {
+                "Filtering..."
+            } else {
+                "File ready"
+            });
 
             if let Some(picked_path) = &self.picked_path {
                 ui.label(format!("CSV reader :: {}", picked_path));
@@ -641,12 +523,20 @@ impl eframe::App for MyApp {
             ui.separator();
 
             if ui.text_edit_singleline(&mut self.filter).changed() {
-                self.loading = true;
-                if let Err(e) = self
-                    .sender_to_worker
-                    .send(UiMessage::FilterData(self.filter.clone(), None))
-                {
-                    eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                if let Some(master_data) = self.promised_data.ready() {
+                    let cloned = Arc::clone(&master_data);
+                    let filter = self.filter.clone();
+
+                    self.filtered_data =
+                        poll_promise::Promise::spawn_thread("filter_sheet", move || {
+                            Arc::new(
+                                cloned
+                                    .iter()
+                                    .filter(|r| r.iter().any(|c| c.contains(&filter)))
+                                    .map(|r| r.clone())
+                                    .collect::<Vec<_>>(),
+                            )
+                        });
                 }
             };
 
@@ -662,7 +552,7 @@ impl eframe::App for MyApp {
                 if ctx.input(|i| i.key_pressed(Key::Escape)) {
                     self.filter = "".to_string();
                     if let Err(e) = self
-                        .sender_to_worker
+                        .sender
                         .send(UiMessage::FilterData("".to_string(), None))
                     {
                         eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
@@ -712,12 +602,12 @@ impl eframe::App for MyApp {
 
                 self.loading = true;
 
-                if let Err(e) = self
-                    .sender_to_worker
-                    .send(UiMessage::OpenFile(str_path.to_string()))
-                {
-                    eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                }
+                // if let Err(e) = self
+                //     .sender_to_worker
+                //     .send(UiMessage::OpenFile(str_path.to_string()))
+                // {
+                //     eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                // }
             }
         });
 
