@@ -1,7 +1,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
-use polars::df;
-use polars::prelude::{AnyValue, CsvReadOptions, CsvWriter, DataFrame, SerReader, SerWriter};
 use poll_promise::Promise;
 use std::sync::Arc;
 
@@ -9,12 +7,6 @@ use crate::egui::Context;
 use csv::Reader;
 use csv::StringRecord;
 use egui::{Color32, Key, ScrollArea, TextFormat};
-use itertools::Itertools;
-use shared_arena::{ArenaArc, SharedArena};
-use std::cmp::Ordering;
-use std::str::FromStr;
-
-use std::sync::Mutex;
 
 use egui::scroll_area::ScrollAreaOutput;
 use std::fs::File;
@@ -93,8 +85,6 @@ fn main() -> eframe::Result {
 
     let title = &format!("CSV Reader.");
 
-    let sheet_filtered: Arc<Mutex<Vec<ArenaArc<StringRecord>>>> = Arc::new(Mutex::new(vec![]));
-
     let ui_chan = mpsc::channel::<UiMessage>();
 
     eframe::run_native(
@@ -116,7 +106,6 @@ fn main() -> eframe::Result {
                 receiver: ui_chan.1,
                 sort_by_column: None,
                 sort_order: None,
-                sheet_filtered,
                 promised_data: poll_promise::Promise::spawn_thread("empty_data", move || {
                     Arc::new(vec![])
                 }),
@@ -159,7 +148,6 @@ struct MyApp {
     receiver: Receiver<UiMessage>,
     sort_by_column: Option<usize>,
     sort_order: Option<SortOrder>,
-    sheet_filtered: Arc<Mutex<Vec<ArenaArc<StringRecord>>>>,
     promised_data: Promise<Arc<ArcSheet>>,
     filtered_data: Promise<Arc<ArcSheet>>,
 }
@@ -362,28 +350,35 @@ fn display_headers(ui: &mut egui::Ui, headers: &mut Vec<FileHeader>) {
     });
 }
 
-fn open_file(app: &mut MyApp, ctx: &egui::Context) {
+fn load_file(app: &mut MyApp, ctx: &egui::Context, file_name: String) {
+    app.picked_path = Some(file_name.clone());
+
+    let (mut reader, headers) = open_csv_file(&file_name);
+
+    app.columns = Some(headers.clone());
+    app.loading = true;
+
+    app.promised_data = poll_promise::Promise::spawn_thread("slow_operation", move || {
+        Arc::new(
+            reader
+                .records()
+                .filter_map(|record| record.ok())
+                .map(|r| Arc::new(r))
+                .collect::<Vec<_>>(),
+        )
+    });
+
+    ctx.send_viewport_cmd(egui::ViewportCommand::Title(file_name));
+}
+
+fn open_file_dialog(app: &mut MyApp) {
     if let Some(path) = rfd::FileDialog::new().pick_file() {
-        let file_name = path.display().to_string();
-        app.picked_path = Some(file_name.clone());
-
-        let (mut reader, headers) = open_csv_file(&file_name);
-
-        app.columns = Some(headers.clone());
-
-        app.loading = true;
-
-        app.promised_data = poll_promise::Promise::spawn_thread("slow_operation", move || {
-            Arc::new(
-                reader
-                    .records()
-                    .filter_map(|record| record.ok())
-                    .map(|r| Arc::new(r))
-                    .collect::<Vec<_>>(),
-            )
-        });
-
-        ctx.send_viewport_cmd(egui::ViewportCommand::Title(file_name));
+        if let Err(e) = app
+            .sender
+            .send(UiMessage::OpenFile(path.display().to_string()))
+        {
+            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+        }
     }
 }
 
@@ -490,7 +485,7 @@ impl eframe::App for MyApp {
                                 });
                         }
                     }
-                    _ => {}
+                    UiMessage::OpenFile(file) => load_file(self, ctx, file),
                 }
             }
 
@@ -517,7 +512,7 @@ impl eframe::App for MyApp {
             }
 
             if ui.button("Open file…").clicked() {
-                open_file(self, ctx);
+                open_file_dialog(self);
             }
 
             ui.separator();
@@ -596,18 +591,9 @@ impl eframe::App for MyApp {
 
                 let str_path = path.to_str().unwrap_or("");
 
-                let (_, headers) = open_csv_file(str_path);
-
-                self.columns = Some(headers.clone());
-
-                self.loading = true;
-
-                // if let Err(e) = self
-                //     .sender_to_worker
-                //     .send(UiMessage::OpenFile(str_path.to_string()))
-                // {
-                //     eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                // }
+                if let Err(e) = self.sender.send(UiMessage::OpenFile(str_path.to_string())) {
+                    eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                }
             }
         });
 
