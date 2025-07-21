@@ -47,13 +47,17 @@ impl egui_dock::TabViewer for TabViewer<'_> {
             open_file_dialog(&self.sender);
         }
 
+        let mut columns = self.columns.clone();
+        if let Some(headers) = columns.as_mut() {
+            display_headers(ui, headers);
+        }
+
         let table = TableBuilder::new(ui)
             .striped(true)
             .resizable(true)
             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
             .min_scrolled_height(0.0);
 
-        let mut columns = self.columns.clone();
         let table_ui = display_table_headers(&mut columns, table);
 
         display_table(
