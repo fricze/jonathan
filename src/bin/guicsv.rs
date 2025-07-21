@@ -27,6 +27,10 @@ struct TabViewer<'a> {
     added_nodes: &'a mut Vec<(SurfaceIndex, NodeIndex)>,
     promised_data: &'a Promise<Arc<ArcSheet>>,
     filtered_data: &'a Promise<Arc<ArcSheet>>,
+    ctx: &'a Context,
+    filter: &'a str,
+    columns: &'a Option<Vec<FileHeader>>,
+    sender: &'a Sender<UiMessage>,
 }
 
 impl egui_dock::TabViewer for TabViewer<'_> {
@@ -38,6 +42,31 @@ impl egui_dock::TabViewer for TabViewer<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         ui.label(format!("Content of {tab}"));
+
+        if ui.button("Open file…").clicked() {
+            open_file_dialog(&self.sender);
+        }
+
+        let table = TableBuilder::new(ui)
+            .striped(true)
+            .resizable(true)
+            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+            .min_scrolled_height(0.0);
+
+        let mut columns = self.columns.clone();
+        let table_ui = display_table_headers(&mut columns, table);
+
+        display_table(
+            self.ctx,
+            table_ui,
+            &self.filter,
+            &self.columns,
+            &self.promised_data,
+            &self.filtered_data,
+            &self.sender,
+            // self.sort_order.unwrap_or(SortOrder::Dsc),
+            // self.sort_by_column,
+        );
     }
 
     fn on_close(&mut self, _tab: &mut Self::Tab) -> OnCloseResponse {
@@ -198,8 +227,6 @@ fn display_table(
     filtered_data: &Promise<Arc<ArcSheet>>,
     sender: &Sender<UiMessage>,
 ) -> ScrollAreaOutput<()> {
-    let filter = filter;
-
     let default: Vec<FileHeader> = vec![];
 
     let visible_columns = columns
@@ -372,12 +399,9 @@ fn load_file(app: &mut MyApp, ctx: &egui::Context, file_name: String) {
     ctx.send_viewport_cmd(egui::ViewportCommand::Title(file_name));
 }
 
-fn open_file_dialog(app: &mut MyApp) {
+fn open_file_dialog(sender: &Sender<UiMessage>) {
     if let Some(path) = rfd::FileDialog::new().pick_file() {
-        if let Err(e) = app
-            .sender
-            .send(UiMessage::OpenFile(path.display().to_string()))
-        {
+        if let Err(e) = sender.send(UiMessage::OpenFile(path.display().to_string())) {
             eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
         }
     }
@@ -409,11 +433,14 @@ fn handle_key_nav<'a>(
     return table;
 }
 
-fn display_table_headers<'a>(app: &mut MyApp, table: TableBuilder<'a>) -> Table<'a> {
+fn display_table_headers<'a>(
+    columns: &mut Option<Vec<FileHeader>>,
+    table: TableBuilder<'a>,
+) -> Table<'a> {
     let mut table = table;
 
     let mut def_headers: Vec<FileHeader> = vec![];
-    let headers = app.columns.as_mut().unwrap_or(def_headers.as_mut());
+    let headers = columns.as_mut().unwrap_or(def_headers.as_mut());
 
     for _ in headers.iter().filter(|c| c.visible) {
         table = table.column(Column::auto());
@@ -449,13 +476,13 @@ fn display_table_headers<'a>(app: &mut MyApp, table: TableBuilder<'a>) -> Table<
                             if ui.button(if asc { "⬆" } else { "⬇" }).clicked() {
                                 file_header.sort_dir = Some(!asc);
 
-                                if asc {
-                                    app.sort_order = Some(SortOrder::Asc);
-                                    app.sort_by_column = Some(idx);
-                                } else {
-                                    app.sort_order = Some(SortOrder::Dsc);
-                                    app.sort_by_column = Some(idx);
-                                }
+                                // if asc {
+                                //     app.sort_order = Some(SortOrder::Asc);
+                                //     app.sort_by_column = Some(idx);
+                                // } else {
+                                //     app.sort_order = Some(SortOrder::Dsc);
+                                //     app.sort_by_column = Some(idx);
+                                // }
                             }
                         },
                     );
@@ -503,6 +530,10 @@ impl eframe::App for MyApp {
                     added_nodes: &mut added_nodes,
                     promised_data: &self.promised_data,
                     filtered_data: &self.filtered_data,
+                    ctx: &ctx,
+                    filter: &self.filter,
+                    columns: &self.columns,
+                    sender: &self.sender,
                 },
             );
 
@@ -512,99 +543,99 @@ impl eframe::App for MyApp {
             self.counter += 1;
         });
 
-        egui::CentralPanel::default().show(&ctx, |ui| {
-            ui.label(if self.promised_data.ready().is_none() {
-                "Loading..."
-            } else {
-                "File loaded"
-            });
+        // egui::CentralPanel::default().show(&ctx, |ui| {
+        //     ui.label(if self.promised_data.ready().is_none() {
+        //         "Loading..."
+        //     } else {
+        //         "File loaded"
+        //     });
 
-            ui.label(if self.filtered_data.ready().is_none() {
-                "Filtering..."
-            } else {
-                "File ready"
-            });
+        //     ui.label(if self.filtered_data.ready().is_none() {
+        //         "Filtering..."
+        //     } else {
+        //         "File ready"
+        //     });
 
-            if let Some(picked_path) = &self.picked_path {
-                ui.label(format!("CSV reader :: {}", picked_path));
-            } else {
-                ui.label(format!("CSV reader"));
-            }
+        //     if let Some(picked_path) = &self.picked_path {
+        //         ui.label(format!("CSV reader :: {}", picked_path));
+        //     } else {
+        //         ui.label(format!("CSV reader"));
+        //     }
 
-            if let Some(headers) = self.columns.as_mut() {
-                display_headers(ui, headers);
-            }
+        //     if let Some(headers) = self.columns.as_mut() {
+        //         display_headers(ui, headers);
+        //     }
 
-            if ui.button("Open file…").clicked() {
-                open_file_dialog(self);
-            }
+        //     if ui.button("Open file…").clicked() {
+        //         open_file_dialog(self);
+        //     }
 
-            ui.separator();
+        //     ui.separator();
 
-            if ui.text_edit_singleline(&mut self.filter).changed() {
-                if let Some(master_data) = self.promised_data.ready() {
-                    let cloned = Arc::clone(&master_data);
-                    let filter = self.filter.clone();
+        //     if ui.text_edit_singleline(&mut self.filter).changed() {
+        //         if let Some(master_data) = self.promised_data.ready() {
+        //             let cloned = Arc::clone(&master_data);
+        //             let filter = self.filter.clone();
 
-                    self.filtered_data =
-                        poll_promise::Promise::spawn_thread("filter_sheet", move || {
-                            Arc::new(
-                                cloned
-                                    .iter()
-                                    .filter(|r| r.iter().any(|c| c.contains(&filter)))
-                                    .map(|r| r.clone())
-                                    .collect::<Vec<_>>(),
-                            )
-                        });
-                }
-            };
+        //             self.filtered_data =
+        //                 poll_promise::Promise::spawn_thread("filter_sheet", move || {
+        //                     Arc::new(
+        //                         cloned
+        //                             .iter()
+        //                             .filter(|r| r.iter().any(|c| c.contains(&filter)))
+        //                             .map(|r| r.clone())
+        //                             .collect::<Vec<_>>(),
+        //                     )
+        //                 });
+        //         }
+        //     };
 
-            ui.separator();
+        //     ui.separator();
 
-            ScrollArea::horizontal().show(ui, |ui| {
-                let mut table = TableBuilder::new(ui)
-                    .striped(true)
-                    .resizable(true)
-                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .min_scrolled_height(0.0);
+        //     ScrollArea::horizontal().show(ui, |ui| {
+        //         let mut table = TableBuilder::new(ui)
+        //             .striped(true)
+        //             .resizable(true)
+        //             .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+        //             .min_scrolled_height(0.0);
 
-                if ctx.input(|i| i.key_pressed(Key::Escape)) {
-                    self.filter = "".to_string();
-                    if let Err(e) = self
-                        .sender
-                        .send(UiMessage::FilterData("".to_string(), None))
-                    {
-                        eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                    }
-                }
+        //         if ctx.input(|i| i.key_pressed(Key::Escape)) {
+        //             self.filter = "".to_string();
+        //             if let Err(e) = self
+        //                 .sender
+        //                 .send(UiMessage::FilterData("".to_string(), None))
+        //             {
+        //                 eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+        //             }
+        //         }
 
-                table = handle_key_nav(self, ctx, table);
+        //         table = handle_key_nav(self, ctx, table);
 
-                let table_ui = display_table_headers(self, table);
+        //         let table_ui = display_table_headers(&mut self.columns, table);
 
-                let scroll_area = display_table(
-                    ctx,
-                    table_ui,
-                    &self.filter,
-                    &self.columns,
-                    &self.promised_data,
-                    &self.filtered_data,
-                    &self.sender,
-                    // self.sort_order.unwrap_or(SortOrder::Dsc),
-                    // self.sort_by_column,
-                );
+        //         let scroll_area = display_table(
+        //             ctx,
+        //             table_ui,
+        //             &self.filter,
+        //             &self.columns,
+        //             &self.promised_data,
+        //             &self.filtered_data,
+        //             &self.sender,
+        //             // self.sort_order.unwrap_or(SortOrder::Dsc),
+        //             // self.sort_by_column,
+        //         );
 
-                let content_height = scroll_area.content_size[1];
+        //         let content_height = scroll_area.content_size[1];
 
-                self.content_height = content_height;
+        //         self.content_height = content_height;
 
-                let offset = scroll_area.state.offset[1];
-                self.scroll_y = offset;
-                self.inner_rect = scroll_area.inner_rect.height();
-            });
-        });
+        //         let offset = scroll_area.state.offset[1];
+        //         self.scroll_y = offset;
+        //         self.inner_rect = scroll_area.inner_rect.height();
+        //     });
+        // });
 
-        preview_files_being_dropped(ctx);
+        // preview_files_being_dropped(ctx);
 
         let mut file_name = None;
         // Collect dropped files:
