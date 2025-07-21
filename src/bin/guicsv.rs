@@ -1,15 +1,15 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
+use egui_dock::tab_viewer::OnCloseResponse;
+use egui_dock::{DockArea, DockState, NodeIndex, Style, SurfaceIndex};
 use poll_promise::Promise;
 use std::sync::Arc;
 
 use crate::egui::Context;
-use csv::Reader;
 use csv::StringRecord;
 use egui::{Color32, Key, ScrollArea, TextFormat};
 
 use egui::scroll_area::ScrollAreaOutput;
-use std::fs::File;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::{
@@ -20,7 +20,35 @@ use std::{
 use egui_extras::{Column, Table, TableBuilder};
 
 use eframe::egui;
-use jonathan::read_csv;
+use jonathan::read_csv::open_csv_file;
+use jonathan::ui::FileHeader;
+
+struct TabViewer<'a> {
+    added_nodes: &'a mut Vec<(SurfaceIndex, NodeIndex)>,
+    promised_data: &'a Promise<Arc<ArcSheet>>,
+    filtered_data: &'a Promise<Arc<ArcSheet>>,
+}
+
+impl egui_dock::TabViewer for TabViewer<'_> {
+    type Tab = usize;
+
+    fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
+        format!("Tab {tab}").into()
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
+        ui.label(format!("Content of {tab}"));
+    }
+
+    fn on_close(&mut self, _tab: &mut Self::Tab) -> OnCloseResponse {
+        println!("Closed tab: {_tab}");
+        OnCloseResponse::Close
+    }
+
+    fn on_add(&mut self, surface: SurfaceIndex, node: NodeIndex) {
+        self.added_nodes.push((surface, node));
+    }
+}
 
 enum UiMessage {
     OpenFile(String),
@@ -53,26 +81,6 @@ fn replace_fonts(ctx: &egui::Context) {
 
     // Tell egui to use these fonts:
     ctx.set_fonts(fonts);
-}
-
-fn open_csv_file(path: &str) -> (Reader<File>, Vec<FileHeader>) {
-    match read_csv::iterate_csv(path) {
-        Ok((csv_reader, headers)) => {
-            let headers = headers
-                .into_iter()
-                .map(|name| FileHeader {
-                    name: name.to_string(),
-                    visible: true,
-                    ..FileHeader::default()
-                })
-                .collect::<Vec<_>>();
-            return (csv_reader, headers);
-        }
-        Err(err) => {
-            eprintln!("Error reading CSV file: {}", err);
-            std::process::exit(1);
-        }
-    };
 }
 
 fn main() -> eframe::Result {
@@ -112,6 +120,8 @@ fn main() -> eframe::Result {
                 filtered_data: poll_promise::Promise::spawn_thread("empty_data", move || {
                     Arc::new(vec![])
                 }),
+                tree: DockState::new(vec![1]),
+                counter: 2,
             }))
         }),
     )
@@ -121,16 +131,6 @@ fn main() -> eframe::Result {
 pub enum SortOrder {
     Asc,
     Dsc,
-}
-
-#[derive(Clone, Default)]
-struct FileHeader {
-    unique_vals: Vec<String>,
-    name: String,
-    visible: bool,
-    dtype: Option<String>,
-    sort: Option<SortOrder>,
-    sort_dir: Option<bool>,
 }
 
 type ArcSheet = Vec<Arc<StringRecord>>;
@@ -150,6 +150,9 @@ struct MyApp {
     sort_order: Option<SortOrder>,
     promised_data: Promise<Arc<ArcSheet>>,
     filtered_data: Promise<Arc<ArcSheet>>,
+
+    tree: DockState<usize>,
+    counter: usize,
 }
 
 fn preview_files_being_dropped(ctx: &egui::Context) {
@@ -189,16 +192,17 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
 fn display_table(
     ctx: &Context,
     table_ui: Table,
-    app: &mut MyApp,
-    sort_order: SortOrder,
-    sort_by_column: Option<usize>,
+    filter: &str,
+    columns: &Option<Vec<FileHeader>>,
+    promised_data: &Promise<Arc<ArcSheet>>,
+    filtered_data: &Promise<Arc<ArcSheet>>,
+    sender: &Sender<UiMessage>,
 ) -> ScrollAreaOutput<()> {
-    let filter = app.filter.clone();
+    let filter = filter;
 
     let default: Vec<FileHeader> = vec![];
 
-    let visible_columns = app
-        .columns
+    let visible_columns = columns
         .as_ref()
         .unwrap_or(&default)
         .iter()
@@ -207,8 +211,8 @@ fn display_table(
         .map(|(index, _)| index)
         .collect::<Vec<usize>>();
 
-    let filtered_data = app.filtered_data.ready();
-    let master_data = app.promised_data.ready();
+    let filtered_data = filtered_data.ready();
+    let master_data = promised_data.ready();
 
     let def_vec: Vec<Arc<StringRecord>> = vec![];
     let default_data: Arc<Vec<Arc<StringRecord>>> = Arc::new(def_vec);
@@ -292,12 +296,9 @@ fn display_table(
 
                         if label.clicked() {
                             ctx.input(|input| {
-                                app.filter = text.to_string();
-                                app.loading = true;
-
                                 if input.modifiers.command {
-                                    if let Err(e) = &app.sender.send(UiMessage::FilterData(
-                                        app.filter.clone(),
+                                    if let Err(e) = &sender.send(UiMessage::FilterData(
+                                        text.to_string(),
                                         Some(col_index),
                                     )) {
                                         eprintln!(
@@ -306,8 +307,8 @@ fn display_table(
                                         );
                                     }
                                 } else {
-                                    if let Err(e) = &app.sender.send(UiMessage::FilterData(
-                                        app.filter.clone(),
+                                    if let Err(e) = &sender.send(UiMessage::FilterData(
+                                        text.to_string(),
                                         Some(col_index),
                                     )) {
                                         eprintln!(
@@ -465,30 +466,53 @@ fn display_table_headers<'a>(app: &mut MyApp, table: TableBuilder<'a>) -> Table<
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        egui::CentralPanel::default().show(&ctx, |ui| {
-            while let Ok(message) = self.receiver.try_recv() {
-                match message {
-                    UiMessage::FilterData(filter, column) => {
-                        if let Some(master_data) = self.promised_data.ready() {
-                            let cloned = Arc::clone(&master_data);
-                            let filter = self.filter.clone();
+        while let Ok(message) = self.receiver.try_recv() {
+            match message {
+                UiMessage::FilterData(filter, column) => {
+                    self.filter = filter;
+                    self.loading = true;
 
-                            self.filtered_data =
-                                poll_promise::Promise::spawn_thread("filter_sheet", move || {
-                                    Arc::new(
-                                        cloned
-                                            .iter()
-                                            .filter(|r| r.iter().any(|c| c.contains(&filter)))
-                                            .map(|r| r.clone())
-                                            .collect::<Vec<_>>(),
-                                    )
-                                });
-                        }
+                    if let Some(master_data) = self.promised_data.ready() {
+                        let cloned = Arc::clone(&master_data);
+                        let filter = self.filter.clone();
+
+                        self.filtered_data =
+                            poll_promise::Promise::spawn_thread("filter_sheet", move || {
+                                Arc::new(
+                                    cloned
+                                        .iter()
+                                        .filter(|r| r.iter().any(|c| c.contains(&filter)))
+                                        .map(|r| r.clone())
+                                        .collect::<Vec<_>>(),
+                                )
+                            });
                     }
-                    UiMessage::OpenFile(file) => load_file(self, ctx, file),
                 }
+                UiMessage::OpenFile(file) => load_file(self, ctx, file),
             }
+        }
 
+        let mut added_nodes = Vec::new();
+
+        DockArea::new(&mut self.tree)
+            .style(Style::from_egui(ctx.style().as_ref()))
+            .show_add_buttons(true)
+            .show(
+                ctx,
+                &mut TabViewer {
+                    added_nodes: &mut added_nodes,
+                    promised_data: &self.promised_data,
+                    filtered_data: &self.filtered_data,
+                },
+            );
+
+        added_nodes.drain(..).for_each(|(surface, node)| {
+            self.tree.set_focused_node_and_surface((surface, node));
+            self.tree.push_to_focused_leaf(self.counter);
+            self.counter += 1;
+        });
+
+        egui::CentralPanel::default().show(&ctx, |ui| {
             ui.label(if self.promised_data.ready().is_none() {
                 "Loading..."
             } else {
@@ -561,9 +585,13 @@ impl eframe::App for MyApp {
                 let scroll_area = display_table(
                     ctx,
                     table_ui,
-                    self,
-                    self.sort_order.unwrap_or(SortOrder::Dsc),
-                    self.sort_by_column,
+                    &self.filter,
+                    &self.columns,
+                    &self.promised_data,
+                    &self.filtered_data,
+                    &self.sender,
+                    // self.sort_order.unwrap_or(SortOrder::Dsc),
+                    // self.sort_by_column,
                 );
 
                 let content_height = scroll_area.content_size[1];
