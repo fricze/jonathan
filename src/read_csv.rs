@@ -3,7 +3,7 @@ use std::fs::File;
 
 use csv::StringRecord;
 
-use crate::ui::FileHeader;
+use crate::types::FileHeader;
 
 pub fn read_csv(path: &str) -> csv::Result<(Vec<StringRecord>, StringRecord)> {
     let mut rdr = Reader::from_path(path)?;

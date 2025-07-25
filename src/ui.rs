@@ -1,15 +1,30 @@
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum SortOrder {
-    Asc,
-    Dsc,
-}
+use crate::types::MyApp;
+use egui::Key;
+use egui_extras::TableBuilder;
+use std::ops::{Add, Sub};
 
-#[derive(Clone, Default)]
-pub struct FileHeader {
-    pub unique_vals: Vec<String>,
-    pub name: String,
-    pub visible: bool,
-    pub dtype: Option<String>,
-    pub sort: Option<SortOrder>,
-    pub sort_dir: Option<bool>,
+pub fn handle_key_nav<'a>(
+    app: &mut MyApp,
+    ctx: &egui::Context,
+    table: TableBuilder<'a>,
+) -> TableBuilder<'a> {
+    let mut table = table;
+
+    if ctx.input(|i| i.key_pressed(Key::PageUp)) {
+        table = table.vertical_scroll_offset(app.scroll_y.sub(app.inner_rect / 2.0).max(0.0));
+    }
+
+    if ctx.input(|i| i.key_pressed(Key::PageDown)) {
+        table = table.vertical_scroll_offset(app.scroll_y.add(app.inner_rect / 2.0));
+    }
+
+    if ctx.input(|i| i.key_pressed(Key::Home)) {
+        table = table.vertical_scroll_offset(0.0);
+    }
+
+    if ctx.input(|i| i.key_pressed(Key::End)) {
+        table = table.vertical_scroll_offset(app.content_height);
+    }
+
+    return table;
 }

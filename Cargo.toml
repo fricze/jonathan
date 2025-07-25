@@ -3,21 +3,6 @@ name = "jonathan"
 version = "0.1.0"
 edition = "2024"
 
-[[bin]]
-name = "gui"
-path = "src/bin/gui.rs"
-
-[[bin]]
-name = "guicsv"
-path = "src/bin/guicsv.rs"
-
-[[bin]]
-name = "tui"
-path = "src/bin/tui.rs"
-
-[[bin]]
-name = "dock"
-path = "src/bin/dock.rs"
 
 [dependencies]
 egui_file = "0.22.1"
