@@ -37,7 +37,6 @@ pub enum SortOrder {
 #[derive(Default)]
 pub struct SheetTab {
     pub id: usize,
-    pub chosen_file: String,
     pub scroll_y: f32,
     pub inner_rect: f32,
     pub content_height: f32,
@@ -58,6 +57,7 @@ pub struct MyApp {
     pub tree: DockState<SheetTab>,
     pub counter: usize,
     pub files_list: Vec<String>,
+    pub chosen_file: HashMap<usize, String>,
 }
 
 pub struct TabViewer<'a> {
@@ -70,4 +70,5 @@ pub struct TabViewer<'a> {
     pub sender: &'a Sender<UiMessage>,
     pub counter: &'a usize,
     pub files_list: &'a Vec<String>,
+    pub chosen_file: &'a mut HashMap<usize, String>,
 }

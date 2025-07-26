@@ -3,8 +3,6 @@
 use egui::{Align2, Id, LayerId, Order, TextStyle};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, NodeIndex, Style, SurfaceIndex};
-use itertools::Itertools;
-use polars::prelude::file;
 use std::sync::Arc;
 
 use egui::{Color32, ScrollArea};
@@ -67,13 +65,15 @@ impl egui_dock::TabViewer for TabViewer<'_> {
             );
         }
 
-        let radio = &tab.chosen_file;
+        let mut default = "".to_string();
+        let radio = self.chosen_file.get_mut(&tab_id).unwrap_or(&mut default);
 
         egui::ComboBox::from_label("Chosen file")
             .selected_text(format!("{radio:?}"))
             .show_ui(ui, |ui| {
                 for file in self.files_list {
-                    ui.selectable_value(&mut tab.chosen_file, file.clone(), file.clone());
+                    let filename = file.clone();
+                    ui.selectable_value(radio, filename, file.clone());
                 }
             });
 
@@ -199,6 +199,7 @@ fn main() -> eframe::Result {
                 }]),
                 counter: 2,
                 files_list: vec![],
+                chosen_file: HashMap::from([(1, "".to_string())]),
             }))
         }),
     )
@@ -404,6 +405,7 @@ impl eframe::App for MyApp {
                     sender: &self.sender,
                     counter: &self.counter,
                     files_list: &self.files_list,
+                    chosen_file: &mut self.chosen_file,
                 },
             );
 
