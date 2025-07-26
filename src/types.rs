@@ -1,7 +1,8 @@
+use crate::egui::Context;
 use csv::StringRecord;
+use egui_dock::{DockState, NodeIndex, SurfaceIndex};
 use std::collections::HashMap;
 
-use egui_dock::DockState;
 use poll_promise::Promise;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
@@ -36,8 +37,7 @@ pub enum SortOrder {
 #[derive(Default)]
 pub struct SheetTab {
     pub id: usize,
-    pub radio: String,
-    pub filename: String,
+    pub chosen_file: String,
     pub scroll_y: f32,
     pub inner_rect: f32,
     pub content_height: f32,
@@ -57,4 +57,17 @@ pub struct MyApp {
     pub filtered_data: HashMap<(String, usize), Promise<Arc<ArcSheet>>>,
     pub tree: DockState<SheetTab>,
     pub counter: usize,
+    pub files_list: Vec<String>,
+}
+
+pub struct TabViewer<'a> {
+    pub added_nodes: &'a mut Vec<(SurfaceIndex, NodeIndex)>,
+    pub promised_data: &'a HashMap<String, Promise<Arc<ArcSheet>>>,
+    pub filtered_data: &'a HashMap<(String, usize), Promise<Arc<ArcSheet>>>,
+    pub ctx: &'a Context,
+    pub filter: &'a HashMap<(String, usize), String>,
+    pub columns: &'a mut HashMap<(String, usize), Vec<FileHeader>>,
+    pub sender: &'a Sender<UiMessage>,
+    pub counter: &'a usize,
+    pub files_list: &'a Vec<String>,
 }

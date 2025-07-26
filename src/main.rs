@@ -4,14 +4,11 @@ use egui::{Align2, Id, LayerId, Order, TextStyle};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, NodeIndex, Style, SurfaceIndex};
 use itertools::Itertools;
-use poll_promise::Promise;
+use polars::prelude::file;
 use std::sync::Arc;
 
-use crate::egui::Context;
-use csv::StringRecord;
-use egui::{Color32, ScrollArea, TextFormat};
+use egui::{Color32, ScrollArea};
 
-use egui::scroll_area::ScrollAreaOutput;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
@@ -19,24 +16,15 @@ use std::sync::mpsc::{self, Sender};
 use egui_extras::{Column, Table, TableBuilder};
 
 mod read_csv;
+mod table;
 mod types;
 mod ui;
 
+use crate::table::display_table;
 use crate::ui::handle_key_nav;
 use eframe::egui;
 use read_csv::open_csv_file;
-use types::{ArcSheet, FileHeader, MyApp, SheetTab, UiMessage};
-
-struct TabViewer<'a> {
-    added_nodes: &'a mut Vec<(SurfaceIndex, NodeIndex)>,
-    promised_data: &'a HashMap<String, Promise<Arc<ArcSheet>>>,
-    filtered_data: &'a HashMap<(String, usize), Promise<Arc<ArcSheet>>>,
-    ctx: &'a Context,
-    filter: &'a HashMap<(String, usize), String>,
-    columns: &'a mut HashMap<(String, usize), Vec<FileHeader>>,
-    sender: &'a Sender<UiMessage>,
-    counter: &'a usize,
-}
+use types::{FileHeader, MyApp, SheetTab, TabViewer, UiMessage};
 
 impl egui_dock::TabViewer for TabViewer<'_> {
     type Tab = SheetTab;
@@ -48,9 +36,8 @@ impl egui_dock::TabViewer for TabViewer<'_> {
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         let tab_id = tab.id;
-        let all_columns = self.columns.iter().map(|(k, v)| k.1).join(" ; ");
 
-        ui.label(format!("Content of {tab_id}. {all_columns}"));
+        ui.label(format!("Tab no. {tab_id}"));
 
         let mut default: Vec<FileHeader> = vec![];
         let mut columns = self
@@ -80,14 +67,14 @@ impl egui_dock::TabViewer for TabViewer<'_> {
             );
         }
 
-        let radio = &tab.radio;
+        let radio = &tab.chosen_file;
 
         egui::ComboBox::from_label("Chosen file")
             .selected_text(format!("{radio:?}"))
             .show_ui(ui, |ui| {
-                ui.selectable_value(&mut tab.radio, "file 1".to_string(), "First");
-                ui.selectable_value(&mut tab.radio, "file 2".to_string(), "Second");
-                ui.selectable_value(&mut tab.radio, "file 3".to_string(), "Third");
+                for file in self.files_list {
+                    ui.selectable_value(&mut tab.chosen_file, file.clone(), file.clone());
+                }
             });
 
         if ui.button("Open file…").clicked() {
@@ -146,7 +133,6 @@ impl egui_dock::TabViewer for TabViewer<'_> {
     }
 }
 
-// Demonstrates how to replace all fonts.
 fn replace_fonts(ctx: &egui::Context) {
     // Start with the default fonts (we will be adding to them rather than replacing them).
     let mut fonts = egui::FontDefinitions::default();
@@ -212,6 +198,7 @@ fn main() -> eframe::Result {
                     ..Default::default()
                 }]),
                 counter: 2,
+                files_list: vec![],
             }))
         }),
     )
@@ -251,148 +238,6 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
     }
 }
 
-fn display_table(
-    ctx: &Context,
-    tab_id: usize,
-    table_ui: Table,
-    filter: &str,
-    columns: &Vec<FileHeader>,
-    promised_data: &Promise<Arc<ArcSheet>>,
-    filtered_data: &Promise<Arc<ArcSheet>>,
-    sender: &Sender<UiMessage>,
-) -> ScrollAreaOutput<()> {
-    let visible_columns = columns
-        .iter()
-        .enumerate()
-        .filter(|(_, c)| c.visible)
-        .map(|(index, _)| index)
-        .collect::<Vec<usize>>();
-
-    let filtered_data = filtered_data.ready();
-    let master_data = promised_data.ready();
-
-    let def_vec: Vec<Arc<StringRecord>> = vec![];
-    let default_data: Arc<Vec<Arc<StringRecord>>> = Arc::new(def_vec);
-
-    let sheet_data = match filtered_data {
-        Some(data) if !data.is_empty() => data,
-        _ => master_data.unwrap_or(&default_data),
-    };
-
-    return table_ui.body(|body| {
-        let table_height = sheet_data.len();
-
-        body.rows(18.0, table_height, |mut row| {
-            let row_index = row.index();
-
-            let row_data = sheet_data.get(row_index).unwrap();
-
-            row_data
-                .iter()
-                .map(|text| text.to_string())
-                .enumerate()
-                .filter(|(index, _)| visible_columns.contains(index))
-                .for_each(|(col_index, text)| {
-                    let filter_text: &str = text.as_ref();
-
-                    row.col(|ui| {
-                        let label = if filter.is_empty() {
-                            ui.label(filter_text)
-                        } else {
-                            use egui::text::LayoutJob;
-
-                            if filter_text.contains(&filter) {
-                                let mut job = LayoutJob::default();
-
-                                if filter_text == filter {
-                                    job.append(
-                                        filter_text,
-                                        0.0,
-                                        TextFormat {
-                                            color: Color32::YELLOW,
-                                            ..Default::default()
-                                        },
-                                    );
-
-                                    ui.label(job)
-                                } else {
-                                    let text: Vec<&str> = filter_text.split(&filter).collect();
-
-                                    if text.len() == 1 {
-                                        job.append(
-                                            &filter,
-                                            0.0,
-                                            TextFormat {
-                                                color: Color32::YELLOW,
-                                                ..Default::default()
-                                            },
-                                        );
-                                        job.append(text[0], 0.0, TextFormat::default());
-                                        ui.label(job)
-                                    } else if text.len() == 2 {
-                                        job.append(text[0], 0.0, TextFormat::default());
-                                        job.append(
-                                            &filter,
-                                            0.0,
-                                            TextFormat {
-                                                color: Color32::YELLOW,
-                                                ..Default::default()
-                                            },
-                                        );
-                                        job.append(text[1], 0.0, TextFormat::default());
-
-                                        ui.label(job)
-                                    } else {
-                                        ui.label(job)
-                                    }
-                                }
-                            } else {
-                                ui.label(filter_text)
-                            }
-                        };
-
-                        if label.clicked() {
-                            ctx.input(|input| {
-                                if let Err(e) = &sender.send(UiMessage::FilterData(
-                                    "filename".to_string(),
-                                    filter_text.to_string(),
-                                    tab_id,
-                                    Some(col_index),
-                                )) {
-                                    eprintln!(
-                                        "Worker: Failed to send page data to UI thread: {:?}",
-                                        e
-                                    );
-                                }
-                                // if input.modifiers.command {
-                                //     if let Err(e) = &sender.send(UiMessage::FilterData(
-                                //         text.to_string(),
-                                //         Some(col_index),
-                                //     )) {
-                                //         eprintln!(
-                                //             "Worker: Failed to send page data to UI thread: {:?}",
-                                //             e
-                                //         );
-                                //     }
-                                // } else {
-                                //     if let Err(e) = &sender.send(UiMessage::FilterData(
-                                //         text.to_string(),
-                                //         Some(col_index),
-                                //     )) {
-                                //         eprintln!(
-                                //             "Worker: Failed to send page data to UI thread: {:?}",
-                                //             e
-                                //         );
-                                //     }
-                                // }
-                            })
-                        }
-                    });
-                });
-        });
-    });
-}
-
 fn display_headers(ui: &mut egui::Ui, headers: &mut Vec<FileHeader>) {
     ui.horizontal_wrapped(|ui| {
         let mut hidden = HashSet::new();
@@ -422,11 +267,12 @@ fn display_headers(ui: &mut egui::Ui, headers: &mut Vec<FileHeader>) {
 fn load_file(app: &mut MyApp, ctx: &egui::Context, file_name: String, tab: usize) {
     app.picked_path = Some(file_name.clone());
 
+    app.files_list.push(file_name.clone());
+
     let (mut reader, headers) = open_csv_file(&file_name);
 
     app.columns
         .insert(("sheet".to_string(), tab), headers.clone());
-
     app.columns
         .insert(("sheet".to_string(), 0), headers.clone());
 
@@ -557,6 +403,7 @@ impl eframe::App for MyApp {
                     columns: &mut self.columns,
                     sender: &self.sender,
                     counter: &self.counter,
+                    files_list: &self.files_list,
                 },
             );
 
@@ -564,7 +411,6 @@ impl eframe::App for MyApp {
             self.tree.set_focused_node_and_surface((surface, node));
             self.tree.push_to_focused_leaf(SheetTab {
                 id: self.counter,
-                filename: "sheet".to_string(),
                 ..Default::default()
             });
             self.counter += 1;
