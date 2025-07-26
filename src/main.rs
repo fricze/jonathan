@@ -20,7 +20,7 @@ mod ui;
 
 use crate::table::display_table;
 use crate::ui::handle_key_nav;
-use eframe::egui;
+use eframe::{APP_KEY, egui};
 use read_csv::open_csv_file;
 use types::{FileHeader, MyApp, SheetTab, TabViewer, UiMessage};
 
@@ -37,17 +37,18 @@ impl egui_dock::TabViewer for TabViewer<'_> {
 
         ui.label(format!("Tab no. {tab_id}"));
 
-        let mut default = "".to_string();
-        let radio = self.chosen_file.get_mut(&tab_id).unwrap_or(&mut default);
-
-        egui::ComboBox::from_label("Chosen file")
-            .selected_text(format!("{radio:?}"))
-            .show_ui(ui, |ui| {
-                for file in self.files_list {
-                    let filename = file.clone();
-                    ui.selectable_value(radio, filename, file.clone());
-                }
-            });
+        if let Some(radio) = self.chosen_file.get_mut(&tab_id) {
+            egui::ComboBox::from_label("Chosen file")
+                .selected_text(format!("{radio:?}"))
+                .show_ui(ui, |ui| {
+                    for file in self.files_list {
+                        let filename = file.clone();
+                        ui.selectable_value(radio, filename, file.clone());
+                    }
+                });
+        } else {
+            ui.label("No chosen file");
+        }
 
         if ui.button("Open file…").clicked() {
             open_file_dialog(&self.sender, &tab_id);
@@ -76,14 +77,6 @@ impl egui_dock::TabViewer for TabViewer<'_> {
                 }
             }
 
-            if !chosen_file.is_empty() && !self.columns.contains_key(&(chosen_file.clone(), tab_id))
-            {
-                self.columns.insert(
-                    (chosen_file.clone(), tab_id),
-                    self.columns.get(&(chosen_file.clone(), 0)).unwrap().clone(),
-                );
-            }
-
             if let Some(columns) = self.columns.get_mut(&(chosen_file.clone(), tab_id)) {
                 display_headers(ui, columns.as_mut());
 
@@ -98,6 +91,13 @@ impl egui_dock::TabViewer for TabViewer<'_> {
                 let table_ui = display_table_headers(columns, table);
 
                 if let Some(promised_data) = self.promised_data.get(chosen_file) {
+                    let default_sheet =
+                        poll_promise::Promise::spawn_thread("empty_data", move || Arc::new(vec![]));
+                    let filtered_data = &self
+                        .filtered_data
+                        .get(&(chosen_file.to_string(), tab_id))
+                        .unwrap_or(&default_sheet);
+
                     display_table(
                         self.ctx,
                         chosen_file,
@@ -109,13 +109,7 @@ impl egui_dock::TabViewer for TabViewer<'_> {
                             .unwrap_or(&"".to_string()),
                         &columns,
                         promised_data,
-                        &self
-                            .filtered_data
-                            .get(&(chosen_file.to_string(), tab_id))
-                            .unwrap_or(&poll_promise::Promise::spawn_thread(
-                                "empty_data",
-                                move || Arc::new(vec![]),
-                            )),
+                        filtered_data,
                         &self.sender,
                         // self.sort_order.unwrap_or(SortOrder::Dsc),
                         // self.sort_by_column,
@@ -277,9 +271,13 @@ fn load_file(app: &mut MyApp, ctx: &egui::Context, file_name: String, tab_id: us
 
     let (mut reader, headers) = open_csv_file(&file_name);
 
-    app.columns
-        .insert((file_name.clone(), tab_id), headers.clone());
     app.columns.insert((file_name.clone(), 0), headers.clone());
+
+    for tab in app.tree.iter_all_tabs() {
+        let tab_id = tab.1.id;
+        app.columns
+            .insert((file_name.clone(), tab_id), headers.clone());
+    }
 
     app.loading = true;
 
@@ -419,6 +417,16 @@ impl eframe::App for MyApp {
                 id: self.counter,
                 ..Default::default()
             });
+
+            for file in &self.files_list {
+                self.columns.insert(
+                    (file.clone(), self.counter),
+                    self.columns.get(&(file.clone(), 0)).unwrap().clone(),
+                );
+            }
+
+            self.chosen_file.insert(self.counter, "".to_string());
+
             self.counter += 1;
         });
 
