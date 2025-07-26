@@ -16,9 +16,13 @@ pub struct FileHeader {
     pub sort_dir: Option<bool>,
 }
 
+pub type TabId = usize;
+pub type Filter = String;
+pub type Filename = String;
+
 pub enum UiMessage {
     OpenFile(String, usize),
-    FilterData(String, Option<usize>),
+    FilterData(Filename, Filter, TabId, Option<usize>),
 }
 
 pub type ArcSheet = Vec<Arc<StringRecord>>;
@@ -29,18 +33,19 @@ pub enum SortOrder {
     Dsc,
 }
 
+#[derive(Default)]
 pub struct SheetTab {
     pub id: usize,
     pub radio: String,
     pub filename: String,
+    pub scroll_y: f32,
+    pub inner_rect: f32,
+    pub content_height: f32,
 }
 
 pub struct MyApp {
     pub columns: HashMap<(String, usize), Vec<FileHeader>>,
-    pub scroll_y: f32,
-    pub inner_rect: f32,
-    pub content_height: f32,
-    pub filter: String,
+    pub filter: HashMap<(String, usize), String>,
     pub dropped_files: Vec<egui::DroppedFile>,
     pub picked_path: Option<String>,
     pub loading: bool,
@@ -49,8 +54,7 @@ pub struct MyApp {
     pub sort_by_column: Option<usize>,
     pub sort_order: Option<SortOrder>,
     pub promised_data: HashMap<String, Promise<Arc<ArcSheet>>>,
-    pub filtered_data: HashMap<String, Promise<Arc<ArcSheet>>>,
+    pub filtered_data: HashMap<(String, usize), Promise<Arc<ArcSheet>>>,
     pub tree: DockState<SheetTab>,
     pub counter: usize,
-    pub radio: String,
 }
