@@ -40,11 +40,12 @@ pub struct SheetTab {
     pub scroll_y: f32,
     pub inner_rect: f32,
     pub content_height: f32,
+    pub chosen_file: String,
+    pub columns: HashMap<Filename, Vec<FileHeader>>,
 }
 
 pub struct MyApp {
-    pub columns: HashMap<(String, usize), Vec<FileHeader>>,
-    pub filter: HashMap<(String, usize), String>,
+    pub filter: HashMap<(Filename, TabId), String>,
     pub dropped_files: Vec<egui::DroppedFile>,
     pub picked_path: Option<String>,
     pub loading: bool,
@@ -53,22 +54,18 @@ pub struct MyApp {
     pub sort_by_column: Option<usize>,
     pub sort_order: Option<SortOrder>,
     pub promised_data: HashMap<String, Promise<Arc<ArcSheet>>>,
-    pub filtered_data: HashMap<(String, usize), Promise<Arc<ArcSheet>>>,
+    pub filtered_data: HashMap<(Filename, TabId), Promise<Arc<ArcSheet>>>,
     pub tree: DockState<SheetTab>,
     pub counter: usize,
     pub files_list: Vec<String>,
-    pub chosen_file: HashMap<usize, String>,
 }
 
 pub struct TabViewer<'a> {
     pub added_nodes: &'a mut Vec<(SurfaceIndex, NodeIndex)>,
-    pub promised_data: &'a HashMap<String, Promise<Arc<ArcSheet>>>,
-    pub filtered_data: &'a HashMap<(String, usize), Promise<Arc<ArcSheet>>>,
+    pub promised_data: &'a HashMap<Filename, Promise<Arc<ArcSheet>>>,
+    pub filtered_data: &'a HashMap<(Filename, TabId), Promise<Arc<ArcSheet>>>,
     pub ctx: &'a Context,
-    pub filter: &'a HashMap<(String, usize), String>,
-    pub columns: &'a mut HashMap<(String, usize), Vec<FileHeader>>,
+    pub filter: &'a HashMap<(Filename, TabId), String>,
     pub sender: &'a Sender<UiMessage>,
-    pub counter: &'a usize,
     pub files_list: &'a Vec<String>,
-    pub chosen_file: &'a mut HashMap<usize, String>,
 }

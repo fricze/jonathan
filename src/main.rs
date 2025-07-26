@@ -3,6 +3,7 @@
 use egui::{Align2, Id, LayerId, Order, TextStyle};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, NodeIndex, Style, SurfaceIndex};
+use polars::prelude::file;
 use std::sync::Arc;
 
 use egui::{Color32, ScrollArea};
@@ -20,7 +21,7 @@ mod ui;
 
 use crate::table::display_table;
 use crate::ui::handle_key_nav;
-use eframe::{APP_KEY, egui};
+use eframe::egui;
 use read_csv::open_csv_file;
 use types::{FileHeader, MyApp, SheetTab, TabViewer, UiMessage};
 
@@ -37,84 +38,80 @@ impl egui_dock::TabViewer for TabViewer<'_> {
 
         ui.label(format!("Tab no. {tab_id}"));
 
-        if let Some(radio) = self.chosen_file.get_mut(&tab_id) {
-            egui::ComboBox::from_label("Chosen file")
-                .selected_text(format!("{radio:?}"))
-                .show_ui(ui, |ui| {
-                    for file in self.files_list {
-                        let filename = file.clone();
-                        ui.selectable_value(radio, filename, file.clone());
-                    }
-                });
-        } else {
-            ui.label("No chosen file");
-        }
+        let radio = &tab.chosen_file;
+        egui::ComboBox::from_label("Chosen file")
+            .selected_text(format!("{radio:?}"))
+            .show_ui(ui, |ui| {
+                for file in self.files_list {
+                    let filename = file.clone();
+                    ui.selectable_value(&mut tab.chosen_file, filename, file.clone());
+                }
+            });
 
         if ui.button("Open file…").clicked() {
             open_file_dialog(&self.sender, &tab_id);
         }
 
-        if let Some(chosen_file) = self.chosen_file.get(&tab_id) {
-            if let (Some(sheet), Some(filtered_sheet)) = (
-                self.promised_data.get(chosen_file),
-                self.filtered_data.get(&(chosen_file.to_string(), tab_id)),
-            ) {
-                if sheet.ready().is_none() || filtered_sheet.ready().is_none() {
-                    let painter = self.ctx.layer_painter(LayerId::new(
-                        Order::Foreground,
-                        Id::new("file_drop_target"),
-                    ));
+        let chosen_file = &tab.chosen_file.clone();
 
-                    let screen_rect = self.ctx.screen_rect();
-                    painter.rect_filled(screen_rect, 0.0, Color32::from_black_alpha(192));
-                    painter.text(
-                        screen_rect.center(),
-                        Align2::CENTER_CENTER,
-                        "Loading…",
-                        TextStyle::Heading.resolve(&self.ctx.style()),
-                        Color32::WHITE,
-                    );
-                }
+        if let (Some(sheet), Some(filtered_sheet)) = (
+            self.promised_data.get(chosen_file),
+            self.filtered_data.get(&(chosen_file.to_string(), tab_id)),
+        ) {
+            if sheet.ready().is_none() || filtered_sheet.ready().is_none() {
+                let painter = self
+                    .ctx
+                    .layer_painter(LayerId::new(Order::Foreground, Id::new("file_drop_target")));
+
+                let screen_rect = self.ctx.screen_rect();
+                painter.rect_filled(screen_rect, 0.0, Color32::from_black_alpha(192));
+                painter.text(
+                    screen_rect.center(),
+                    Align2::CENTER_CENTER,
+                    "Loading…",
+                    TextStyle::Heading.resolve(&self.ctx.style()),
+                    Color32::WHITE,
+                );
             }
+        }
 
-            if let Some(columns) = self.columns.get_mut(&(chosen_file.clone(), tab_id)) {
-                display_headers(ui, columns.as_mut());
+        if let Some(columns) = tab.columns.get_mut(chosen_file) {
+            display_headers(ui, columns.as_mut());
 
-                let mut table = TableBuilder::new(ui)
-                    .striped(true)
-                    .resizable(true)
-                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                    .min_scrolled_height(0.0);
+            let table = TableBuilder::new(ui)
+                .striped(true)
+                .resizable(true)
+                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                .min_scrolled_height(0.0);
 
-                table = handle_key_nav(tab, self.ctx, table);
+            // table = handle_key_nav(tab, self.ctx, table);
 
-                let table_ui = display_table_headers(columns, table);
+            let table_ui = display_table_headers(columns, table);
 
-                if let Some(promised_data) = self.promised_data.get(chosen_file) {
-                    let default_sheet =
-                        poll_promise::Promise::spawn_thread("empty_data", move || Arc::new(vec![]));
-                    let filtered_data = &self
-                        .filtered_data
-                        .get(&(chosen_file.to_string(), tab_id))
-                        .unwrap_or(&default_sheet);
+            if let Some(promised_data) = self.promised_data.get(chosen_file) {
+                let default_sheet =
+                    poll_promise::Promise::spawn_thread("empty_data", move || Arc::new(vec![]));
+                let filtered_data = &self
+                    .filtered_data
+                    .get(&(chosen_file.to_string(), tab_id))
+                    .unwrap_or(&default_sheet);
 
-                    display_table(
-                        self.ctx,
-                        chosen_file,
-                        tab_id,
-                        table_ui,
-                        &self
-                            .filter
-                            .get(&(chosen_file.clone(), tab_id))
-                            .unwrap_or(&"".to_string()),
-                        &columns,
-                        promised_data,
-                        filtered_data,
-                        &self.sender,
-                        // self.sort_order.unwrap_or(SortOrder::Dsc),
-                        // self.sort_by_column,
-                    );
-                }
+                display_table(
+                    self.ctx,
+                    chosen_file,
+                    tab_id,
+                    table_ui,
+                    &self
+                        .filter
+                        .get(&(chosen_file.clone(), tab_id))
+                        .unwrap_or(&"".to_string()),
+                    &columns,
+                    promised_data,
+                    filtered_data,
+                    &self.sender,
+                    // self.sort_order.unwrap_or(SortOrder::Dsc),
+                    // self.sort_by_column,
+                );
             }
         }
     }
@@ -181,7 +178,6 @@ fn main() -> eframe::Result {
                 receiver: ui_chan.1,
                 sort_by_column: None,
                 sort_order: None,
-                columns: HashMap::new(),
                 filter: HashMap::new(),
                 dropped_files: Vec::new(),
                 picked_path: None,
@@ -197,7 +193,6 @@ fn main() -> eframe::Result {
                 }]),
                 counter: 2,
                 files_list: vec![],
-                chosen_file: HashMap::from([(1, "".to_string())]),
             }))
         }),
     )
@@ -267,16 +262,11 @@ fn load_file(app: &mut MyApp, ctx: &egui::Context, file_name: String, tab_id: us
     app.picked_path = Some(file_name.clone());
 
     app.files_list.push(file_name.clone());
-    app.chosen_file.insert(tab_id, file_name.clone());
 
     let (mut reader, headers) = open_csv_file(&file_name);
 
-    app.columns.insert((file_name.clone(), 0), headers.clone());
-
-    for tab in app.tree.iter_all_tabs() {
-        let tab_id = tab.1.id;
-        app.columns
-            .insert((file_name.clone(), tab_id), headers.clone());
+    for tab in app.tree.iter_all_tabs_mut() {
+        tab.1.columns.insert(file_name.clone(), headers.clone());
     }
 
     app.loading = true;
@@ -403,29 +393,21 @@ impl eframe::App for MyApp {
                     filtered_data: &self.filtered_data,
                     ctx: &ctx,
                     filter: &self.filter,
-                    columns: &mut self.columns,
                     sender: &self.sender,
-                    counter: &self.counter,
                     files_list: &self.files_list,
-                    chosen_file: &mut self.chosen_file,
                 },
             );
 
         added_nodes.drain(..).for_each(|(surface, node)| {
             self.tree.set_focused_node_and_surface((surface, node));
+
+            let columns = self.tree.iter_all_tabs().last().unwrap().1.columns.clone();
+
             self.tree.push_to_focused_leaf(SheetTab {
                 id: self.counter,
+                columns,
                 ..Default::default()
             });
-
-            for file in &self.files_list {
-                self.columns.insert(
-                    (file.clone(), self.counter),
-                    self.columns.get(&(file.clone(), 0)).unwrap().clone(),
-                );
-            }
-
-            self.chosen_file.insert(self.counter, "".to_string());
 
             self.counter += 1;
         });
