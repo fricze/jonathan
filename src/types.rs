@@ -53,7 +53,11 @@ pub struct MyApp {
     pub receiver: Receiver<UiMessage>,
     pub sort_by_column: Option<usize>,
     pub sort_order: Option<SortOrder>,
-    pub promised_data: HashMap<String, Promise<Arc<ArcSheet>>>,
+    pub sheets_data: HashMap<String, Promise<Arc<ArcSheet>>>,
+    // Filtered data is stored per file and per tab. Filtered data coming from
+    // one master file can be used in many tabs. It's all Arcs, so
+    // even if we show the same data in many tabs, filtered in different ways
+    // we're just using references to the same master data.
     pub filtered_data: HashMap<(Filename, TabId), Promise<Arc<ArcSheet>>>,
     pub tree: DockState<SheetTab>,
     pub counter: usize,

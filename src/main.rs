@@ -182,7 +182,7 @@ fn main() -> eframe::Result {
                 dropped_files: Vec::new(),
                 picked_path: None,
                 loading: false,
-                promised_data: HashMap::from([(
+                sheets_data: HashMap::from([(
                     "filename".to_string(),
                     poll_promise::Promise::spawn_thread("empty_data", move || Arc::new(vec![])),
                 )]),
@@ -271,7 +271,7 @@ fn load_file(app: &mut MyApp, ctx: &egui::Context, file_name: String, tab_id: us
 
     app.loading = true;
 
-    app.promised_data.insert(
+    app.sheets_data.insert(
         file_name.clone(),
         poll_promise::Promise::spawn_thread("slow_operation", move || {
             Arc::new(
@@ -358,22 +358,24 @@ impl eframe::App for MyApp {
                         .insert((filename.clone(), tab_id), filter.clone());
                     self.loading = true;
 
-                    if let Some(master_data) = self.promised_data.get(&filename).unwrap().ready() {
-                        let cloned = Arc::clone(&master_data);
-                        let filter = filter.clone();
+                    if let Some(file) = self.sheets_data.get(&filename) {
+                        if let Some(master_data) = file.ready() {
+                            let cloned = Arc::clone(&master_data);
+                            let filter = filter.clone();
 
-                        self.filtered_data.insert(
-                            (filename, tab_id),
-                            poll_promise::Promise::spawn_thread("filter_sheet", move || {
-                                Arc::new(
-                                    cloned
-                                        .iter()
-                                        .filter(|r| r.iter().any(|c| c.contains(&filter)))
-                                        .map(|r| r.clone())
-                                        .collect::<Vec<_>>(),
-                                )
-                            }),
-                        );
+                            self.filtered_data.insert(
+                                (filename, tab_id),
+                                poll_promise::Promise::spawn_thread("filter_sheet", move || {
+                                    Arc::new(
+                                        cloned
+                                            .iter()
+                                            .filter(|r| r.iter().any(|c| c.contains(&filter)))
+                                            .map(|r| r.clone())
+                                            .collect::<Vec<_>>(),
+                                    )
+                                }),
+                            );
+                        }
                     }
                 }
                 UiMessage::OpenFile(file, tab) => load_file(self, ctx, file, tab),
@@ -389,7 +391,7 @@ impl eframe::App for MyApp {
                 ctx,
                 &mut TabViewer {
                     added_nodes: &mut added_nodes,
-                    promised_data: &self.promised_data,
+                    promised_data: &self.sheets_data,
                     filtered_data: &self.filtered_data,
                     ctx: &ctx,
                     filter: &self.filter,
