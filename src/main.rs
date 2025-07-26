@@ -37,34 +37,6 @@ impl egui_dock::TabViewer for TabViewer<'_> {
 
         ui.label(format!("Tab no. {tab_id}"));
 
-        let mut default: Vec<FileHeader> = vec![];
-        let mut columns = self
-            .columns
-            .get_mut(&("sheet".to_string(), tab_id))
-            .unwrap_or(default.as_mut());
-
-        if self
-            .promised_data
-            .get("filename")
-            .unwrap()
-            .ready()
-            .is_none()
-        {
-            let painter = self
-                .ctx
-                .layer_painter(LayerId::new(Order::Foreground, Id::new("file_drop_target")));
-
-            let screen_rect = self.ctx.screen_rect();
-            painter.rect_filled(screen_rect, 0.0, Color32::from_black_alpha(192));
-            painter.text(
-                screen_rect.center(),
-                Align2::CENTER_CENTER,
-                "Loading…",
-                TextStyle::Heading.resolve(&self.ctx.style()),
-                Color32::WHITE,
-            );
-        }
-
         let mut default = "".to_string();
         let radio = self.chosen_file.get_mut(&tab_id).unwrap_or(&mut default);
 
@@ -81,39 +53,76 @@ impl egui_dock::TabViewer for TabViewer<'_> {
             open_file_dialog(&self.sender, &tab_id);
         }
 
-        display_headers(ui, columns.as_mut());
+        if let Some(chosen_file) = self.chosen_file.get(&tab_id) {
+            if let (Some(sheet), Some(filtered_sheet)) = (
+                self.promised_data.get(chosen_file),
+                self.filtered_data.get(&(chosen_file.to_string(), tab_id)),
+            ) {
+                if sheet.ready().is_none() || filtered_sheet.ready().is_none() {
+                    let painter = self.ctx.layer_painter(LayerId::new(
+                        Order::Foreground,
+                        Id::new("file_drop_target"),
+                    ));
 
-        let mut table = TableBuilder::new(ui)
-            .striped(true)
-            .resizable(true)
-            .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-            .min_scrolled_height(0.0);
+                    let screen_rect = self.ctx.screen_rect();
+                    painter.rect_filled(screen_rect, 0.0, Color32::from_black_alpha(192));
+                    painter.text(
+                        screen_rect.center(),
+                        Align2::CENTER_CENTER,
+                        "Loading…",
+                        TextStyle::Heading.resolve(&self.ctx.style()),
+                        Color32::WHITE,
+                    );
+                }
+            }
 
-        table = handle_key_nav(tab, self.ctx, table);
+            if !chosen_file.is_empty() && !self.columns.contains_key(&(chosen_file.clone(), tab_id))
+            {
+                self.columns.insert(
+                    (chosen_file.clone(), tab_id),
+                    self.columns.get(&(chosen_file.clone(), 0)).unwrap().clone(),
+                );
+            }
 
-        let table_ui = display_table_headers(&mut columns, table);
+            if let Some(columns) = self.columns.get_mut(&(chosen_file.clone(), tab_id)) {
+                display_headers(ui, columns.as_mut());
 
-        display_table(
-            self.ctx,
-            tab_id,
-            table_ui,
-            &self
-                .filter
-                .get(&("filename".to_string(), tab_id))
-                .unwrap_or(&"".to_string()),
-            &columns,
-            &self.promised_data.get("filename").unwrap(),
-            &self
-                .filtered_data
-                .get(&("filename".to_string(), tab_id))
-                .unwrap_or(&poll_promise::Promise::spawn_thread(
-                    "empty_data",
-                    move || Arc::new(vec![]),
-                )),
-            &self.sender,
-            // self.sort_order.unwrap_or(SortOrder::Dsc),
-            // self.sort_by_column,
-        );
+                let mut table = TableBuilder::new(ui)
+                    .striped(true)
+                    .resizable(true)
+                    .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
+                    .min_scrolled_height(0.0);
+
+                table = handle_key_nav(tab, self.ctx, table);
+
+                let table_ui = display_table_headers(columns, table);
+
+                if let Some(promised_data) = self.promised_data.get(chosen_file) {
+                    display_table(
+                        self.ctx,
+                        chosen_file,
+                        tab_id,
+                        table_ui,
+                        &self
+                            .filter
+                            .get(&(chosen_file.clone(), tab_id))
+                            .unwrap_or(&"".to_string()),
+                        &columns,
+                        promised_data,
+                        &self
+                            .filtered_data
+                            .get(&(chosen_file.to_string(), tab_id))
+                            .unwrap_or(&poll_promise::Promise::spawn_thread(
+                                "empty_data",
+                                move || Arc::new(vec![]),
+                            )),
+                        &self.sender,
+                        // self.sort_order.unwrap_or(SortOrder::Dsc),
+                        // self.sort_by_column,
+                    );
+                }
+            }
+        }
     }
 
     fn on_close(&mut self, tab: &mut Self::Tab) -> OnCloseResponse {
@@ -124,11 +133,6 @@ impl egui_dock::TabViewer for TabViewer<'_> {
     }
 
     fn on_add(&mut self, surface: SurfaceIndex, node: NodeIndex) {
-        let columns = self.columns.get(&("sheet".to_string(), 0)).unwrap();
-
-        self.columns
-            .insert(("sheet".to_string(), self.counter.clone()), columns.clone());
-
         self.added_nodes.push((surface, node));
     }
 }
@@ -265,22 +269,22 @@ fn display_headers(ui: &mut egui::Ui, headers: &mut Vec<FileHeader>) {
     });
 }
 
-fn load_file(app: &mut MyApp, ctx: &egui::Context, file_name: String, tab: usize) {
+fn load_file(app: &mut MyApp, ctx: &egui::Context, file_name: String, tab_id: usize) {
     app.picked_path = Some(file_name.clone());
 
     app.files_list.push(file_name.clone());
+    app.chosen_file.insert(tab_id, file_name.clone());
 
     let (mut reader, headers) = open_csv_file(&file_name);
 
     app.columns
-        .insert(("sheet".to_string(), tab), headers.clone());
-    app.columns
-        .insert(("sheet".to_string(), 0), headers.clone());
+        .insert((file_name.clone(), tab_id), headers.clone());
+    app.columns.insert((file_name.clone(), 0), headers.clone());
 
     app.loading = true;
 
     app.promised_data.insert(
-        "filename".to_string(),
+        file_name.clone(),
         poll_promise::Promise::spawn_thread("slow_operation", move || {
             Arc::new(
                 reader

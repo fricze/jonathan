@@ -13,6 +13,7 @@ use egui_extras::Table;
 
 pub fn display_table(
     ctx: &Context,
+    filename: &str,
     tab_id: usize,
     table_ui: Table,
     filter: &str,
@@ -114,7 +115,7 @@ pub fn display_table(
                         if label.clicked() {
                             ctx.input(|input| {
                                 if let Err(e) = &sender.send(UiMessage::FilterData(
-                                    "filename".to_string(),
+                                    filename.to_string(),
                                     filter_text.to_string(),
                                     tab_id,
                                     Some(col_index),
