@@ -3,7 +3,6 @@
 use egui::{Align2, Id, LayerId, Order, TextStyle};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, NodeIndex, Style, SurfaceIndex};
-use polars::prelude::file;
 use std::sync::Arc;
 
 use egui::{Color32, ScrollArea};
@@ -25,22 +24,34 @@ use eframe::egui;
 use read_csv::open_csv_file;
 use types::{FileHeader, MyApp, SheetTab, TabViewer, UiMessage};
 
+fn get_last_element_from_path(s: &str) -> Option<&str> {
+    s.split('/').last()
+}
+
 impl egui_dock::TabViewer for TabViewer<'_> {
     type Tab = SheetTab;
 
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
-        let id = tab.id;
-        format!("Tab {id}").into()
+        let file = get_last_element_from_path(&tab.chosen_file);
+        let tab_id = &tab.id;
+
+        if let Some(file) = file {
+            if file.is_empty() {
+                format!("tab {tab_id}. Load file").into()
+            } else {
+                format!("tab {tab_id}. {file}").into()
+            }
+        } else {
+            format!("tab {tab_id}. Load file").into()
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         let tab_id = tab.id;
 
-        ui.label(format!("Tab no. {tab_id}"));
-
         let radio = &tab.chosen_file;
         egui::ComboBox::from_label("Chosen file")
-            .selected_text(format!("{radio:?}"))
+            .selected_text(radio)
             .show_ui(ui, |ui| {
                 for file in self.files_list {
                     let filename = file.clone();
@@ -54,11 +65,12 @@ impl egui_dock::TabViewer for TabViewer<'_> {
 
         let chosen_file = &tab.chosen_file.clone();
 
-        if let (Some(sheet), Some(filtered_sheet)) = (
-            self.promised_data.get(chosen_file),
-            self.filtered_data.get(&(chosen_file.to_string(), tab_id)),
-        ) {
-            if sheet.ready().is_none() || filtered_sheet.ready().is_none() {
+        // self.filtered_data.get(&(chosen_file.to_string(), tab_id)),
+        // || filtered_sheet.ready().is_none()
+        // , Some(filtered_sheet)
+
+        if let Some(sheet) = self.promised_data.get(chosen_file) {
+            if sheet.ready().is_none() {
                 let painter = self
                     .ctx
                     .layer_painter(LayerId::new(Order::Foreground, Id::new("file_drop_target")));
@@ -266,31 +278,39 @@ fn load_file(app: &mut MyApp, ctx: &egui::Context, file_name: String, tab_id: us
     let (mut reader, headers) = open_csv_file(&file_name);
 
     for tab in app.tree.iter_all_tabs_mut() {
-        tab.1.columns.insert(file_name.clone(), headers.clone());
+        let sheet_tab = tab.1;
+        sheet_tab.columns.insert(file_name.clone(), headers.clone());
+
+        if sheet_tab.id == tab_id {
+            sheet_tab.chosen_file = file_name.clone();
+        }
     }
 
     app.loading = true;
 
-    app.sheets_data.insert(
-        file_name.clone(),
-        poll_promise::Promise::spawn_thread("slow_operation", move || {
-            Arc::new(
-                reader
-                    .records()
-                    .filter_map(|record| record.ok())
-                    .map(|r| Arc::new(r))
-                    .collect::<Vec<_>>(),
-            )
-        }),
-    );
+    let promise = poll_promise::Promise::spawn_thread("slow_operation", move || {
+        Arc::new(
+            reader
+                .records()
+                .filter_map(|record| record.ok())
+                .map(|r| Arc::new(r))
+                .collect::<Vec<_>>(),
+        )
+    });
+    app.sheets_data.insert(file_name.clone(), promise);
 
     ctx.send_viewport_cmd(egui::ViewportCommand::Title(file_name));
 }
 
 fn open_file_dialog(sender: &Sender<UiMessage>, tab: &usize) {
-    if let Some(path) = rfd::FileDialog::new().pick_file() {
-        if let Err(e) = sender.send(UiMessage::OpenFile(path.display().to_string(), *tab)) {
-            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+    if let Some(paths) = rfd::FileDialog::new()
+        .add_filter("csv", &["csv"])
+        .pick_files()
+    {
+        for path in paths {
+            if let Err(e) = sender.send(UiMessage::OpenFile(path.display().to_string(), *tab)) {
+                eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+            }
         }
     }
 }
