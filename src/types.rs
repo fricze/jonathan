@@ -72,4 +72,5 @@ pub struct TabViewer<'a> {
     pub filter: &'a HashMap<(Filename, TabId), String>,
     pub sender: &'a Sender<UiMessage>,
     pub files_list: &'a Vec<String>,
+    pub tabs_no: usize,
 }

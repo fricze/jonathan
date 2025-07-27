@@ -49,8 +49,16 @@ impl egui_dock::TabViewer for TabViewer<'_> {
     fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
         let tab_id = tab.id;
 
+        ui.add_space(4.0);
+
+        if ui.button("Open file…").clicked() {
+            open_file_dialog(&self.sender, &tab_id);
+        }
+
+        ui.add_space(4.0);
+
         let radio = &tab.chosen_file;
-        egui::ComboBox::from_label("Chosen file")
+        egui::ComboBox::from_label("Select file")
             .selected_text(radio)
             .show_ui(ui, |ui| {
                 for file in self.files_list {
@@ -59,9 +67,7 @@ impl egui_dock::TabViewer for TabViewer<'_> {
                 }
             });
 
-        if ui.button("Open file…").clicked() {
-            open_file_dialog(&self.sender, &tab_id);
-        }
+        ui.add_space(4.0);
 
         let chosen_file = &tab.chosen_file.clone();
 
@@ -89,6 +95,7 @@ impl egui_dock::TabViewer for TabViewer<'_> {
 
         if let Some(columns) = tab.columns.get_mut(chosen_file) {
             display_headers(ui, columns.as_mut());
+            ui.add_space(4.0);
 
             let table = TableBuilder::new(ui)
                 .striped(true)
@@ -129,10 +136,11 @@ impl egui_dock::TabViewer for TabViewer<'_> {
     }
 
     fn on_close(&mut self, tab: &mut Self::Tab) -> OnCloseResponse {
-        let id = tab.id;
-
-        println!("Closed tab: {id}");
-        OnCloseResponse::Close
+        if self.tabs_no > 1 {
+            OnCloseResponse::Close
+        } else {
+            OnCloseResponse::Ignore
+        }
     }
 
     fn on_add(&mut self, surface: SurfaceIndex, node: NodeIndex) {
@@ -245,28 +253,30 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
 }
 
 fn display_headers(ui: &mut egui::Ui, headers: &mut Vec<FileHeader>) {
-    ui.horizontal_wrapped(|ui| {
-        let mut hidden = HashSet::new();
+    ui.collapsing("Show/hide columns", |ui| {
+        ui.horizontal_wrapped(|ui| {
+            let mut hidden = HashSet::new();
 
-        for (index, file_header) in headers.iter_mut().enumerate() {
-            if file_header.visible {
-                hidden.remove(&index);
-            } else {
-                hidden.insert(index);
-            }
-
-            if ui
-                .checkbox(&mut file_header.visible, &file_header.name)
-                .on_hover_text(format!("Show/hide column {}", file_header.name))
-                .clicked()
-            {
+            for (index, file_header) in headers.iter_mut().enumerate() {
                 if file_header.visible {
                     hidden.remove(&index);
                 } else {
                     hidden.insert(index);
                 }
+
+                if ui
+                    .checkbox(&mut file_header.visible, &file_header.name)
+                    .on_hover_text(format!("Show/hide column {}", file_header.name))
+                    .clicked()
+                {
+                    if file_header.visible {
+                        hidden.remove(&index);
+                    } else {
+                        hidden.insert(index);
+                    }
+                }
             }
-        }
+        });
     });
 }
 
@@ -404,6 +414,8 @@ impl eframe::App for MyApp {
 
         let mut added_nodes = Vec::new();
 
+        let tabs_no = self.tree.iter_all_tabs().count();
+
         DockArea::new(&mut self.tree)
             .style(Style::from_egui(ctx.style().as_ref()))
             .show_add_buttons(true)
@@ -417,6 +429,7 @@ impl eframe::App for MyApp {
                     filter: &self.filter,
                     sender: &self.sender,
                     files_list: &self.files_list,
+                    tabs_no,
                 },
             );
 
