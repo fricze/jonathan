@@ -42,10 +42,10 @@ pub struct SheetTab {
     pub content_height: f32,
     pub chosen_file: String,
     pub columns: HashMap<Filename, Vec<FileHeader>>,
+    pub filter: HashMap<Filename, String>,
 }
 
 pub struct MyApp {
-    pub filter: HashMap<(Filename, TabId), String>,
     pub dropped_files: Vec<egui::DroppedFile>,
     pub picked_path: Option<String>,
     pub loading: bool,
@@ -69,7 +69,6 @@ pub struct TabViewer<'a> {
     pub promised_data: &'a HashMap<Filename, Promise<Arc<ArcSheet>>>,
     pub filtered_data: &'a HashMap<(Filename, TabId), Promise<Arc<ArcSheet>>>,
     pub ctx: &'a Context,
-    pub filter: &'a HashMap<(Filename, TabId), String>,
     pub sender: &'a Sender<UiMessage>,
     pub files_list: &'a Vec<String>,
     pub tabs_no: usize,

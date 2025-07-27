@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
+use eframe::glow::SHADER_COMPILER;
 use egui::{Align2, Id, LayerId, Order, TextStyle};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, NodeIndex, Style, SurfaceIndex};
@@ -57,19 +58,36 @@ impl egui_dock::TabViewer for TabViewer<'_> {
 
         ui.add_space(4.0);
 
-        let radio = &tab.chosen_file;
-        egui::ComboBox::from_label("Select file")
-            .selected_text(radio)
-            .show_ui(ui, |ui| {
-                for file in self.files_list {
-                    let filename = file.clone();
-                    ui.selectable_value(&mut tab.chosen_file, filename, file.clone());
-                }
-            });
+        if !self.files_list.is_empty() {
+            let radio = &tab.chosen_file;
+            egui::ComboBox::from_label("Select file")
+                .selected_text(radio)
+                .show_ui(ui, |ui| {
+                    for file in self.files_list {
+                        let filename = file.clone();
+                        ui.selectable_value(&mut tab.chosen_file, filename, file.clone());
+                    }
+                });
 
-        ui.add_space(4.0);
+            ui.add_space(4.0);
+        }
 
         let chosen_file = &tab.chosen_file.clone();
+
+        if !chosen_file.is_empty() {
+            if let Some(filter) = tab.filter.get_mut(chosen_file) {
+                if ui.text_edit_singleline(filter).changed() {
+                    if let Err(e) = &self.sender.send(UiMessage::FilterData(
+                        chosen_file.to_string(),
+                        filter.to_string(),
+                        tab_id,
+                        None,
+                    )) {
+                        eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                    }
+                };
+            }
+        }
 
         // self.filtered_data.get(&(chosen_file.to_string(), tab_id)),
         // || filtered_sheet.ready().is_none()
@@ -120,10 +138,7 @@ impl egui_dock::TabViewer for TabViewer<'_> {
                     chosen_file,
                     tab_id,
                     table_ui,
-                    &self
-                        .filter
-                        .get(&(chosen_file.clone(), tab_id))
-                        .unwrap_or(&"".to_string()),
+                    &tab.filter.get(chosen_file).unwrap_or(&"".to_string()),
                     &columns,
                     promised_data,
                     filtered_data,
@@ -198,7 +213,6 @@ fn main() -> eframe::Result {
                 receiver: ui_chan.1,
                 sort_by_column: None,
                 sort_order: None,
-                filter: HashMap::new(),
                 dropped_files: Vec::new(),
                 picked_path: None,
                 loading: false,
@@ -290,6 +304,7 @@ fn load_file(app: &mut MyApp, ctx: &egui::Context, file_name: String, tab_id: us
     for tab in app.tree.iter_all_tabs_mut() {
         let sheet_tab = tab.1;
         sheet_tab.columns.insert(file_name.clone(), headers.clone());
+        sheet_tab.filter.insert(file_name.clone(), "".to_string());
 
         if sheet_tab.id == tab_id {
             sheet_tab.chosen_file = file_name.clone();
@@ -384,8 +399,13 @@ impl eframe::App for MyApp {
         while let Ok(message) = self.receiver.try_recv() {
             match message {
                 UiMessage::FilterData(filename, filter, tab_id, column) => {
-                    self.filter
-                        .insert((filename.clone(), tab_id), filter.clone());
+                    for tab in self.tree.iter_all_tabs_mut() {
+                        let sheet_tab = tab.1;
+                        if sheet_tab.id == tab_id {
+                            sheet_tab.filter.insert(filename.clone(), filter.clone());
+                        }
+                    }
+
                     self.loading = true;
 
                     if let Some(file) = self.sheets_data.get(&filename) {
@@ -426,7 +446,6 @@ impl eframe::App for MyApp {
                     promised_data: &self.sheets_data,
                     filtered_data: &self.filtered_data,
                     ctx: &ctx,
-                    filter: &self.filter,
                     sender: &self.sender,
                     files_list: &self.files_list,
                     tabs_no,
