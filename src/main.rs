@@ -1,9 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
-use eframe::glow::SHADER_COMPILER;
 use egui::{Align2, Id, LayerId, Order, TextStyle};
+use egui::{Key, Rect};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, NodeIndex, Style, SurfaceIndex};
+use poll_promise::Promise;
 use std::sync::Arc;
 
 use egui::{Color32, ScrollArea};
@@ -23,7 +24,7 @@ use crate::table::display_table;
 use crate::ui::handle_key_nav;
 use eframe::egui;
 use read_csv::open_csv_file;
-use types::{FileHeader, MyApp, SheetTab, TabViewer, UiMessage};
+use types::{ArcSheet, FileHeader, Filename, MyApp, SheetTab, TabId, TabViewer, UiMessage};
 
 fn get_last_element_from_path(s: &str) -> Option<&str> {
     s.split('/').last()
@@ -76,16 +77,47 @@ impl egui_dock::TabViewer for TabViewer<'_> {
 
         if !chosen_file.is_empty() {
             if let Some(filter) = tab.filter.get_mut(chosen_file) {
-                if ui.text_edit_singleline(filter).changed() {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.text_edit_singleline(filter).changed() {
+                        if let Err(e) = &self.sender.send(UiMessage::FilterData(
+                            chosen_file.to_string(),
+                            filter.to_string(),
+                            tab_id,
+                            None,
+                            types::Tabs::Single,
+                        )) {
+                            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                        }
+                    }
+
+                    if ui.button("Clear (esc)").clicked() {
+                        if let Err(e) = &self.sender.send(UiMessage::FilterData(
+                            chosen_file.to_string(),
+                            "".to_string(),
+                            tab_id,
+                            None,
+                            types::Tabs::Single,
+                        )) {
+                            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                        }
+                    }
+                });
+            }
+        }
+
+        if let Some(focused_tab) = self.focused_tab {
+            if focused_tab == tab.id {
+                if self.ctx.input(|i| i.key_pressed(Key::Escape)) {
                     if let Err(e) = &self.sender.send(UiMessage::FilterData(
                         chosen_file.to_string(),
-                        filter.to_string(),
+                        "".to_string(),
                         tab_id,
                         None,
+                        types::Tabs::Single,
                     )) {
                         eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
                     }
-                };
+                }
             }
         }
 
@@ -294,7 +326,7 @@ fn display_headers(ui: &mut egui::Ui, headers: &mut Vec<FileHeader>) {
     });
 }
 
-fn load_file(app: &mut MyApp, ctx: &egui::Context, file_name: String, tab_id: usize) {
+fn load_file(app: &mut MyApp, ctx: &egui::Context, file_name: String, tab_id: Option<usize>) {
     app.picked_path = Some(file_name.clone());
 
     app.files_list.push(file_name.clone());
@@ -306,8 +338,10 @@ fn load_file(app: &mut MyApp, ctx: &egui::Context, file_name: String, tab_id: us
         sheet_tab.columns.insert(file_name.clone(), headers.clone());
         sheet_tab.filter.insert(file_name.clone(), "".to_string());
 
-        if sheet_tab.id == tab_id {
-            sheet_tab.chosen_file = file_name.clone();
+        if let Some(tab_id) = tab_id {
+            if sheet_tab.id == tab_id {
+                sheet_tab.chosen_file = file_name.clone();
+            }
         }
     }
 
@@ -333,7 +367,8 @@ fn open_file_dialog(sender: &Sender<UiMessage>, tab: &usize) {
         .pick_files()
     {
         for path in paths {
-            if let Err(e) = sender.send(UiMessage::OpenFile(path.display().to_string(), *tab)) {
+            if let Err(e) = sender.send(UiMessage::OpenFile(path.display().to_string(), Some(*tab)))
+            {
                 eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
             }
         }
@@ -394,37 +429,76 @@ fn display_table_headers<'a>(columns: &mut Vec<FileHeader>, table: TableBuilder<
     })
 }
 
+fn filter_data(
+    filtered_data: &mut HashMap<(Filename, TabId), Promise<Arc<ArcSheet>>>,
+    sheets_data: &HashMap<String, Promise<Arc<ArcSheet>>>,
+    filter: String,
+    filename: String,
+    tab_id: usize,
+) {
+    if filter.is_empty() {
+        filtered_data.insert(
+            (filename.clone(), tab_id),
+            poll_promise::Promise::spawn_thread("filter_sheet", move || Arc::new(vec![])),
+        );
+    } else {
+        if let Some(file) = sheets_data.get(&filename) {
+            if let Some(master_data) = file.ready() {
+                let cloned = Arc::clone(&master_data);
+                let filter = filter.clone();
+
+                filtered_data.insert(
+                    (filename, tab_id),
+                    poll_promise::Promise::spawn_thread("filter_sheet", move || {
+                        Arc::new(
+                            cloned
+                                .iter()
+                                .filter(|r| r.iter().any(|c| c.contains(&filter)))
+                                .map(|r| r.clone())
+                                .collect::<Vec<_>>(),
+                        )
+                    }),
+                );
+            }
+        }
+    }
+}
+
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok(message) = self.receiver.try_recv() {
             match message {
-                UiMessage::FilterData(filename, filter, tab_id, column) => {
+                UiMessage::FilterData(filename, filter, tab_id, column, tabs) => {
                     for tab in self.tree.iter_all_tabs_mut() {
                         let sheet_tab = tab.1;
-                        if sheet_tab.id == tab_id {
-                            sheet_tab.filter.insert(filename.clone(), filter.clone());
-                        }
-                    }
 
-                    self.loading = true;
+                        match tabs {
+                            types::Tabs::Single => {
+                                if sheet_tab.id == tab_id {
+                                    sheet_tab.filter.insert(filename.clone(), filter.clone());
 
-                    if let Some(file) = self.sheets_data.get(&filename) {
-                        if let Some(master_data) = file.ready() {
-                            let cloned = Arc::clone(&master_data);
-                            let filter = filter.clone();
+                                    filter_data(
+                                        &mut self.filtered_data,
+                                        &self.sheets_data,
+                                        filter.clone(),
+                                        filename.clone(),
+                                        tab_id,
+                                    );
+                                }
+                            }
+                            types::Tabs::All => {
+                                sheet_tab
+                                    .filter
+                                    .insert(sheet_tab.chosen_file.clone(), filter.clone());
 
-                            self.filtered_data.insert(
-                                (filename, tab_id),
-                                poll_promise::Promise::spawn_thread("filter_sheet", move || {
-                                    Arc::new(
-                                        cloned
-                                            .iter()
-                                            .filter(|r| r.iter().any(|c| c.contains(&filter)))
-                                            .map(|r| r.clone())
-                                            .collect::<Vec<_>>(),
-                                    )
-                                }),
-                            );
+                                filter_data(
+                                    &mut self.filtered_data,
+                                    &self.sheets_data,
+                                    filter.clone(),
+                                    sheet_tab.chosen_file.clone(),
+                                    tab_id,
+                                );
+                            }
                         }
                     }
                 }
@@ -435,6 +509,7 @@ impl eframe::App for MyApp {
         let mut added_nodes = Vec::new();
 
         let tabs_no = self.tree.iter_all_tabs().count();
+        let focused_tab = self.tree.find_active_focused().map(|(rect, tab)| tab.id);
 
         DockArea::new(&mut self.tree)
             .style(Style::from_egui(ctx.style().as_ref()))
@@ -449,17 +524,24 @@ impl eframe::App for MyApp {
                     sender: &self.sender,
                     files_list: &self.files_list,
                     tabs_no,
+                    focused_tab,
                 },
             );
 
         added_nodes.drain(..).for_each(|(surface, node)| {
             self.tree.set_focused_node_and_surface((surface, node));
 
-            let columns = self.tree.iter_all_tabs().last().unwrap().1.columns.clone();
+            let last_tab = self.tree.iter_all_tabs().last().unwrap().1;
+            let columns = last_tab.columns.clone();
+            let mut filter = last_tab.filter.clone();
+            for value in filter.values_mut() {
+                *value = "".to_string();
+            }
 
             self.tree.push_to_focused_leaf(SheetTab {
                 id: self.counter,
                 columns,
+                filter,
                 ..Default::default()
             });
 
@@ -558,29 +640,30 @@ impl eframe::App for MyApp {
         //     });
         // });
 
-        // preview_files_being_dropped(ctx);
+        preview_files_being_dropped(ctx);
 
-        let mut file_name = None;
-        // Collect dropped files:
         ctx.input(|i| {
             if !i.raw.dropped_files.is_empty() {
                 let files = &i.raw.dropped_files;
-                self.dropped_files.clone_from(files);
 
                 let default_path = PathBuf::default();
-                let path = files[0].path.as_ref().unwrap_or(&default_path);
-                file_name = Some(path.display().to_string());
 
-                let str_path = path.to_str().unwrap_or("");
+                for file in files {
+                    let path = file
+                        .path
+                        .as_ref()
+                        .unwrap_or(&default_path)
+                        .to_str()
+                        .unwrap_or("");
 
-                // if let Err(e) = self.sender.send(UiMessage::OpenFile(str_path.to_string())) {
-                //     eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                // }
+                    if let Err(e) = self
+                        .sender
+                        .send(UiMessage::OpenFile(path.to_string(), None))
+                    {
+                        eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                    }
+                }
             }
         });
-
-        if let Some(file_name) = file_name {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Title(file_name));
-        }
     }
 }

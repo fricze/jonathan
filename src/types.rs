@@ -1,5 +1,5 @@
-use crate::egui::Context;
 use csv::StringRecord;
+use egui::Context;
 use egui_dock::{DockState, NodeIndex, SurfaceIndex};
 use std::collections::HashMap;
 
@@ -21,9 +21,14 @@ pub type TabId = usize;
 pub type Filter = String;
 pub type Filename = String;
 
+pub enum Tabs {
+    All,
+    Single,
+}
+
 pub enum UiMessage {
-    OpenFile(String, usize),
-    FilterData(Filename, Filter, TabId, Option<usize>),
+    OpenFile(String, Option<TabId>),
+    FilterData(Filename, Filter, TabId, Option<usize>, Tabs),
 }
 
 pub type ArcSheet = Vec<Arc<StringRecord>>;
@@ -72,4 +77,5 @@ pub struct TabViewer<'a> {
     pub sender: &'a Sender<UiMessage>,
     pub files_list: &'a Vec<String>,
     pub tabs_no: usize,
+    pub focused_tab: Option<usize>,
 }
