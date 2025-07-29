@@ -1,9 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
-use egui::{Align2, Id, LayerId, Order, TextStyle};
-use egui::{Key, Rect};
+use egui::{Align, Align2, Id, LayerId, Order, RichText, TextStyle};
+use egui::{Button, Key, Rect};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, NodeIndex, Style, SurfaceIndex};
+use egui_flex::{Flex, FlexAlignContent, item};
 use poll_promise::Promise;
 use std::sync::Arc;
 
@@ -33,18 +34,39 @@ fn get_last_element_from_path(s: &str) -> Option<&str> {
 impl egui_dock::TabViewer for TabViewer<'_> {
     type Tab = SheetTab;
 
+    fn add_popup(&mut self, ui: &mut egui::Ui, surface: SurfaceIndex, node: NodeIndex) {
+        ui.set_min_width(120.0);
+
+        ui.layout()
+            .with_main_justify(true)
+            .with_main_align(Align::Min)
+            .with_cross_align(Align::Min);
+
+        ui.with_layout(egui::Layout::default().with_cross_align(Align::Min), |ui| {
+            if ui.button("job").clicked() {}
+
+            for file in self.files_list {
+                if let Some(file) = get_last_element_from_path(file) {
+                    if ui.button(file).clicked() {
+                        self.added_nodes.push((surface, node));
+                    }
+                }
+            }
+        });
+    }
+
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
         let file = get_last_element_from_path(&tab.chosen_file);
         let tab_id = &tab.id;
 
         if let Some(file) = file {
             if file.is_empty() {
-                format!("tab {tab_id}. Load file").into()
+                format!("[tab {tab_id}] Load file").into()
             } else {
-                format!("tab {tab_id}. {file}").into()
+                format!("[tab {tab_id}] {file}").into()
             }
         } else {
-            format!("tab {tab_id}. Load file").into()
+            format!("[tab {tab_id}] Load file").into()
         }
     }
 
@@ -190,9 +212,9 @@ impl egui_dock::TabViewer for TabViewer<'_> {
         }
     }
 
-    fn on_add(&mut self, surface: SurfaceIndex, node: NodeIndex) {
-        self.added_nodes.push((surface, node));
-    }
+    // fn on_add(&mut self, surface: SurfaceIndex, node: NodeIndex) {
+    //     self.added_nodes.push((surface, node));
+    // }
 }
 
 fn replace_fonts(ctx: &egui::Context) {
@@ -516,9 +538,16 @@ impl eframe::App for MyApp {
         let tabs_no = self.tree.iter_all_tabs().count();
         let focused_tab = self.tree.find_active_focused().map(|(rect, tab)| tab.id);
 
+        egui::SidePanel::left("documents").show(ctx, |ui| {
+            for lab in vec!["raz", "dwa", "trzy"] {
+                if ui.selectable_label(false, lab.to_string()).clicked() {}
+            }
+        });
+
         DockArea::new(&mut self.tree)
             .style(Style::from_egui(ctx.style().as_ref()))
             .show_add_buttons(true)
+            .show_add_popup(true)
             .show(
                 ctx,
                 &mut TabViewer {
