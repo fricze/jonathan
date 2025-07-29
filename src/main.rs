@@ -439,25 +439,30 @@ fn filter_data(
     if filter.is_empty() {
         filtered_data.insert(
             (filename.clone(), tab_id),
-            poll_promise::Promise::spawn_thread("filter_sheet", move || Arc::new(vec![])),
+            poll_promise::Promise::spawn_thread(format!("filter_sheet {tab_id}"), move || {
+                Arc::new(vec![])
+            }),
         );
     } else {
         if let Some(file) = sheets_data.get(&filename) {
             if let Some(master_data) = file.ready() {
-                let cloned = Arc::clone(&master_data);
+                let master_clone = Arc::clone(&master_data);
                 let filter = filter.clone();
 
                 filtered_data.insert(
                     (filename, tab_id),
-                    poll_promise::Promise::spawn_thread("filter_sheet", move || {
-                        Arc::new(
-                            cloned
-                                .iter()
-                                .filter(|r| r.iter().any(|c| c.contains(&filter)))
-                                .map(|r| r.clone())
-                                .collect::<Vec<_>>(),
-                        )
-                    }),
+                    poll_promise::Promise::spawn_thread(
+                        format!("filter_sheet {tab_id}"),
+                        move || {
+                            Arc::new(
+                                master_clone
+                                    .iter()
+                                    .filter(|r| r.iter().any(|c| c.contains(&filter)))
+                                    .map(|r| r.clone())
+                                    .collect::<Vec<_>>(),
+                            )
+                        },
+                    ),
                 );
             }
         }
@@ -487,16 +492,16 @@ impl eframe::App for MyApp {
                                 }
                             }
                             types::Tabs::All => {
-                                sheet_tab
-                                    .filter
-                                    .insert(sheet_tab.chosen_file.clone(), filter.clone());
+                                let chosen_file = sheet_tab.chosen_file.clone();
+
+                                sheet_tab.filter.insert(chosen_file.clone(), filter.clone());
 
                                 filter_data(
                                     &mut self.filtered_data,
                                     &self.sheets_data,
                                     filter.clone(),
-                                    sheet_tab.chosen_file.clone(),
-                                    tab_id,
+                                    chosen_file,
+                                    sheet_tab.id,
                                 );
                             }
                         }

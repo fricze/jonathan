@@ -36,7 +36,7 @@ pub fn display_table(
     let default_data: Arc<Vec<Arc<StringRecord>>> = Arc::new(def_vec);
 
     let sheet_data = match filtered_data {
-        Some(data) if !data.is_empty() => data,
+        Some(data) if !filter.is_empty() => data,
         _ => master_data.unwrap_or(&default_data),
     };
 
