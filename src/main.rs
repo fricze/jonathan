@@ -43,7 +43,9 @@ impl egui_dock::TabViewer for TabViewer<'_> {
             .with_cross_align(Align::Min);
 
         ui.with_layout(egui::Layout::default().with_cross_align(Align::Min), |ui| {
-            if ui.button("job").clicked() {}
+            if ui.button("New tab").clicked() {
+                self.added_nodes.push((surface, node));
+            }
 
             for file in self.files_list {
                 if let Some(file) = get_last_element_from_path(file) {
