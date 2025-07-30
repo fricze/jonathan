@@ -107,24 +107,22 @@ impl egui_dock::TabViewer for TabViewer<'_> {
             if let Some(filter) = tab.filter.get_mut(chosen_file) {
                 ui.horizontal_wrapped(|ui| {
                     if ui.text_edit_singleline(filter).changed() {
-                        if let Err(e) = &self.sender.send(UiMessage::FilterData(
+                        if let Err(e) = &self.sender.send(UiMessage::FilterSheet(
                             chosen_file.to_string(),
                             filter.to_string(),
                             tab_id,
                             None,
-                            types::Tabs::Single,
                         )) {
                             eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
                         }
                     }
 
                     if ui.button("Clear (esc)").clicked() {
-                        if let Err(e) = &self.sender.send(UiMessage::FilterData(
+                        if let Err(e) = &self.sender.send(UiMessage::FilterSheet(
                             chosen_file.to_string(),
                             "".to_string(),
                             tab_id,
                             None,
-                            types::Tabs::Single,
                         )) {
                             eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
                         }
@@ -136,12 +134,11 @@ impl egui_dock::TabViewer for TabViewer<'_> {
         if let Some(focused_tab) = self.focused_tab {
             if focused_tab == tab.id {
                 if self.ctx.input(|i| i.key_pressed(Key::Escape)) {
-                    if let Err(e) = &self.sender.send(UiMessage::FilterData(
+                    if let Err(e) = &self.sender.send(UiMessage::FilterSheet(
                         chosen_file.to_string(),
                         "".to_string(),
                         tab_id,
                         None,
-                        types::Tabs::Single,
                     )) {
                         eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
                     }
@@ -193,12 +190,20 @@ impl egui_dock::TabViewer for TabViewer<'_> {
                     .get(&(chosen_file.to_string(), tab_id))
                     .unwrap_or(&default_sheet);
 
+                let filter = if !self.global_filter.is_empty() {
+                    self.global_filter
+                } else if let Some(chosen_file) = tab.filter.get(chosen_file) {
+                    chosen_file
+                } else {
+                    &"".to_string()
+                };
+
                 display_table(
                     self.ctx,
                     chosen_file,
                     tab_id,
                     table_ui,
-                    &tab.filter.get(chosen_file).unwrap_or(&"".to_string()),
+                    filter,
                     &columns,
                     promised_data,
                     filtered_data,
@@ -502,37 +507,36 @@ impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok(message) = self.receiver.try_recv() {
             match message {
-                UiMessage::FilterData(filename, filter, tab_id, column, tabs) => {
+                UiMessage::FilterGlobal(filter) => {
+                    for tab in self.tree.iter_all_tabs_mut() {
+                        let sheet_tab = tab.1;
+                        let chosen_file = sheet_tab.chosen_file.clone();
+
+                        self.global_filter = filter.clone();
+
+                        filter_data(
+                            &mut self.filtered_data,
+                            &self.sheets_data,
+                            filter.clone(),
+                            chosen_file,
+                            sheet_tab.id,
+                        );
+                    }
+                }
+                UiMessage::FilterSheet(filename, filter, tab_id, column) => {
                     for tab in self.tree.iter_all_tabs_mut() {
                         let sheet_tab = tab.1;
 
-                        match tabs {
-                            types::Tabs::Single => {
-                                if sheet_tab.id == tab_id {
-                                    sheet_tab.filter.insert(filename.clone(), filter.clone());
+                        if sheet_tab.id == tab_id {
+                            sheet_tab.filter.insert(filename.clone(), filter.clone());
 
-                                    filter_data(
-                                        &mut self.filtered_data,
-                                        &self.sheets_data,
-                                        filter.clone(),
-                                        filename.clone(),
-                                        tab_id,
-                                    );
-                                }
-                            }
-                            types::Tabs::All => {
-                                let chosen_file = sheet_tab.chosen_file.clone();
-
-                                sheet_tab.filter.insert(chosen_file.clone(), filter.clone());
-
-                                filter_data(
-                                    &mut self.filtered_data,
-                                    &self.sheets_data,
-                                    filter.clone(),
-                                    chosen_file,
-                                    sheet_tab.id,
-                                );
-                            }
+                            filter_data(
+                                &mut self.filtered_data,
+                                &self.sheets_data,
+                                filter.clone(),
+                                filename.clone(),
+                                tab_id,
+                            );
                         }
                     }
                 }
@@ -546,35 +550,34 @@ impl eframe::App for MyApp {
         let focused_tab = self.tree.find_active_focused().map(|(_, tab)| tab.id);
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            ctx.input(|input| {
+                if input.key_pressed(Key::X) {
+                    if let Err(e) = &self.sender.send(UiMessage::FilterGlobal("".to_string())) {
+                        eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                    }
+                }
+            });
+
             ui.vertical(|ui| {
                 ui.add_space(4.0);
 
                 ui.horizontal_wrapped(|ui| {
                     ui.label("Global filter");
 
-                    if ui.text_edit_singleline(&mut self.global_filter).changed() {}
-                    // if ui.text_edit_singleline(filter).changed() {
-                    //     if let Err(e) = &self.sender.send(UiMessage::FilterData(
-                    //         chosen_file.to_string(),
-                    //         filter.to_string(),
-                    //         tab_id,
-                    //         None,
-                    //         types::Tabs::Single,
-                    //     )) {
-                    //         eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                    //     }
-                    // }
+                    let filter = &self.global_filter.to_string();
+                    if ui.text_edit_singleline(&mut self.global_filter).changed() {
+                        if let Err(e) = &self
+                            .sender
+                            .send(UiMessage::FilterGlobal(filter.to_string()))
+                        {
+                            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                        }
+                    }
 
-                    if ui.button("Clear (esc)").clicked() {
-                        // if let Err(e) = &self.sender.send(UiMessage::FilterData(
-                        //     chosen_file.to_string(),
-                        //     "".to_string(),
-                        //     tab_id,
-                        //     None,
-                        //     types::Tabs::Single,
-                        // )) {
-                        //     eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                        // }
+                    if ui.button("Clear (x)").clicked() {
+                        if let Err(e) = &self.sender.send(UiMessage::FilterGlobal("".to_string())) {
+                            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                        }
                     }
                 });
 
@@ -600,6 +603,7 @@ impl eframe::App for MyApp {
                     files_list: &self.files_list,
                     tabs_no,
                     focused_tab,
+                    global_filter: &self.global_filter,
                 },
             );
 

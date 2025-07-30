@@ -115,25 +115,20 @@ pub fn display_table(
                         if label.clicked() {
                             ctx.input(|input| {
                                 if input.modifiers.command {
-                                    if let Err(e) = &sender.send(UiMessage::FilterData(
-                                        filename.to_string(),
-                                        filter_text.to_string(),
-                                        tab_id,
-                                        Some(col_index),
-                                        crate::types::Tabs::All,
-                                    )) {
+                                    if let Err(e) = &sender
+                                        .send(UiMessage::FilterGlobal(filter_text.to_string()))
+                                    {
                                         eprintln!(
                                             "Worker: Failed to send page data to UI thread: {:?}",
                                             e
                                         );
                                     }
                                 } else {
-                                    if let Err(e) = &sender.send(UiMessage::FilterData(
+                                    if let Err(e) = &sender.send(UiMessage::FilterSheet(
                                         filename.to_string(),
                                         filter_text.to_string(),
                                         tab_id,
                                         Some(col_index),
-                                        crate::types::Tabs::Single,
                                     )) {
                                         eprintln!(
                                             "Worker: Failed to send page data to UI thread: {:?}",

@@ -28,7 +28,8 @@ pub enum Tabs {
 
 pub enum UiMessage {
     OpenFile(String, Option<TabId>),
-    FilterData(Filename, Filter, TabId, Option<usize>, Tabs),
+    FilterSheet(Filename, Filter, TabId, Option<usize>),
+    FilterGlobal(Filter),
 }
 
 pub type ArcSheet = Vec<Arc<StringRecord>>;
@@ -79,4 +80,5 @@ pub struct TabViewer<'a> {
     pub files_list: &'a Vec<String>,
     pub tabs_no: usize,
     pub focused_tab: Option<usize>,
+    pub global_filter: &'a String,
 }
