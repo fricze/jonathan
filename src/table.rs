@@ -136,28 +136,6 @@ pub fn display_table(
                                         );
                                     }
                                 }
-
-                                // if input.modifiers.command {
-                                //     if let Err(e) = &sender.send(UiMessage::FilterData(
-                                //         text.to_string(),
-                                //         Some(col_index),
-                                //     )) {
-                                //         eprintln!(
-                                //             "Worker: Failed to send page data to UI thread: {:?}",
-                                //             e
-                                //         );
-                                //     }
-                                // } else {
-                                //     if let Err(e) = &sender.send(UiMessage::FilterData(
-                                //         text.to_string(),
-                                //         Some(col_index),
-                                //     )) {
-                                //         eprintln!(
-                                //             "Worker: Failed to send page data to UI thread: {:?}",
-                                //             e
-                                //         );
-                                //     }
-                                // }
                             })
                         }
                     });
