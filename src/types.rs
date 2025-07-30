@@ -67,10 +67,11 @@ pub struct MyApp {
     pub tree: DockState<SheetTab>,
     pub counter: usize,
     pub files_list: Vec<String>,
+    pub global_filter: String,
 }
 
 pub struct TabViewer<'a> {
-    pub added_nodes: &'a mut Vec<(SurfaceIndex, NodeIndex)>,
+    pub added_nodes: &'a mut Vec<(SurfaceIndex, NodeIndex, Filename)>,
     pub promised_data: &'a HashMap<Filename, Promise<Arc<ArcSheet>>>,
     pub filtered_data: &'a HashMap<(Filename, TabId), Promise<Arc<ArcSheet>>>,
     pub ctx: &'a Context,

@@ -4,7 +4,7 @@ use egui::{Align, Align2, Id, LayerId, Order, RichText, TextStyle};
 use egui::{Button, Key, Rect};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, NodeIndex, Style, SurfaceIndex};
-use egui_flex::{Flex, FlexAlignContent, item};
+use itertools::Itertools;
 use poll_promise::Promise;
 use std::sync::Arc;
 
@@ -43,14 +43,14 @@ impl egui_dock::TabViewer for TabViewer<'_> {
             .with_cross_align(Align::Min);
 
         ui.with_layout(egui::Layout::default().with_cross_align(Align::Min), |ui| {
-            if ui.button("New tab").clicked() {
-                self.added_nodes.push((surface, node));
+            if ui.button("Empty tab").clicked() {
+                self.added_nodes.push((surface, node, "".to_string()));
             }
 
-            for file in self.files_list {
-                if let Some(file) = get_last_element_from_path(file) {
+            for path in self.files_list {
+                if let Some(file) = get_last_element_from_path(path) {
                     if ui.button(file).clicked() {
-                        self.added_nodes.push((surface, node));
+                        self.added_nodes.push((surface, node, path.to_string()));
                     }
                 }
             }
@@ -86,11 +86,15 @@ impl egui_dock::TabViewer for TabViewer<'_> {
         if !self.files_list.is_empty() {
             let radio = &tab.chosen_file;
             egui::ComboBox::from_label("Select file")
-                .selected_text(radio)
+                .selected_text(get_last_element_from_path(radio).unwrap_or(""))
                 .show_ui(ui, |ui| {
                     for file in self.files_list {
                         let filename = file.clone();
-                        ui.selectable_value(&mut tab.chosen_file, filename, file.clone());
+                        ui.selectable_value(
+                            &mut tab.chosen_file,
+                            filename,
+                            get_last_element_from_path(file).unwrap_or(""),
+                        );
                     }
                 });
 
@@ -283,6 +287,7 @@ fn main() -> eframe::Result {
                 }]),
                 counter: 2,
                 files_list: vec![],
+                global_filter: "".to_string(),
             }))
         }),
     )
@@ -538,12 +543,46 @@ impl eframe::App for MyApp {
         let mut added_nodes = Vec::new();
 
         let tabs_no = self.tree.iter_all_tabs().count();
-        let focused_tab = self.tree.find_active_focused().map(|(rect, tab)| tab.id);
+        let focused_tab = self.tree.find_active_focused().map(|(_, tab)| tab.id);
 
-        egui::SidePanel::left("documents").show(ctx, |ui| {
-            for lab in vec!["raz", "dwa", "trzy"] {
-                if ui.selectable_label(false, lab.to_string()).clicked() {}
-            }
+        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+            ui.vertical(|ui| {
+                ui.add_space(4.0);
+
+                ui.horizontal_wrapped(|ui| {
+                    ui.label("Global filter");
+
+                    if ui.text_edit_singleline(&mut self.global_filter).changed() {}
+                    // if ui.text_edit_singleline(filter).changed() {
+                    //     if let Err(e) = &self.sender.send(UiMessage::FilterData(
+                    //         chosen_file.to_string(),
+                    //         filter.to_string(),
+                    //         tab_id,
+                    //         None,
+                    //         types::Tabs::Single,
+                    //     )) {
+                    //         eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                    //     }
+                    // }
+
+                    if ui.button("Clear (esc)").clicked() {
+                        // if let Err(e) = &self.sender.send(UiMessage::FilterData(
+                        //     chosen_file.to_string(),
+                        //     "".to_string(),
+                        //     tab_id,
+                        //     None,
+                        //     types::Tabs::Single,
+                        // )) {
+                        //     eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                        // }
+                    }
+                });
+
+                ui.add_space(4.0);
+            });
+            // for lab in vec!["raz", "dwa", "trzy"] {
+            //     if ui.selectable_label(false, lab.to_string()).clicked() {}
+            // }
         });
 
         DockArea::new(&mut self.tree)
@@ -564,7 +603,7 @@ impl eframe::App for MyApp {
                 },
             );
 
-        added_nodes.drain(..).for_each(|(surface, node)| {
+        added_nodes.drain(..).for_each(|(surface, node, filename)| {
             self.tree.set_focused_node_and_surface((surface, node));
 
             let last_tab = self.tree.iter_all_tabs().last().unwrap().1;
@@ -578,6 +617,7 @@ impl eframe::App for MyApp {
                 id: self.counter,
                 columns,
                 filter,
+                chosen_file: filename,
                 ..Default::default()
             });
 
