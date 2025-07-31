@@ -1,10 +1,10 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
-use egui::{Align, Align2, Id, LayerId, Order, RichText, TextStyle};
+use egui::text::LayoutJob;
+use egui::{Align, Align2, Id, LayerId, Order, Response, RichText, Stroke, TextStyle, Ui};
 use egui::{Button, Key, Rect};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, NodeIndex, Style, SurfaceIndex};
-use itertools::Itertools;
 use poll_promise::Promise;
 use std::sync::Arc;
 
@@ -16,7 +16,9 @@ use std::sync::mpsc::{self, Sender};
 
 use egui_extras::{Column, Table, TableBuilder};
 
+mod new_table;
 mod read_csv;
+mod rect;
 mod table;
 mod types;
 mod ui;
@@ -31,25 +33,66 @@ fn get_last_element_from_path(s: &str) -> Option<&str> {
     s.split('/').last()
 }
 
+fn gfg<G>(f: G)
+where
+    G: FnOnce(),
+{
+    f();
+}
+
+fn file_button(ui: &mut egui::Ui, file: &str) -> Response {
+    let mut l: Option<Response> = None;
+    egui::Frame::new()
+        .inner_margin(egui::Margin::symmetric(4, 8)) // Horizontal 20, Vertical 10 padding
+        .show(ui, |ui| {
+            l = Some(ui.selectable_label(false, file));
+        });
+
+    let mut rect = l.unwrap().rect;
+
+    rect.set_left(rect.left() - 4.0);
+    rect.set_top(rect.top() - 4.0);
+    rect.set_width(120.0);
+    rect.set_height(rect.height() + 8.0);
+
+    let response = ui
+        .put(rect, egui::Label::new(""))
+        .on_hover_cursor(egui::CursorIcon::PointingHand);
+
+    let border_color = if response.hovered() {
+        Color32::from_rgb(100, 100, 255)
+    } else {
+        Color32::GRAY
+    };
+
+    let stroke_rect = rect.clone();
+    ui.painter().rect_stroke(
+        stroke_rect,
+        4.0,
+        Stroke::new(1.0, border_color),
+        egui::StrokeKind::Outside,
+    );
+
+    response
+}
+
 impl egui_dock::TabViewer for TabViewer<'_> {
     type Tab = SheetTab;
 
     fn add_popup(&mut self, ui: &mut egui::Ui, surface: SurfaceIndex, node: NodeIndex) {
         ui.set_min_width(120.0);
-
-        ui.layout()
-            .with_main_justify(true)
-            .with_main_align(Align::Min)
-            .with_cross_align(Align::Min);
+        ui.set_max_width(120.0);
 
         ui.with_layout(egui::Layout::default().with_cross_align(Align::Min), |ui| {
-            if ui.button("Empty tab").clicked() {
+            ui.set_width(120.0);
+
+            if file_button(ui, "Empty tab").clicked() {
                 self.added_nodes.push((surface, node, "".to_string()));
             }
 
             for path in self.files_list {
                 if let Some(file) = get_last_element_from_path(path) {
-                    if ui.button(file).clicked() {
+                    if file_button(ui, file).clicked() {
                         self.added_nodes.push((surface, node, path.to_string()));
                     }
                 }
@@ -213,6 +256,9 @@ impl egui_dock::TabViewer for TabViewer<'_> {
                 );
             }
         }
+
+        let mut t = new_table::TableDemo::default();
+        t.ui(ui);
     }
 
     fn on_close(&mut self, tab: &mut Self::Tab) -> OnCloseResponse {
