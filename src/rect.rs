@@ -1,3 +1,4 @@
+use egui::epaint::FontsView;
 use egui::text::LayoutJob;
 use egui::{Align2, Color32, FontId, Response, Sense, Ui, Vec2, Widget};
 
@@ -63,7 +64,7 @@ impl Widget for HoverableRectangle {
         // layout_job.wrap.break_on_space = true; // Ensure wrapping breaks on spaces
         layout_job.halign = egui::Align::Center; // Center the text horizontally within its wrapped width
 
-        let galley = ui.fonts(|fonts| fonts.layout_job(layout_job));
+        let galley = ui.fonts_mut(|fonts| fonts.layout_job(layout_job));
 
         // 3. Calculate the desired size of the rectangle based on the text galley's size
         // Add padding around the text

@@ -33,13 +33,6 @@ fn get_last_element_from_path(s: &str) -> Option<&str> {
     s.split('/').last()
 }
 
-fn gfg<G>(f: G)
-where
-    G: FnOnce(),
-{
-    f();
-}
-
 fn file_button(ui: &mut egui::Ui, file: &str) -> Response {
     let mut l: Option<Response> = None;
     egui::Frame::new()
@@ -223,7 +216,7 @@ impl egui_dock::TabViewer for TabViewer<'_> {
 
             // table = handle_key_nav(tab, self.ctx, table);
 
-            let table_ui = display_table_headers(columns, table);
+            // let table_ui = display_table_headers(columns, table);
 
             if let Some(promised_data) = self.promised_data.get(chosen_file) {
                 let default_sheet =
@@ -241,24 +234,70 @@ impl egui_dock::TabViewer for TabViewer<'_> {
                     &"".to_string()
                 };
 
-                display_table(
-                    self.ctx,
-                    chosen_file,
-                    tab_id,
-                    table_ui,
-                    filter,
-                    &columns,
-                    promised_data,
-                    filtered_data,
-                    &self.sender,
-                    // self.sort_order.unwrap_or(SortOrder::Dsc),
-                    // self.sort_by_column,
-                );
+                // display_table(
+                //     self.ctx,
+                //     chosen_file,
+                //     tab_id,
+                //     table_ui,
+                //     filter,
+                //     &columns,
+                //     promised_data,
+                //     filtered_data,
+                //     &self.sender,
+                //     // self.sort_order.unwrap_or(SortOrder::Dsc),
+                //     // self.sort_by_column,
+                // );
+
+                match promised_data.ready() {
+                    Some(data) => {
+                        // let id_salt = Id::new("table_demo");
+                        // let state_id = egui_table::Table::new().id_salt(id_salt).get_id(ui); // Note: must be here (in the correct outer `ui` scope) to be correct.
+                        let len = data.len();
+                        let num_columns = data[0].len();
+
+                        // let table = egui_table::Table::new()
+                        //     .id_salt(id_salt)
+                        //     .num_rows(1000)
+                        //     .columns(vec![
+                        //         egui_table::Column::new(100.0)
+                        //             .range(10.0..=500.0)
+                        //             .resizable(true);
+                        //         20
+                        //     ])
+                        //     .num_sticky_cols(1)
+                        //     .headers([
+                        //         egui_table::HeaderRow {
+                        //             height: 24.0,
+                        //             groups: vec![0..20],
+                        //         },
+                        //         egui_table::HeaderRow::new(24.0),
+                        //     ])
+                        //     .auto_size_mode(egui_table::AutoSizeMode::default());
+
+                        // table.show(ui, self);
+
+                        let mut t = new_table::TableDemo {
+                            data: Some(data),
+                            num_columns,
+                            columns: Some(columns.as_ref()),
+                            num_rows: len as u64,
+                            num_sticky_cols: 1,
+                            default_column: egui_table::Column::new(100.0)
+                                .range(10.0..=500.0)
+                                .resizable(true),
+                            auto_size_mode: egui_table::AutoSizeMode::default(),
+                            top_row_height: 24.0,
+                            row_height: 18.0,
+                            is_row_expanded: Default::default(),
+                            prefetched: vec![],
+                        };
+
+                        t.ui(ui);
+                    }
+                    None => {}
+                }
             }
         }
-
-        let mut t = new_table::TableDemo::default();
-        t.ui(ui);
     }
 
     fn on_close(&mut self, tab: &mut Self::Tab) -> OnCloseResponse {

@@ -1,21 +1,26 @@
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, sync::Arc};
 
+use csv::StringRecord;
 use egui::{Align2, Context, Id, Margin, NumExt as _, Sense, Vec2};
 
-#[derive(serde::Deserialize, serde::Serialize)]
-pub struct TableDemo {
-    num_columns: usize,
-    num_rows: u64,
-    num_sticky_cols: usize,
-    default_column: egui_table::Column,
-    auto_size_mode: egui_table::AutoSizeMode,
-    top_row_height: f32,
-    row_height: f32,
-    is_row_expanded: BTreeMap<u64, bool>,
-    prefetched: Vec<egui_table::PrefetchInfo>,
+use crate::types::FileHeader;
+
+// #[derive(serde::Deserialize, serde::Serialize)]
+pub struct TableDemo<'a> {
+    pub data: Option<&'a Arc<Vec<Arc<StringRecord>>>>,
+    pub num_columns: usize,
+    pub columns: Option<&'a Vec<FileHeader>>,
+    pub num_rows: u64,
+    pub num_sticky_cols: usize,
+    pub default_column: egui_table::Column,
+    pub auto_size_mode: egui_table::AutoSizeMode,
+    pub top_row_height: f32,
+    pub row_height: f32,
+    pub is_row_expanded: BTreeMap<u64, bool>,
+    pub prefetched: Vec<egui_table::PrefetchInfo>,
 }
 
-impl Default for TableDemo {
+impl<'a> Default for TableDemo<'a> {
     fn default() -> Self {
         Self {
             num_columns: 20,
@@ -29,67 +34,59 @@ impl Default for TableDemo {
             row_height: 18.0,
             is_row_expanded: Default::default(),
             prefetched: vec![],
+            data: None,
+            columns: None,
         }
     }
 }
 
-impl TableDemo {
-    fn was_row_prefetched(&self, row_nr: u64) -> bool {
-        self.prefetched
-            .iter()
-            .any(|info| info.visible_rows.contains(&row_nr))
-    }
+impl<'a> TableDemo<'a> {
+    // fn was_row_prefetched(&self, row_nr: u64) -> bool {
+    //     self.prefetched
+    //         .iter()
+    //         .any(|info| info.visible_rows.contains(&row_nr))
+    // }
 
     fn cell_content_ui(&mut self, row_nr: u64, col_nr: usize, ui: &mut egui::Ui) {
-        assert!(
-            self.was_row_prefetched(row_nr),
-            "Was asked to show row {row_nr} which was not prefetched! This is a bug in egui_table."
-        );
+        // assert!(
+        //     self.was_row_prefetched(row_nr),
+        //     "Was asked to show row {row_nr} which was not prefetched! This is a bug in egui_table."
+        // );
 
-        let is_expanded = self
-            .is_row_expanded
-            .get(&row_nr)
-            .copied()
-            .unwrap_or_default();
-        let expandedness = ui.ctx().animate_bool(Id::new(row_nr), is_expanded);
-
-        ui.vertical(|ui| {
-            if col_nr == 0 {
-                ui.horizontal(|ui| {
-                    // Button to expand/collapse row:
-                    let (_, response) = ui.allocate_exact_size(Vec2::splat(10.0), Sense::click());
-                    egui::collapsing_header::paint_default_icon(ui, expandedness, &response);
-                    if response.clicked() {
-                        // Toggle.
-                        // Note: we use a map instead of a set so that we can animate opening and closing of each column.
-                        self.is_row_expanded.insert(row_nr, !is_expanded);
-                    }
-
-                    ui.label(row_nr.to_string());
-                });
-            } else {
-                ui.horizontal(|ui| {
-                    ui.label(format!("({row_nr}, {col_nr})"));
-
-                    if (row_nr + col_nr as u64) % 27 == 0 {
-                        if !ui.is_sizing_pass() {
-                            // During a sizing pass we don't truncate!
-                            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-                        }
-                        ui.label("Extra long cell!");
-                    }
-                });
-
-                if 0.0 < expandedness {
-                    ui.label("Expanded content");
-                    ui.label("Blah blah blah…");
+        // let is_expanded = self
+        //     .is_row_expanded
+        //     .get(&row_nr)
+        //     .copied()
+        //     .unwrap_or_default();
+        // let expandedness = ui.ctx().animate_bool(Id::new(row_nr), is_expanded);
+        //
+        if let Some(data) = self.data {
+            let row = data.get(row_nr as usize);
+            if let Some(row) = row {
+                let cell = row.get(col_nr as usize);
+                if let Some(cell) = cell {
+                    ui.label(cell);
                 }
             }
-        });
+        }
+
+        // ui.vertical(|ui| {
+        //     ui.horizontal(|ui| {
+        //         ui.label(format!("({row_nr}, {col_nr})"));
+
+        //         if (row_nr + col_nr as u64) % 27 == 0 {
+        //             if !ui.is_sizing_pass() {
+        //                 // During a sizing pass we don't truncate!
+        //                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
+        //             }
+        //             ui.label("Extra long cell!");
+        //         }
+        //     });
+        // });
     }
 }
 
-impl egui_table::TableDelegate for TableDemo {
+impl<'a> egui_table::TableDelegate for TableDemo<'a> {
     fn prepare(&mut self, info: &egui_table::PrefetchInfo) {
         assert!(
             info.visible_rows.end <= self.num_rows,
@@ -145,19 +142,36 @@ impl egui_table::TableDelegate for TableDemo {
                         }
                     }
                 } else {
-                    if col_range.start == 0 {
-                        egui::Sides::new().height(ui.available_height()).show(
-                            ui,
-                            |ui| {
-                                ui.heading("Row");
-                            },
-                            |ui| {
-                                ui.label("⬇");
-                            },
-                        );
-                    } else {
-                        ui.heading(format!("Column {group_index}"));
+                    if let Some(columns) = self.columns {
+                        let header = columns.get(group_index.clone());
+                        if let Some(header) = header {
+                            let name = &header.name;
+
+                            if col_range.start == 0 && name.is_empty() {
+                                ui.heading("ID");
+                            } else {
+                                ui.heading(&header.name);
+                            }
+                        }
                     }
+                    // if col_range.start == 0 {
+                    //     egui::Sides::new().height(ui.available_height()).show(
+                    //         ui,
+                    //         |ui| {
+                    //             ui.heading("Row");
+                    //         },
+                    //         |ui| {
+                    //             ui.label("⬇");
+                    //         },
+                    //     );
+                    // } else {
+                    //     if let Some(columns) = self.columns {
+                    //         let header = columns.get(group_index.clone());
+                    //         if let Some(header) = header {
+                    //             ui.heading(&header.name);
+                    //         }
+                    //     }
+                    // }
                 }
             });
     }
@@ -191,7 +205,7 @@ impl egui_table::TableDelegate for TableDemo {
     }
 }
 
-impl TableDemo {
+impl<'a> TableDemo<'a> {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let id_salt = Id::new("table_demo");
         let state_id = egui_table::Table::new().id_salt(id_salt).get_id(ui); // Note: must be here (in the correct outer `ui` scope) to be correct.
