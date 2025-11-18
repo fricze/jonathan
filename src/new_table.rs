@@ -152,6 +152,20 @@ impl<'a> egui_table::TableDelegate for TableDemo<'a> {
                             } else {
                                 ui.heading(&header.name);
                             }
+
+                            let asc = true;
+
+                            if ui.button(if asc { "⬆" } else { "⬇" }).clicked() {
+                                // file_header.sort_dir = Some(!asc);
+
+                                // if asc {
+                                //     app.sort_order = Some(SortOrder::Asc);
+                                //     app.sort_by_column = Some(idx);
+                                // } else {
+                                //     app.sort_order = Some(SortOrder::Dsc);
+                                //     app.sort_by_column = Some(idx);
+                                // }
+                            }
                         }
                     }
                     // if col_range.start == 0 {
@@ -218,7 +232,11 @@ impl<'a> TableDemo<'a> {
             .headers([
                 egui_table::HeaderRow {
                     height: self.top_row_height,
-                    groups: vec![0..self.num_columns],
+                    groups: if self.num_columns > 0 {
+                        vec![0..self.num_columns]
+                    } else {
+                        vec![]
+                    },
                 },
                 egui_table::HeaderRow::new(self.top_row_height),
             ])

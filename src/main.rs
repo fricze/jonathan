@@ -1,5 +1,6 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
+use csv::StringRecord;
 use egui::text::LayoutJob;
 use egui::{Align, Align2, Id, LayerId, Order, Response, RichText, Stroke, TextStyle, Ui};
 use egui::{Button, Key, Rect};
@@ -248,54 +249,47 @@ impl egui_dock::TabViewer for TabViewer<'_> {
                 //     // self.sort_by_column,
                 // );
 
-                match promised_data.ready() {
-                    Some(data) => {
-                        // let id_salt = Id::new("table_demo");
-                        // let state_id = egui_table::Table::new().id_salt(id_salt).get_id(ui); // Note: must be here (in the correct outer `ui` scope) to be correct.
-                        let len = data.len();
-                        let num_columns = data[0].len();
+                let filtered_data = filtered_data.ready();
+                let master_data = promised_data.ready();
 
-                        // let table = egui_table::Table::new()
-                        //     .id_salt(id_salt)
-                        //     .num_rows(1000)
-                        //     .columns(vec![
-                        //         egui_table::Column::new(100.0)
-                        //             .range(10.0..=500.0)
-                        //             .resizable(true);
-                        //         20
-                        //     ])
-                        //     .num_sticky_cols(1)
-                        //     .headers([
-                        //         egui_table::HeaderRow {
-                        //             height: 24.0,
-                        //             groups: vec![0..20],
-                        //         },
-                        //         egui_table::HeaderRow::new(24.0),
-                        //     ])
-                        //     .auto_size_mode(egui_table::AutoSizeMode::default());
+                let def_vec: Vec<Arc<StringRecord>> = vec![];
+                let default_data: Arc<Vec<Arc<StringRecord>>> = Arc::new(def_vec);
 
-                        // table.show(ui, self);
+                let sheet_data = match filtered_data {
+                    Some(data) if !filter.is_empty() => data,
+                    _ => master_data.unwrap_or(&default_data),
+                };
 
-                        let mut t = new_table::TableDemo {
-                            data: Some(data),
-                            num_columns,
-                            columns: Some(columns.as_ref()),
-                            num_rows: len as u64,
-                            num_sticky_cols: 1,
-                            default_column: egui_table::Column::new(100.0)
-                                .range(10.0..=500.0)
-                                .resizable(true),
-                            auto_size_mode: egui_table::AutoSizeMode::default(),
-                            top_row_height: 24.0,
-                            row_height: 18.0,
-                            is_row_expanded: Default::default(),
-                            prefetched: vec![],
-                        };
+                // let id_salt = Id::new("table_demo");
+                // let state_id = egui_table::Table::new().id_salt(id_salt).get_id(ui); // Note: must be here (in the correct outer `ui` scope) to be correct.
+                let len = sheet_data.len();
 
-                        t.ui(ui);
-                    }
-                    None => {}
-                }
+                let first_row = sheet_data.get(0);
+                let num_columns = if let Some(first_row) = first_row {
+                    first_row.len()
+                } else {
+                    0
+                };
+
+                // table.show(ui, self);
+
+                let mut t = new_table::TableDemo {
+                    data: Some(sheet_data),
+                    num_columns,
+                    columns: Some(columns.as_ref()),
+                    num_rows: len as u64,
+                    num_sticky_cols: if columns.len() > 0 { 1 } else { 0 },
+                    default_column: egui_table::Column::new(100.0)
+                        .range(10.0..=500.0)
+                        .resizable(true),
+                    auto_size_mode: egui_table::AutoSizeMode::default(),
+                    top_row_height: 24.0,
+                    row_height: 18.0,
+                    is_row_expanded: Default::default(),
+                    prefetched: vec![],
+                };
+
+                t.ui(ui);
             }
         }
     }
@@ -405,7 +399,7 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
         let painter =
             ctx.layer_painter(LayerId::new(Order::Foreground, Id::new("file_drop_target")));
 
-        let screen_rect = ctx.screen_rect();
+        let screen_rect = ctx.content_rect();
         painter.rect_filled(screen_rect, 0.0, Color32::from_black_alpha(192));
         painter.text(
             screen_rect.center(),
