@@ -3,13 +3,13 @@ use std::{collections::BTreeMap, sync::Arc};
 use csv::StringRecord;
 use egui::{Align2, Context, Id, Margin, NumExt as _, Sense, Vec2};
 
-use crate::types::FileHeader;
+use crate::types::{FileHeader, SortOrder};
 
 // #[derive(serde::Deserialize, serde::Serialize)]
 pub struct TableDemo<'a> {
     pub data: Option<&'a Arc<Vec<Arc<StringRecord>>>>,
     pub num_columns: usize,
-    pub columns: Option<&'a Vec<FileHeader>>,
+    pub columns: &'a mut Vec<FileHeader>,
     pub num_rows: u64,
     pub num_sticky_cols: usize,
     pub default_column: egui_table::Column,
@@ -20,25 +20,25 @@ pub struct TableDemo<'a> {
     pub prefetched: Vec<egui_table::PrefetchInfo>,
 }
 
-impl<'a> Default for TableDemo<'a> {
-    fn default() -> Self {
-        Self {
-            num_columns: 20,
-            num_rows: 10_000,
-            num_sticky_cols: 1,
-            default_column: egui_table::Column::new(100.0)
-                .range(10.0..=500.0)
-                .resizable(true),
-            auto_size_mode: egui_table::AutoSizeMode::default(),
-            top_row_height: 24.0,
-            row_height: 18.0,
-            is_row_expanded: Default::default(),
-            prefetched: vec![],
-            data: None,
-            columns: None,
-        }
-    }
-}
+// impl<'a> Default for TableDemo<'a> {
+//     fn default() -> Self {
+//         Self {
+//             num_columns: 20,
+//             num_rows: 10_000,
+//             num_sticky_cols: 1,
+//             default_column: egui_table::Column::new(100.0)
+//                 .range(10.0..=500.0)
+//                 .resizable(true),
+//             auto_size_mode: egui_table::AutoSizeMode::default(),
+//             top_row_height: 24.0,
+//             row_height: 18.0,
+//             is_row_expanded: Default::default(),
+//             prefetched: vec![],
+//             data: None,
+//             columns: &mut vec![],
+//         }
+//     }
+// }
 
 impl<'a> TableDemo<'a> {
     // fn was_row_prefetched(&self, row_nr: u64) -> bool {
@@ -142,50 +142,43 @@ impl<'a> egui_table::TableDelegate for TableDemo<'a> {
                         }
                     }
                 } else {
-                    if let Some(columns) = self.columns {
-                        let header = columns.get(group_index.clone());
-                        if let Some(header) = header {
-                            let name = &header.name;
+                    let header = self.columns.get(group_index.clone());
+                    if let Some(header) = header {
+                        let name = &header.name;
 
-                            if col_range.start == 0 && name.is_empty() {
-                                ui.heading("ID");
-                            } else {
-                                ui.heading(&header.name);
-                            }
+                        if col_range.start == 0 && name.is_empty() {
+                            ui.heading("ID");
+                        } else {
+                            ui.heading(&header.name);
+                        }
 
-                            let asc = true;
+                        let button_symbol = if let Some(sort) = header.sort {
+                            if sort == SortOrder::Asc { "⬆" } else { "⬇" }
+                        } else {
+                            "→"
+                        };
 
-                            if ui.button(if asc { "⬆" } else { "⬇" }).clicked() {
-                                // file_header.sort_dir = Some(!asc);
-
-                                // if asc {
-                                //     app.sort_order = Some(SortOrder::Asc);
-                                //     app.sort_by_column = Some(idx);
-                                // } else {
-                                //     app.sort_order = Some(SortOrder::Dsc);
-                                //     app.sort_by_column = Some(idx);
-                                // }
-                            }
+                        if ui.button(button_symbol).clicked() {
+                            self.columns
+                                .iter_mut()
+                                .enumerate()
+                                .for_each(|(idx, header)| {
+                                    if idx == group_index.clone() {
+                                        if let Some(sort) = header.sort {
+                                            if sort == SortOrder::Asc {
+                                                header.sort = Some(SortOrder::Dsc)
+                                            } else {
+                                                header.sort = Some(SortOrder::Asc)
+                                            }
+                                        } else {
+                                            header.sort = Some(SortOrder::Asc)
+                                        }
+                                    } else {
+                                        header.sort = None
+                                    }
+                                });
                         }
                     }
-                    // if col_range.start == 0 {
-                    //     egui::Sides::new().height(ui.available_height()).show(
-                    //         ui,
-                    //         |ui| {
-                    //             ui.heading("Row");
-                    //         },
-                    //         |ui| {
-                    //             ui.label("⬇");
-                    //         },
-                    //     );
-                    // } else {
-                    //     if let Some(columns) = self.columns {
-                    //         let header = columns.get(group_index.clone());
-                    //         if let Some(header) = header {
-                    //             ui.heading(&header.name);
-                    //         }
-                    //     }
-                    // }
                 }
             });
     }

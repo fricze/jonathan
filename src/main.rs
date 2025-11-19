@@ -183,17 +183,13 @@ impl egui_dock::TabViewer for TabViewer<'_> {
             }
         }
 
-        // self.filtered_data.get(&(chosen_file.to_string(), tab_id)),
-        // || filtered_sheet.ready().is_none()
-        // , Some(filtered_sheet)
-
         if let Some(sheet) = self.promised_data.get(chosen_file) {
             if sheet.ready().is_none() {
                 let painter = self
                     .ctx
                     .layer_painter(LayerId::new(Order::Foreground, Id::new("file_drop_target")));
 
-                let screen_rect = self.ctx.screen_rect();
+                let screen_rect = self.ctx.content_rect();
                 painter.rect_filled(screen_rect, 0.0, Color32::from_black_alpha(192));
                 painter.text(
                     screen_rect.center(),
@@ -208,16 +204,6 @@ impl egui_dock::TabViewer for TabViewer<'_> {
         if let Some(columns) = tab.columns.get_mut(chosen_file) {
             display_headers(ui, columns.as_mut());
             ui.add_space(4.0);
-
-            let table = TableBuilder::new(ui)
-                .striped(true)
-                .resizable(true)
-                .cell_layout(egui::Layout::left_to_right(egui::Align::Center))
-                .min_scrolled_height(0.0);
-
-            // table = handle_key_nav(tab, self.ctx, table);
-
-            // let table_ui = display_table_headers(columns, table);
 
             if let Some(promised_data) = self.promised_data.get(chosen_file) {
                 let default_sheet =
@@ -234,20 +220,6 @@ impl egui_dock::TabViewer for TabViewer<'_> {
                 } else {
                     &"".to_string()
                 };
-
-                // display_table(
-                //     self.ctx,
-                //     chosen_file,
-                //     tab_id,
-                //     table_ui,
-                //     filter,
-                //     &columns,
-                //     promised_data,
-                //     filtered_data,
-                //     &self.sender,
-                //     // self.sort_order.unwrap_or(SortOrder::Dsc),
-                //     // self.sort_by_column,
-                // );
 
                 let filtered_data = filtered_data.ready();
                 let master_data = promised_data.ready();
@@ -271,14 +243,14 @@ impl egui_dock::TabViewer for TabViewer<'_> {
                     0
                 };
 
-                // table.show(ui, self);
+                let col_len = columns.len();
 
                 let mut t = new_table::TableDemo {
                     data: Some(sheet_data),
                     num_columns,
-                    columns: Some(columns.as_ref()),
+                    columns: columns.as_mut(),
                     num_rows: len as u64,
-                    num_sticky_cols: if columns.len() > 0 { 1 } else { 0 },
+                    num_sticky_cols: if col_len > 0 { 1 } else { 0 },
                     default_column: egui_table::Column::new(100.0)
                         .range(10.0..=500.0)
                         .resizable(true),
@@ -486,60 +458,6 @@ fn open_file_dialog(sender: &Sender<UiMessage>, tab: &usize) {
             }
         }
     }
-}
-
-fn display_table_headers<'a>(columns: &mut Vec<FileHeader>, table: TableBuilder<'a>) -> Table<'a> {
-    let mut table = table;
-
-    let headers = columns;
-
-    for _ in headers.iter().filter(|c| c.visible) {
-        table = table.column(Column::auto());
-    }
-
-    table.header(20.0, |mut header| {
-        headers
-            .iter_mut()
-            .filter(|c| c.visible)
-            .enumerate()
-            .for_each(|(idx, file_header)| {
-                header.col(|ui| {
-                    egui::containers::Sides::new().show(
-                        ui,
-                        |ui| {
-                            let name = &file_header.name;
-
-                            if let Some(dtype) = file_header.dtype.clone() {
-                                ui.heading(format!("{} ({})", name, dtype))
-                                    .on_hover_ui(|ui| {
-                                        ScrollArea::vertical().show(ui, |ui| {
-                                            ui.style_mut().interaction.selectable_labels = true;
-                                            ui.label(file_header.unique_vals.join("; "));
-                                        });
-                                    });
-                            } else {
-                                ui.heading(name);
-                            }
-                        },
-                        |ui| {
-                            let asc = file_header.sort_dir.unwrap_or(false);
-
-                            if ui.button(if asc { "⬆" } else { "⬇" }).clicked() {
-                                file_header.sort_dir = Some(!asc);
-
-                                // if asc {
-                                //     app.sort_order = Some(SortOrder::Asc);
-                                //     app.sort_by_column = Some(idx);
-                                // } else {
-                                //     app.sort_order = Some(SortOrder::Dsc);
-                                //     app.sort_by_column = Some(idx);
-                                // }
-                            }
-                        },
-                    );
-                });
-            });
-    })
 }
 
 fn filter_data(
