@@ -7,7 +7,7 @@ use crate::types::{FileHeader, SortOrder};
 
 // #[derive(serde::Deserialize, serde::Serialize)]
 pub struct TableDemo<'a> {
-    pub data: Option<&'a Arc<Vec<Arc<StringRecord>>>>,
+    pub data: Vec<Arc<StringRecord>>,
     pub num_columns: usize,
     pub columns: &'a mut Vec<FileHeader>,
     pub num_rows: u64,
@@ -60,13 +60,12 @@ impl<'a> TableDemo<'a> {
         //     .unwrap_or_default();
         // let expandedness = ui.ctx().animate_bool(Id::new(row_nr), is_expanded);
         //
-        if let Some(data) = self.data {
-            let row = data.get(row_nr as usize);
-            if let Some(row) = row {
-                let cell = row.get(col_nr as usize);
-                if let Some(cell) = cell {
-                    ui.label(cell);
-                }
+
+        let row = self.data.get(row_nr as usize);
+        if let Some(row) = row {
+            let cell = row.get(col_nr as usize);
+            if let Some(cell) = cell {
+                ui.label(cell);
             }
         }
 

@@ -7,6 +7,7 @@ use egui::{Button, Key, Rect};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, NodeIndex, Style, SurfaceIndex};
 use poll_promise::Promise;
+use rand::seq::IndexedRandom;
 use std::sync::Arc;
 
 use egui::{Color32, ScrollArea};
@@ -25,6 +26,7 @@ mod types;
 mod ui;
 
 use crate::table::display_table;
+use crate::types::SortOrder;
 use crate::ui::handle_key_nav;
 use eframe::egui;
 use read_csv::open_csv_file;
@@ -245,13 +247,36 @@ impl egui_dock::TabViewer for TabViewer<'_> {
 
                 let col_len = columns.len();
 
+                let sort_by = columns
+                    .iter()
+                    .enumerate()
+                    .find(|(_idx, el)| el.sort.is_some())
+                    .map(|(idx, el)| (idx, el.sort.unwrap()));
+
+                let sorted_data = sort_by.map_or(sheet_data.as_ref().clone(), |sort_by| {
+                    let mut copy = sheet_data.as_ref().clone();
+
+                    copy.sort_by(|a, b| {
+                        let val_a = a.get(sort_by.0).unwrap();
+                        let val_b = b.get(sort_by.0).unwrap();
+
+                        if sort_by.1 == SortOrder::Dsc {
+                            val_a.cmp(val_b)
+                        } else {
+                            val_b.cmp(val_a)
+                        }
+                    });
+
+                    copy
+                });
+
                 let mut t = new_table::TableDemo {
-                    data: Some(sheet_data),
+                    data: sorted_data,
                     num_columns,
                     columns: columns.as_mut(),
                     num_rows: len as u64,
                     num_sticky_cols: if col_len > 0 { 1 } else { 0 },
-                    default_column: egui_table::Column::new(100.0)
+                    default_column: egui_table::Column::new(50.0)
                         .range(10.0..=500.0)
                         .resizable(true),
                     auto_size_mode: egui_table::AutoSizeMode::default(),
