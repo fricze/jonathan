@@ -1,13 +1,11 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
 use csv::StringRecord;
-use egui::text::LayoutJob;
 use egui::{Align, Align2, Id, LayerId, Order, Response, RichText, Stroke, TextStyle, Ui};
 use egui::{Button, Key, Rect};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, NodeIndex, Style, SurfaceIndex};
 use poll_promise::Promise;
-use rand::seq::IndexedRandom;
 use std::sync::Arc;
 
 use egui::{Color32, ScrollArea};
@@ -16,8 +14,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Sender};
 
-use egui_extras::{Column, Table, TableBuilder};
-
 mod new_table;
 mod read_csv;
 mod rect;
@@ -25,9 +21,7 @@ mod table;
 mod types;
 mod ui;
 
-use crate::table::display_table;
 use crate::types::SortOrder;
-use crate::ui::handle_key_nav;
 use eframe::egui;
 use read_csv::open_csv_file;
 use types::{ArcSheet, FileHeader, Filename, MyApp, SheetTab, TabId, TabViewer, UiMessage};
@@ -247,31 +241,8 @@ impl egui_dock::TabViewer for TabViewer<'_> {
 
                 let col_len = columns.len();
 
-                let sort_by = columns
-                    .iter()
-                    .enumerate()
-                    .find(|(_idx, el)| el.sort.is_some())
-                    .map(|(idx, el)| (idx, el.sort.unwrap()));
-
-                let sorted_data = sort_by.map_or(sheet_data.as_ref().clone(), |sort_by| {
-                    let mut copy = sheet_data.as_ref().clone();
-
-                    copy.sort_by(|a, b| {
-                        let val_a = a.get(sort_by.0).unwrap();
-                        let val_b = b.get(sort_by.0).unwrap();
-
-                        if sort_by.1 == SortOrder::Dsc {
-                            val_a.cmp(val_b)
-                        } else {
-                            val_b.cmp(val_a)
-                        }
-                    });
-
-                    copy
-                });
-
                 let mut t = new_table::TableDemo {
-                    data: sorted_data,
+                    data: sheet_data,
                     num_columns,
                     columns: columns.as_mut(),
                     num_rows: len as u64,
@@ -284,6 +255,9 @@ impl egui_dock::TabViewer for TabViewer<'_> {
                     row_height: 18.0,
                     is_row_expanded: Default::default(),
                     prefetched: vec![],
+                    sender: self.sender,
+                    tab_id: tab_id,
+                    filename: chosen_file.clone(),
                 };
 
                 t.ui(ui);
@@ -485,6 +459,37 @@ fn open_file_dialog(sender: &Sender<UiMessage>, tab: &usize) {
     }
 }
 
+fn sort_data(
+    filtered_data: &mut HashMap<(Filename, TabId), Promise<Arc<ArcSheet>>>,
+    sheets_data: &HashMap<String, Promise<Arc<ArcSheet>>>,
+    sort_by: (usize, SortOrder),
+    filename: String,
+    tab_id: usize,
+) {
+    if let Some(file) = sheets_data.get(&filename) {
+        if let Some(master_data) = file.ready() {
+            let mut master_clone = master_data.as_ref().clone();
+
+            filtered_data.insert(
+                (filename, tab_id),
+                poll_promise::Promise::spawn_thread(format!("sort_sheet {tab_id}"), move || {
+                    master_clone.sort_by(|a, b| {
+                        let val_a = a.get(sort_by.0).unwrap();
+                        let val_b = b.get(sort_by.0).unwrap();
+
+                        if sort_by.1 == SortOrder::Dsc {
+                            val_a.cmp(val_b)
+                        } else {
+                            val_b.cmp(val_a)
+                        }
+                    });
+                    Arc::new(master_clone)
+                }),
+            );
+        }
+    }
+}
+
 fn filter_data(
     filtered_data: &mut HashMap<(Filename, TabId), Promise<Arc<ArcSheet>>>,
     sheets_data: &HashMap<String, Promise<Arc<ArcSheet>>>,
@@ -556,6 +561,21 @@ impl eframe::App for MyApp {
                                 &mut self.filtered_data,
                                 &self.sheets_data,
                                 filter.clone(),
+                                filename.clone(),
+                                tab_id,
+                            );
+                        }
+                    }
+                }
+                UiMessage::SortSheet(filename, sort_order, tab_id) => {
+                    for tab in self.tree.iter_all_tabs_mut() {
+                        let sheet_tab = tab.1;
+
+                        if sheet_tab.id == tab_id {
+                            sort_data(
+                                &mut self.filtered_data,
+                                &self.sheets_data,
+                                sort_order,
                                 filename.clone(),
                                 tab_id,
                             );

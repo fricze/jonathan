@@ -1,13 +1,16 @@
-use std::{collections::BTreeMap, sync::Arc};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, mpsc::Sender},
+};
 
 use csv::StringRecord;
 use egui::{Align2, Context, Id, Margin, NumExt as _, Sense, Vec2};
 
-use crate::types::{FileHeader, SortOrder};
+use crate::types::{FileHeader, Filename, SortOrder, TabId, UiMessage};
 
 // #[derive(serde::Deserialize, serde::Serialize)]
 pub struct TableDemo<'a> {
-    pub data: Vec<Arc<StringRecord>>,
+    pub data: &'a Vec<Arc<StringRecord>>,
     pub num_columns: usize,
     pub columns: &'a mut Vec<FileHeader>,
     pub num_rows: u64,
@@ -18,6 +21,9 @@ pub struct TableDemo<'a> {
     pub row_height: f32,
     pub is_row_expanded: BTreeMap<u64, bool>,
     pub prefetched: Vec<egui_table::PrefetchInfo>,
+    pub sender: &'a Sender<UiMessage>,
+    pub filename: Filename,
+    pub tab_id: TabId,
 }
 
 // impl<'a> Default for TableDemo<'a> {
@@ -163,15 +169,27 @@ impl<'a> egui_table::TableDelegate for TableDemo<'a> {
                                 .enumerate()
                                 .for_each(|(idx, header)| {
                                     if idx == group_index.clone() {
-                                        if let Some(sort) = header.sort {
+                                        let new_sort = if let Some(sort) = header.sort {
                                             if sort == SortOrder::Asc {
-                                                header.sort = Some(SortOrder::Dsc)
+                                                SortOrder::Dsc
                                             } else {
-                                                header.sort = Some(SortOrder::Asc)
+                                                SortOrder::Asc
                                             }
                                         } else {
-                                            header.sort = Some(SortOrder::Asc)
-                                        }
+                                            SortOrder::Asc
+                                        };
+
+                                        header.sort = Some(new_sort);
+
+                                        if let Err(e) = self.sender.send(UiMessage::SortSheet(
+                                            self.filename.clone(),
+                                            (group_index.clone(), new_sort.clone()),
+                                            self.tab_id,
+                                        )) {
+                                            println!("{:?}", e)
+                                        };
+
+                                        ()
                                     } else {
                                         header.sort = None
                                     }

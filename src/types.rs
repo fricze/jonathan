@@ -18,6 +18,7 @@ pub struct FileHeader {
 }
 
 pub type TabId = usize;
+pub type ColumnId = usize;
 pub type Filter = String;
 pub type Filename = String;
 
@@ -29,6 +30,7 @@ pub enum Tabs {
 pub enum UiMessage {
     OpenFile(String, Option<TabId>),
     FilterSheet(Filename, Filter, TabId, Option<usize>),
+    SortSheet(Filename, (ColumnId, SortOrder), TabId),
     FilterGlobal(Filter),
 }
 
