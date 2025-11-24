@@ -7,6 +7,7 @@ use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, NodeIndex, Style, SurfaceIndex};
 use poll_promise::Promise;
 use std::sync::Arc;
+use std::time::Instant;
 
 use egui::{Color32, ScrollArea};
 
@@ -202,12 +203,7 @@ impl egui_dock::TabViewer for TabViewer<'_> {
             ui.add_space(4.0);
 
             if let Some(promised_data) = self.promised_data.get(chosen_file) {
-                let default_sheet =
-                    poll_promise::Promise::spawn_thread("empty_data", move || Arc::new(vec![]));
-                let filtered_data = &self
-                    .filtered_data
-                    .get(&(chosen_file.to_string(), tab_id))
-                    .unwrap_or(&default_sheet);
+                let filtered_data = self.filtered_data.get(&(chosen_file.to_string(), tab_id));
 
                 let filter = if !self.global_filter.is_empty() {
                     self.global_filter
@@ -217,7 +213,7 @@ impl egui_dock::TabViewer for TabViewer<'_> {
                     &"".to_string()
                 };
 
-                let filtered_data = filtered_data.ready();
+                let filtered_data = filtered_data.map(|p| p.ready()).flatten();
                 let master_data = promised_data.ready();
 
                 let def_vec: Vec<Arc<StringRecord>> = vec![];
@@ -331,10 +327,7 @@ fn main() -> eframe::Result {
                 dropped_files: Vec::new(),
                 picked_path: None,
                 loading: false,
-                sheets_data: HashMap::from([(
-                    "filename".to_string(),
-                    poll_promise::Promise::spawn_thread("empty_data", move || Arc::new(vec![])),
-                )]),
+                sheets_data: HashMap::new(),
                 filtered_data: HashMap::new(),
                 tree: DockState::new(vec![SheetTab {
                     id: 1,
@@ -473,7 +466,7 @@ fn sort_data(
             filtered_data.insert(
                 (filename, tab_id),
                 poll_promise::Promise::spawn_thread(format!("sort_sheet {tab_id}"), move || {
-                    master_clone.sort_by(|a, b| {
+                    master_clone.sort_by(|a, b| -> std::cmp::Ordering {
                         let val_a = a.get(sort_by.0).unwrap();
                         let val_b = b.get(sort_by.0).unwrap();
 
@@ -483,6 +476,7 @@ fn sort_data(
                             val_b.cmp(val_a)
                         }
                     });
+
                     Arc::new(master_clone)
                 }),
             );
