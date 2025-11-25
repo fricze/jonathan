@@ -27,6 +27,8 @@ pub enum Tabs {
     Single,
 }
 
+pub type Ping = bool;
+
 pub enum UiMessage {
     OpenFile(String, Option<TabId>),
     FilterSheet(Filename, Filter, TabId, Option<usize>),
@@ -53,12 +55,14 @@ pub struct SheetTab {
     pub filter: HashMap<Filename, String>,
 }
 
+pub type Chan<Msg> = (Sender<Msg>, Receiver<Msg>);
+
 pub struct MyApp {
     pub dropped_files: Vec<egui::DroppedFile>,
     pub picked_path: Option<String>,
     pub loading: bool,
-    pub sender: Sender<UiMessage>,
-    pub receiver: Receiver<UiMessage>,
+    pub worker_chan: Chan<UiMessage>,
+    pub ui_chan: Chan<Ping>,
     pub sort_by_column: Option<usize>,
     pub sort_order: Option<SortOrder>,
     pub sheets_data: HashMap<String, Promise<Arc<ArcSheet>>>,

@@ -1,15 +1,14 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
 use csv::StringRecord;
-use egui::{Align, Align2, Id, LayerId, Order, Response, RichText, Stroke, TextStyle, Ui};
-use egui::{Button, Key, Rect};
+use egui::Key;
+use egui::{Align, Align2, Id, LayerId, Order, Response, Stroke, TextStyle};
 use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, NodeIndex, Style, SurfaceIndex};
 use poll_promise::Promise;
 use std::sync::Arc;
-use std::time::Instant;
 
-use egui::{Color32, ScrollArea};
+use egui::Color32;
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -22,7 +21,7 @@ mod table;
 mod types;
 mod ui;
 
-use crate::types::SortOrder;
+use crate::types::{Ping, SortOrder};
 use eframe::egui;
 use read_csv::open_csv_file;
 use types::{ArcSheet, FileHeader, Filename, MyApp, SheetTab, TabId, TabViewer, UiMessage};
@@ -311,7 +310,8 @@ fn main() -> eframe::Result {
 
     let title = &format!("CSV Reader.");
 
-    let ui_chan = mpsc::channel::<UiMessage>();
+    let worker_chan = mpsc::channel::<UiMessage>();
+    let ui_chan = mpsc::channel::<Ping>();
 
     eframe::run_native(
         title,
@@ -320,8 +320,8 @@ fn main() -> eframe::Result {
             replace_fonts(&cc.egui_ctx);
 
             Ok(Box::new(MyApp {
-                sender: ui_chan.0,
-                receiver: ui_chan.1,
+                worker_chan: worker_chan,
+                ui_chan: ui_chan,
                 sort_by_column: None,
                 sort_order: None,
                 dropped_files: Vec::new(),
@@ -458,13 +458,12 @@ fn sort_data(
     sort_by: (usize, SortOrder),
     filename: String,
     tab_id: usize,
+    sender: &Sender<Ping>,
 ) {
     if let Some(file) = sheets_data.get(&filename) {
         if let Some(master_data) = file.ready() {
             let mut master_clone = master_data.as_ref().clone();
-
-            filtered_data.insert(
-                (filename, tab_id),
+            let thread_val =
                 poll_promise::Promise::spawn_thread(format!("sort_sheet {tab_id}"), move || {
                     master_clone.sort_by(|a, b| -> std::cmp::Ordering {
                         let val_a = a.get(sort_by.0).unwrap();
@@ -478,8 +477,17 @@ fn sort_data(
                     });
 
                     Arc::new(master_clone)
-                }),
-            );
+                });
+
+            thread_val.block_until_ready();
+
+            filtered_data.insert((filename, tab_id), thread_val);
+
+            if let Err(e) = sender.send(true) {
+                eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+            }
+
+            ()
         }
     }
 }
@@ -526,7 +534,15 @@ fn filter_data(
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        while let Ok(message) = self.receiver.try_recv() {
+        while let Ok(ui_ping) = self.ui_chan.1.try_recv() {
+            if ui_ping {
+                eprintln!("requested ui ping");
+
+                ctx.request_repaint();
+            }
+        }
+
+        while let Ok(message) = self.worker_chan.1.try_recv() {
             match message {
                 UiMessage::FilterGlobal(filter) => {
                     for tab in self.tree.iter_all_tabs_mut() {
@@ -572,8 +588,11 @@ impl eframe::App for MyApp {
                                 sort_order,
                                 filename.clone(),
                                 tab_id,
+                                &self.ui_chan.0,
                             );
-                        }
+                        };
+
+                        ()
                     }
                 }
                 UiMessage::OpenFile(file, tab) => load_file(self, ctx, file, tab),
@@ -588,7 +607,11 @@ impl eframe::App for MyApp {
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ctx.input(|input| {
                 if input.key_pressed(Key::X) {
-                    if let Err(e) = &self.sender.send(UiMessage::FilterGlobal("".to_string())) {
+                    if let Err(e) = &self
+                        .worker_chan
+                        .0
+                        .send(UiMessage::FilterGlobal("".to_string()))
+                    {
                         eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
                     }
                 }
@@ -603,7 +626,8 @@ impl eframe::App for MyApp {
                     let filter = &self.global_filter.to_string();
                     if ui.text_edit_singleline(&mut self.global_filter).changed() {
                         if let Err(e) = &self
-                            .sender
+                            .worker_chan
+                            .0
                             .send(UiMessage::FilterGlobal(filter.to_string()))
                         {
                             eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
@@ -611,7 +635,11 @@ impl eframe::App for MyApp {
                     }
 
                     if ui.button("Clear (x)").clicked() {
-                        if let Err(e) = &self.sender.send(UiMessage::FilterGlobal("".to_string())) {
+                        if let Err(e) = &self
+                            .worker_chan
+                            .0
+                            .send(UiMessage::FilterGlobal("".to_string()))
+                        {
                             eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
                         }
                     }
@@ -635,7 +663,7 @@ impl eframe::App for MyApp {
                     promised_data: &self.sheets_data,
                     filtered_data: &self.filtered_data,
                     ctx: &ctx,
-                    sender: &self.sender,
+                    sender: &self.worker_chan.0,
                     files_list: &self.files_list,
                     tabs_no,
                     focused_tab,
@@ -773,7 +801,8 @@ impl eframe::App for MyApp {
                         .unwrap_or("");
 
                     if let Err(e) = self
-                        .sender
+                        .worker_chan
+                        .0
                         .send(UiMessage::OpenFile(path.to_string(), None))
                     {
                         eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
