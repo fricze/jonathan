@@ -34,6 +34,7 @@ pub enum UiMessage {
     FilterSheet(Filename, Filter, TabId, Option<usize>),
     SortSheet(Filename, (ColumnId, SortOrder), TabId),
     FilterGlobal(Filter),
+    SetSorted(Arc<Vec<Arc<StringRecord>>>),
 }
 
 pub type ArcSheet = Vec<Arc<StringRecord>>;

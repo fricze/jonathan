@@ -7,6 +7,7 @@ use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{DockArea, DockState, NodeIndex, Style, SurfaceIndex};
 use poll_promise::Promise;
 use std::sync::Arc;
+use std::thread;
 
 use egui::Color32;
 
@@ -453,43 +454,21 @@ fn open_file_dialog(sender: &Sender<UiMessage>, tab: &usize) {
 }
 
 fn sort_data(
-    filtered_data: &mut HashMap<(Filename, TabId), Promise<Arc<ArcSheet>>>,
-    sheets_data: &HashMap<String, Promise<Arc<ArcSheet>>>,
+    mut master_clone: Vec<Arc<StringRecord>>,
     sort_by: (usize, SortOrder),
-    filename: String,
-    tab_id: usize,
-    sender: &Sender<Ping>,
-) {
-    if let Some(file) = sheets_data.get(&filename) {
-        if let Some(master_data) = file.ready() {
-            let mut master_clone = master_data.as_ref().clone();
-            let thread_val =
-                poll_promise::Promise::spawn_thread(format!("sort_sheet {tab_id}"), move || {
-                    master_clone.sort_by(|a, b| -> std::cmp::Ordering {
-                        let val_a = a.get(sort_by.0).unwrap();
-                        let val_b = b.get(sort_by.0).unwrap();
+) -> Arc<Vec<Arc<StringRecord>>> {
+    master_clone.sort_by(|a, b| -> std::cmp::Ordering {
+        let val_a = a.get(sort_by.0).unwrap();
+        let val_b = b.get(sort_by.0).unwrap();
 
-                        if sort_by.1 == SortOrder::Dsc {
-                            val_a.cmp(val_b)
-                        } else {
-                            val_b.cmp(val_a)
-                        }
-                    });
-
-                    Arc::new(master_clone)
-                });
-
-            thread_val.block_until_ready();
-
-            filtered_data.insert((filename, tab_id), thread_val);
-
-            if let Err(e) = sender.send(true) {
-                eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-            }
-
-            ()
+        if sort_by.1 == SortOrder::Dsc {
+            val_a.cmp(val_b)
+        } else {
+            val_b.cmp(val_a)
         }
-    }
+    });
+
+    Arc::new(master_clone)
 }
 
 fn filter_data(
@@ -532,6 +511,60 @@ fn filter_data(
     }
 }
 
+fn filter_data_simple(
+    master_data: Arc<Vec<Arc<StringRecord>>>,
+    filter: String,
+) -> Arc<Vec<Arc<StringRecord>>> {
+    let master_clone = Arc::clone(&master_data);
+    let filter = filter.clone();
+
+    Arc::new(
+        master_clone
+            .iter()
+            .filter(|r| r.iter().any(|c| c.contains(&filter)))
+            .map(|r| r.clone())
+            .collect::<Vec<_>>(),
+    )
+}
+
+impl MyApp {
+    fn sort_current_sheet(
+        &mut self,
+        ctx: &egui::Context,
+        filename: String,
+        sort_order: (usize, SortOrder),
+        tab_id: usize,
+    ) {
+        let chan = self.worker_chan.0.clone();
+
+        for tab in self.tree.iter_all_tabs_mut() {
+            let sheet_tab = tab.1;
+
+            if sheet_tab.id == tab_id {
+                if let Some(file) = &self.sheets_data.get(&filename) {
+                    if let Some(master_data) = file.ready() {
+                        let master_clone = master_data.as_ref().clone();
+                        let chan = chan.clone();
+                        let ctx = ctx.clone();
+
+                        thread::spawn(move || {
+                            let sorted = sort_data(master_clone, sort_order);
+
+                            if let Err(e) = chan.send(UiMessage::SetSorted(sorted)) {
+                                eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                            }
+
+                            ctx.request_repaint();
+                        });
+                    }
+                }
+            };
+        }
+
+        ()
+    }
+}
+
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         while let Ok(ui_ping) = self.ui_chan.1.try_recv() {
@@ -544,6 +577,7 @@ impl eframe::App for MyApp {
 
         while let Ok(message) = self.worker_chan.1.try_recv() {
             match message {
+                UiMessage::SetSorted(sorted) => {}
                 UiMessage::FilterGlobal(filter) => {
                     for tab in self.tree.iter_all_tabs_mut() {
                         let sheet_tab = tab.1;
@@ -578,22 +612,7 @@ impl eframe::App for MyApp {
                     }
                 }
                 UiMessage::SortSheet(filename, sort_order, tab_id) => {
-                    for tab in self.tree.iter_all_tabs_mut() {
-                        let sheet_tab = tab.1;
-
-                        if sheet_tab.id == tab_id {
-                            sort_data(
-                                &mut self.filtered_data,
-                                &self.sheets_data,
-                                sort_order,
-                                filename.clone(),
-                                tab_id,
-                                &self.ui_chan.0,
-                            );
-                        };
-
-                        ()
-                    }
+                    self.sort_current_sheet(ctx, filename, sort_order, tab_id);
                 }
                 UiMessage::OpenFile(file, tab) => load_file(self, ctx, file, tab),
             }
