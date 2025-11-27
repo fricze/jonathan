@@ -181,7 +181,7 @@ impl egui_dock::TabViewer for TabViewer<'_> {
         }
 
         if let Some(sheet) = self.promised_data.get(chosen_file) {
-            if sheet.ready().is_none() {
+            if sheet.is_empty() {
                 let painter = self
                     .ctx
                     .layer_painter(LayerId::new(Order::Foreground, Id::new("file_drop_target")));
@@ -202,7 +202,7 @@ impl egui_dock::TabViewer for TabViewer<'_> {
             display_headers(ui, columns.as_mut());
             ui.add_space(4.0);
 
-            if let Some(promised_data) = self.promised_data.get(chosen_file) {
+            if let Some(master_data) = self.promised_data.get(chosen_file) {
                 let filtered_data = self.filtered_data.get(&(chosen_file.to_string(), tab_id));
 
                 let filter = if !self.global_filter.is_empty() {
@@ -213,15 +213,10 @@ impl egui_dock::TabViewer for TabViewer<'_> {
                     &"".to_string()
                 };
 
-                let filtered_data = filtered_data.map(|p| p.ready()).flatten();
-                let master_data = promised_data.ready();
-
-                let def_vec: Vec<Arc<StringRecord>> = vec![];
-                let default_data: Arc<Vec<Arc<StringRecord>>> = Arc::new(def_vec);
-
                 let sheet_data = match filtered_data {
-                    Some(data) if !filter.is_empty() => data,
-                    _ => master_data.unwrap_or(&default_data),
+                    // Some(filtered_data) if !filter.is_empty() => filtered_data,
+                    Some(filtered_data) if !filtered_data.is_empty() => filtered_data,
+                    _ => master_data,
                 };
 
                 // let id_salt = Id::new("table_demo");
@@ -404,40 +399,40 @@ fn display_headers(ui: &mut egui::Ui, headers: &mut Vec<FileHeader>) {
     });
 }
 
-fn load_file(app: &mut MyApp, ctx: &egui::Context, file_name: String, tab_id: Option<usize>) {
-    app.picked_path = Some(file_name.clone());
+// fn load_file(app: &mut MyApp, ctx: &egui::Context, file_name: String, tab_id: Option<usize>) {
+//     app.picked_path = Some(file_name.clone());
 
-    app.files_list.push(file_name.clone());
+//     app.files_list.push(file_name.clone());
 
-    let (mut reader, headers) = open_csv_file(&file_name);
+//     let (mut reader, headers) = open_csv_file(&file_name);
 
-    for tab in app.tree.iter_all_tabs_mut() {
-        let sheet_tab = tab.1;
-        sheet_tab.columns.insert(file_name.clone(), headers.clone());
-        sheet_tab.filter.insert(file_name.clone(), "".to_string());
+//     for tab in app.tree.iter_all_tabs_mut() {
+//         let sheet_tab = tab.1;
+//         sheet_tab.columns.insert(file_name.clone(), headers.clone());
+//         sheet_tab.filter.insert(file_name.clone(), "".to_string());
 
-        if let Some(tab_id) = tab_id {
-            if sheet_tab.id == tab_id {
-                sheet_tab.chosen_file = file_name.clone();
-            }
-        }
-    }
+//         if let Some(tab_id) = tab_id {
+//             if sheet_tab.id == tab_id {
+//                 sheet_tab.chosen_file = file_name.clone();
+//             }
+//         }
+//     }
 
-    app.loading = true;
+//     app.loading = true;
 
-    let promise = poll_promise::Promise::spawn_thread("slow_operation", move || {
-        Arc::new(
-            reader
-                .records()
-                .filter_map(|record| record.ok())
-                .map(|r| Arc::new(r))
-                .collect::<Vec<_>>(),
-        )
-    });
-    app.sheets_data.insert(file_name.clone(), promise);
+//     let promise = poll_promise::Promise::spawn_thread("slow_operation", move || {
+//         Arc::new(
+//             reader
+//                 .records()
+//                 .filter_map(|record| record.ok())
+//                 .map(|r| Arc::new(r))
+//                 .collect::<Vec<_>>(),
+//         )
+//     });
+//     app.sheets_data.insert(file_name.clone(), promise);
 
-    ctx.send_viewport_cmd(egui::ViewportCommand::Title(file_name));
-}
+//     ctx.send_viewport_cmd(egui::ViewportCommand::Title(file_name));
+// }
 
 fn open_file_dialog(sender: &Sender<UiMessage>, tab: &usize) {
     if let Some(paths) = rfd::FileDialog::new()
@@ -456,7 +451,7 @@ fn open_file_dialog(sender: &Sender<UiMessage>, tab: &usize) {
 fn sort_data(
     mut master_clone: Vec<Arc<StringRecord>>,
     sort_by: (usize, SortOrder),
-) -> Arc<Vec<Arc<StringRecord>>> {
+) -> Vec<Arc<StringRecord>> {
     master_clone.sort_by(|a, b| -> std::cmp::Ordering {
         let val_a = a.get(sort_by.0).unwrap();
         let val_b = b.get(sort_by.0).unwrap();
@@ -468,7 +463,7 @@ fn sort_data(
         }
     });
 
-    Arc::new(master_clone)
+    master_clone
 }
 
 fn filter_data(
@@ -528,6 +523,57 @@ fn filter_data_simple(
 }
 
 impl MyApp {
+    fn load_file(&mut self, ctx: &egui::Context, file_name: String, tab_id: Option<usize>) {
+        self.picked_path = Some(file_name.clone());
+
+        self.files_list.push(file_name.clone());
+
+        let (mut reader, headers) = open_csv_file(&file_name);
+
+        for tab in self.tree.iter_all_tabs_mut() {
+            let sheet_tab = tab.1;
+            sheet_tab.columns.insert(file_name.clone(), headers.clone());
+            sheet_tab.filter.insert(file_name.clone(), "".to_string());
+
+            if let Some(tab_id) = tab_id {
+                if sheet_tab.id == tab_id {
+                    sheet_tab.chosen_file = file_name.clone();
+                }
+            }
+        }
+
+        self.loading = true;
+
+        ctx.send_viewport_cmd(egui::ViewportCommand::Title(file_name.clone()));
+
+        let chan = self.worker_chan.0.clone();
+        let ctx = ctx.clone();
+
+        thread::spawn(move || {
+            let master_data = reader
+                .records()
+                .filter_map(|record| record.ok())
+                .map(|r| Arc::new(r))
+                .collect::<Vec<_>>();
+
+            if let Err(e) = chan.send(UiMessage::SetMaster(master_data, file_name.clone())) {
+                eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+            }
+
+            ctx.request_repaint();
+        });
+
+        // let promise = poll_promise::Promise::spawn_thread("slow_operation", move || {
+        //     Arc::new(
+        //         reader
+        //             .records()
+        //             .filter_map(|record| record.ok())
+        //             .map(|r| Arc::new(r))
+        //             .collect::<Vec<_>>(),
+        //     )
+        // });
+    }
+
     fn sort_current_sheet(
         &mut self,
         ctx: &egui::Context,
@@ -541,22 +587,21 @@ impl MyApp {
             let sheet_tab = tab.1;
 
             if sheet_tab.id == tab_id {
-                if let Some(file) = &self.sheets_data.get(&filename) {
-                    if let Some(master_data) = file.ready() {
-                        let master_clone = master_data.as_ref().clone();
-                        let chan = chan.clone();
-                        let ctx = ctx.clone();
+                if let Some(master_data) = self.sheets_data.get(&filename) {
+                    let master_clone = master_data.clone();
+                    let chan = chan.clone();
+                    let ctx = ctx.clone();
+                    let filename = filename.clone();
 
-                        thread::spawn(move || {
-                            let sorted = sort_data(master_clone, sort_order);
+                    thread::spawn(move || {
+                        let sorted = sort_data(master_clone, sort_order);
 
-                            if let Err(e) = chan.send(UiMessage::SetSorted(sorted)) {
-                                eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                            }
+                        if let Err(e) = chan.send(UiMessage::SetSorted(sorted, filename, tab_id)) {
+                            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                        }
 
-                            ctx.request_repaint();
-                        });
-                    }
+                        ctx.request_repaint();
+                    });
                 }
             };
         }
@@ -577,7 +622,12 @@ impl eframe::App for MyApp {
 
         while let Ok(message) = self.worker_chan.1.try_recv() {
             match message {
-                UiMessage::SetSorted(sorted) => {}
+                UiMessage::SetMaster(master, file_name) => {
+                    self.sheets_data.insert(file_name, master);
+                }
+                UiMessage::SetSorted(sorted, file_name, tab_id) => {
+                    self.filtered_data.insert((file_name, tab_id), sorted);
+                }
                 UiMessage::FilterGlobal(filter) => {
                     for tab in self.tree.iter_all_tabs_mut() {
                         let sheet_tab = tab.1;
@@ -585,13 +635,13 @@ impl eframe::App for MyApp {
 
                         self.global_filter = filter.clone();
 
-                        filter_data(
-                            &mut self.filtered_data,
-                            &self.sheets_data,
-                            filter.clone(),
-                            chosen_file,
-                            sheet_tab.id,
-                        );
+                        // filter_data(
+                        //     &mut self.filtered_data,
+                        //     &self.sheets_data,
+                        //     filter.clone(),
+                        //     chosen_file,
+                        //     sheet_tab.id,
+                        // );
                     }
                 }
                 UiMessage::FilterSheet(filename, filter, tab_id, column) => {
@@ -601,20 +651,20 @@ impl eframe::App for MyApp {
                         if sheet_tab.id == tab_id {
                             sheet_tab.filter.insert(filename.clone(), filter.clone());
 
-                            filter_data(
-                                &mut self.filtered_data,
-                                &self.sheets_data,
-                                filter.clone(),
-                                filename.clone(),
-                                tab_id,
-                            );
+                            // filter_data(
+                            //     &mut self.filtered_data,
+                            //     &self.sheets_data,
+                            //     filter.clone(),
+                            //     filename.clone(),
+                            //     tab_id,
+                            // );
                         }
                     }
                 }
                 UiMessage::SortSheet(filename, sort_order, tab_id) => {
                     self.sort_current_sheet(ctx, filename, sort_order, tab_id);
                 }
-                UiMessage::OpenFile(file, tab) => load_file(self, ctx, file, tab),
+                UiMessage::OpenFile(file, tab) => self.load_file(ctx, file, tab),
             }
         }
 

@@ -34,7 +34,8 @@ pub enum UiMessage {
     FilterSheet(Filename, Filter, TabId, Option<usize>),
     SortSheet(Filename, (ColumnId, SortOrder), TabId),
     FilterGlobal(Filter),
-    SetSorted(Arc<Vec<Arc<StringRecord>>>),
+    SetSorted(Vec<Arc<StringRecord>>, String, TabId),
+    SetMaster(Vec<Arc<StringRecord>>, String),
 }
 
 pub type ArcSheet = Vec<Arc<StringRecord>>;
@@ -66,12 +67,12 @@ pub struct MyApp {
     pub ui_chan: Chan<Ping>,
     pub sort_by_column: Option<usize>,
     pub sort_order: Option<SortOrder>,
-    pub sheets_data: HashMap<String, Promise<Arc<ArcSheet>>>,
+    pub sheets_data: HashMap<String, ArcSheet>,
     // Filtered data is stored per file and per tab. Filtered data coming from
     // one master file can be used in many tabs. It's all Arcs, so
     // even if we show the same data in many tabs, filtered in different ways
     // we're just using references to the same master data.
-    pub filtered_data: HashMap<(Filename, TabId), Promise<Arc<ArcSheet>>>,
+    pub filtered_data: HashMap<(Filename, TabId), ArcSheet>,
     pub tree: DockState<SheetTab>,
     pub counter: usize,
     pub files_list: Vec<String>,
@@ -80,8 +81,8 @@ pub struct MyApp {
 
 pub struct TabViewer<'a> {
     pub added_nodes: &'a mut Vec<(SurfaceIndex, NodeIndex, Filename)>,
-    pub promised_data: &'a HashMap<Filename, Promise<Arc<ArcSheet>>>,
-    pub filtered_data: &'a HashMap<(Filename, TabId), Promise<Arc<ArcSheet>>>,
+    pub promised_data: &'a HashMap<Filename, ArcSheet>,
+    pub filtered_data: &'a HashMap<(Filename, TabId), ArcSheet>,
     pub ctx: &'a Context,
     pub sender: &'a Sender<UiMessage>,
     pub files_list: &'a Vec<String>,
