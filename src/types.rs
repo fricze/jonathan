@@ -3,7 +3,6 @@ use egui::Context;
 use egui_dock::{DockState, NodeIndex, SurfaceIndex};
 use std::collections::HashMap;
 
-use poll_promise::Promise;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender};
 
