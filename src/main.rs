@@ -201,57 +201,56 @@ impl egui_dock::TabViewer for TabViewer<'_> {
             display_headers(ui, columns.as_mut());
             ui.add_space(4.0);
 
-            if let Some(master_data) = self.promised_data.get(chosen_file) {
-                let filtered_data = self.filtered_data.get(&(chosen_file.to_string(), tab_id));
+            let filter = if !self.global_filter.is_empty() {
+                self.global_filter
+            } else if let Some(chosen_file) = tab.filter.get(chosen_file) {
+                chosen_file
+            } else {
+                &"".to_string()
+            };
 
-                let filter = if !self.global_filter.is_empty() {
-                    self.global_filter
-                } else if let Some(chosen_file) = tab.filter.get(chosen_file) {
-                    chosen_file
-                } else {
-                    &"".to_string()
-                };
+            let sheet_data = match (
+                self.promised_data.get(chosen_file),
+                self.filtered_data.get(&(chosen_file.to_string(), tab_id)),
+            ) {
+                (Some(_), None) if !filter.is_empty() => &vec![],
+                (Some(master), None) => master,
+                (Some(_), Some(filtered)) => filtered,
+                _ => &vec![],
+            };
 
-                let sheet_data = match filtered_data {
-                    // Some(filtered_data) if !filter.is_empty() => filtered_data,
-                    Some(filtered_data) if !filtered_data.is_empty() => filtered_data,
-                    _ => master_data,
-                };
+            let len = sheet_data.len();
 
-                // let id_salt = Id::new("table_demo");
-                // let state_id = egui_table::Table::new().id_salt(id_salt).get_id(ui); // Note: must be here (in the correct outer `ui` scope) to be correct.
-                let len = sheet_data.len();
+            let first_row = sheet_data.get(0);
+            let num_columns = if let Some(first_row) = first_row {
+                first_row.len()
+            } else {
+                0
+            };
 
-                let first_row = sheet_data.get(0);
-                let num_columns = if let Some(first_row) = first_row {
-                    first_row.len()
-                } else {
-                    0
-                };
+            let col_len = columns.len();
 
-                let col_len = columns.len();
+            let mut t = new_table::TableDemo {
+                data: sheet_data,
+                num_columns,
+                columns: columns.as_mut(),
+                num_rows: len as u64,
+                num_sticky_cols: if col_len > 0 { 1 } else { 0 },
+                default_column: egui_table::Column::new(50.0)
+                    .range(10.0..=500.0)
+                    .resizable(true),
+                auto_size_mode: egui_table::AutoSizeMode::default(),
+                top_row_height: 24.0,
+                row_height: 18.0,
+                is_row_expanded: Default::default(),
+                prefetched: vec![],
+                sender: self.sender,
+                tab_id: tab_id,
+                filename: chosen_file.clone(),
+                filter: &filter,
+            };
 
-                let mut t = new_table::TableDemo {
-                    data: sheet_data,
-                    num_columns,
-                    columns: columns.as_mut(),
-                    num_rows: len as u64,
-                    num_sticky_cols: if col_len > 0 { 1 } else { 0 },
-                    default_column: egui_table::Column::new(50.0)
-                        .range(10.0..=500.0)
-                        .resizable(true),
-                    auto_size_mode: egui_table::AutoSizeMode::default(),
-                    top_row_height: 24.0,
-                    row_height: 18.0,
-                    is_row_expanded: Default::default(),
-                    prefetched: vec![],
-                    sender: self.sender,
-                    tab_id: tab_id,
-                    filename: chosen_file.clone(),
-                };
-
-                t.ui(ui);
-            }
+            t.ui(ui);
         }
     }
 

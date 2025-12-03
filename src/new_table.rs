@@ -4,7 +4,7 @@ use std::{
 };
 
 use csv::StringRecord;
-use egui::{Align2, Context, Id, Margin, NumExt as _, Sense, Vec2};
+use egui::{Align2, Color32, Context, Id, Margin, NumExt as _, Sense, TextFormat, Vec2};
 
 use crate::types::{FileHeader, Filename, SortOrder, TabId, UiMessage};
 
@@ -24,6 +24,7 @@ pub struct TableDemo<'a> {
     pub sender: &'a Sender<UiMessage>,
     pub filename: Filename,
     pub tab_id: TabId,
+    pub filter: &'a str,
 }
 
 // impl<'a> Default for TableDemo<'a> {
@@ -70,8 +71,65 @@ impl<'a> TableDemo<'a> {
         let row = self.data.get(row_nr as usize);
         if let Some(row) = row {
             let cell = row.get(col_nr as usize);
-            if let Some(cell) = cell {
-                ui.label(cell);
+            if let Some(cell_content) = cell {
+                let filter = self.filter;
+
+                let label = if filter.is_empty() {
+                    ui.label(cell_content)
+                } else {
+                    use egui::text::LayoutJob;
+
+                    if cell_content.contains(filter) {
+                        let mut job = LayoutJob::default();
+
+                        if cell_content == filter {
+                            job.append(
+                                cell_content,
+                                0.0,
+                                TextFormat {
+                                    color: Color32::YELLOW,
+                                    ..Default::default()
+                                },
+                            );
+
+                            ui.label(job)
+                        } else {
+                            let text: Vec<&str> = cell_content.split(&filter).collect();
+
+                            if text.len() == 1 {
+                                job.append(
+                                    &filter,
+                                    0.0,
+                                    TextFormat {
+                                        color: Color32::YELLOW,
+                                        ..Default::default()
+                                    },
+                                );
+                                job.append(text[0], 0.0, TextFormat::default());
+                                ui.label(job)
+                            } else if text.len() == 2 {
+                                job.append(text[0], 0.0, TextFormat::default());
+                                job.append(
+                                    &filter,
+                                    0.0,
+                                    TextFormat {
+                                        color: Color32::YELLOW,
+                                        ..Default::default()
+                                    },
+                                );
+                                job.append(text[1], 0.0, TextFormat::default());
+
+                                ui.label(job)
+                            } else {
+                                ui.label(job)
+                            }
+                        }
+                    } else {
+                        ui.label(cell_content)
+                    }
+                };
+
+                if label.clicked() {}
             }
         }
 
