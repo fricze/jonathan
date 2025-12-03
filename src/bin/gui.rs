@@ -7,10 +7,7 @@ use crate::egui::Context;
 use csv::Reader;
 use csv::StringRecord;
 use egui::{Color32, Key, ScrollArea, TextFormat};
-use itertools::Itertools;
 use shared_arena::{ArenaArc, SharedArena};
-use std::cmp::Ordering;
-use std::str::FromStr;
 use std::sync::Arc;
 
 use std::sync::Mutex;
@@ -28,7 +25,6 @@ use std::{
 use egui_extras::{Column, Table, TableBuilder};
 
 use eframe::egui;
-// use read_csv;
 
 enum WorkerMessage {
     SetData(()),

@@ -236,7 +236,7 @@ impl egui_dock::TabViewer for TabViewer<'_> {
                 columns: columns.as_mut(),
                 num_rows: len as u64,
                 num_sticky_cols: if col_len > 0 { 1 } else { 0 },
-                default_column: egui_table::Column::new(50.0)
+                default_column: egui_table::Column::new(30.0)
                     .range(10.0..=500.0)
                     .resizable(true),
                 auto_size_mode: egui_table::AutoSizeMode::default(),

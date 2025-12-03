@@ -4,11 +4,10 @@ use std::{
 };
 
 use csv::StringRecord;
-use egui::{Align2, Color32, Context, Id, Margin, NumExt as _, Sense, TextFormat, Vec2};
+use egui::{Align2, Color32, Context, Id, Margin, NumExt as _, TextFormat};
 
 use crate::types::{FileHeader, Filename, SortOrder, TabId, UiMessage};
 
-// #[derive(serde::Deserialize, serde::Serialize)]
 pub struct TableDemo<'a> {
     pub data: &'a Vec<Arc<StringRecord>>,
     pub num_columns: usize,
@@ -26,26 +25,6 @@ pub struct TableDemo<'a> {
     pub tab_id: TabId,
     pub filter: &'a str,
 }
-
-// impl<'a> Default for TableDemo<'a> {
-//     fn default() -> Self {
-//         Self {
-//             num_columns: 20,
-//             num_rows: 10_000,
-//             num_sticky_cols: 1,
-//             default_column: egui_table::Column::new(100.0)
-//                 .range(10.0..=500.0)
-//                 .resizable(true),
-//             auto_size_mode: egui_table::AutoSizeMode::default(),
-//             top_row_height: 24.0,
-//             row_height: 18.0,
-//             is_row_expanded: Default::default(),
-//             prefetched: vec![],
-//             data: None,
-//             columns: &mut vec![],
-//         }
-//     }
-// }
 
 impl<'a> TableDemo<'a> {
     // fn was_row_prefetched(&self, row_nr: u64) -> bool {
@@ -129,7 +108,16 @@ impl<'a> TableDemo<'a> {
                     }
                 };
 
-                if label.clicked() {}
+                if label.clicked() {
+                    if let Err(e) = self.sender.send(UiMessage::FilterSheet(
+                        self.filename.to_string(),
+                        cell_content.to_string(),
+                        self.tab_id,
+                        None,
+                    )) {
+                        eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                    }
+                }
             }
         }
 
