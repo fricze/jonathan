@@ -31,14 +31,14 @@ egui_extras = "0.33.0"
 rfd = "0.15.3"
 sha2 = "0.10.9"
 shared_arena = "0.8.4"
-polars = { version = "0.49.1", features = [
-    "csv",
-    "lazy",
-    "simd",
-    "performant",
-    "dtype-date",
-    "dtype-datetime",
-] }
+# polars = { version = "0.49.1", features = [
+#     "csv",
+#     "lazy",
+#     "simd",
+#     "performant",
+#     "dtype-date",
+#     "dtype-datetime",
+# ] }
 egui_dock = "0.18"
 egui_table = "0.5.0"
 serde = "1.0.219"

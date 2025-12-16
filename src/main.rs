@@ -16,8 +16,6 @@ use std::sync::mpsc::{self, Sender};
 
 mod new_table;
 mod read_csv;
-mod rect;
-mod table;
 mod types;
 mod ui;
 
