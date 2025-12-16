@@ -78,7 +78,7 @@ pub struct MyApp {
     pub global_filter: String,
 }
 
-pub struct TabViewer<'a> {
+pub struct CsvTabViewer<'a> {
     pub added_nodes: &'a mut Vec<(SurfaceIndex, NodeIndex, Filename)>,
     pub promised_data: &'a HashMap<Filename, ArcSheet>,
     pub filtered_data: &'a HashMap<(Filename, TabId), ArcSheet>,

@@ -22,7 +22,7 @@ mod ui;
 use crate::types::{Ping, SortOrder};
 use eframe::egui;
 use read_csv::open_csv_file;
-use types::{FileHeader, MyApp, SheetTab, TabViewer, UiMessage};
+use types::{CsvTabViewer, FileHeader, MyApp, SheetTab, UiMessage};
 
 fn get_last_element_from_path(s: &str) -> Option<&str> {
     s.split('/').last()
@@ -64,7 +64,7 @@ fn file_button(ui: &mut egui::Ui, file: &str) -> Response {
     response
 }
 
-impl egui_dock::TabViewer for TabViewer<'_> {
+impl egui_dock::TabViewer for CsvTabViewer<'_> {
     type Tab = SheetTab;
 
     fn add_popup(&mut self, ui: &mut egui::Ui, surface: SurfaceIndex, node: NodeIndex) {
@@ -199,9 +199,11 @@ impl egui_dock::TabViewer for TabViewer<'_> {
             display_headers(ui, columns.as_mut());
             ui.add_space(4.0);
 
+            let tab_filter = tab.filter.clone();
+
             let filter = if !self.global_filter.is_empty() {
                 self.global_filter
-            } else if let Some(chosen_file) = tab.filter.get(chosen_file) {
+            } else if let Some(chosen_file) = tab_filter.get(chosen_file) {
                 chosen_file
             } else {
                 &"".to_string()
@@ -228,7 +230,7 @@ impl egui_dock::TabViewer for TabViewer<'_> {
 
             let col_len = columns.len();
 
-            let mut t = new_table::TableDemo {
+            let mut t = new_table::Table {
                 data: sheet_data,
                 num_columns,
                 columns: columns.as_mut(),
@@ -246,6 +248,7 @@ impl egui_dock::TabViewer for TabViewer<'_> {
                 tab_id: tab_id,
                 filename: chosen_file.clone(),
                 filter: &filter,
+                tab_filter: &mut tab.filter,
             };
 
             t.ui(ui);
@@ -650,7 +653,7 @@ impl eframe::App for MyApp {
             .show_add_popup(true)
             .show(
                 ctx,
-                &mut TabViewer {
+                &mut CsvTabViewer {
                     added_nodes: &mut added_nodes,
                     promised_data: &self.sheets_data,
                     filtered_data: &self.filtered_data,

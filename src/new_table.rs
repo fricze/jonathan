@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     sync::{Arc, mpsc::Sender},
 };
 
@@ -8,7 +8,8 @@ use egui::{Align2, Color32, Context, Id, Margin, NumExt as _, TextFormat};
 
 use crate::types::{FileHeader, Filename, SortOrder, TabId, UiMessage};
 
-pub struct TableDemo<'a> {
+pub struct Table<'a> {
+    pub tab_filter: &'a mut HashMap<Filename, String>,
     pub data: &'a Vec<Arc<StringRecord>>,
     pub num_columns: usize,
     pub columns: &'a mut Vec<FileHeader>,
@@ -26,7 +27,7 @@ pub struct TableDemo<'a> {
     pub filter: &'a str,
 }
 
-impl<'a> TableDemo<'a> {
+impl<'a> Table<'a> {
     // fn was_row_prefetched(&self, row_nr: u64) -> bool {
     //     self.prefetched
     //         .iter()
@@ -109,6 +110,9 @@ impl<'a> TableDemo<'a> {
                 };
 
                 if label.clicked() {
+                    self.tab_filter
+                        .insert(self.filename.clone(), cell_content.to_string());
+
                     if let Err(e) = self.sender.send(UiMessage::FilterSheet(
                         self.filename.to_string(),
                         cell_content.to_string(),
@@ -137,7 +141,7 @@ impl<'a> TableDemo<'a> {
     }
 }
 
-impl<'a> egui_table::TableDelegate for TableDemo<'a> {
+impl<'a> egui_table::TableDelegate for Table<'a> {
     fn prepare(&mut self, info: &egui_table::PrefetchInfo) {
         assert!(
             info.visible_rows.end <= self.num_rows,
@@ -275,7 +279,7 @@ impl<'a> egui_table::TableDelegate for TableDemo<'a> {
     }
 }
 
-impl<'a> TableDemo<'a> {
+impl<'a> Table<'a> {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let id_salt = Id::new("table_demo");
         let state_id = egui_table::Table::new().id_salt(id_salt).get_id(ui); // Note: must be here (in the correct outer `ui` scope) to be correct.
