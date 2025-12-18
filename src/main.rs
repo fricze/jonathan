@@ -16,6 +16,7 @@ use std::sync::mpsc::{self, Sender};
 
 mod new_table;
 mod read_csv;
+mod tabs;
 mod types;
 mod ui;
 
@@ -135,7 +136,7 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
         let chosen_file = &tab.chosen_file.clone();
 
         if !chosen_file.is_empty() {
-            if let Some(filter) = tab.filter.get_mut(chosen_file) {
+            if let Some(filter) = self.filters.get_mut(&(chosen_file.clone(), tab_id)) {
                 ui.horizontal_wrapped(|ui| {
                     if ui.text_edit_singleline(filter).changed() {
                         if let Err(e) = &self.sender.send(UiMessage::FilterSheet(
@@ -199,11 +200,9 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
             display_headers(ui, columns.as_mut());
             ui.add_space(4.0);
 
-            let tab_filter = tab.filter.clone();
-
             let filter = if !self.global_filter.is_empty() {
                 self.global_filter
-            } else if let Some(chosen_file) = tab_filter.get(chosen_file) {
+            } else if let Some(chosen_file) = self.filters.get_mut(&(chosen_file.clone(), tab_id)) {
                 chosen_file
             } else {
                 &"".to_string()
@@ -248,7 +247,6 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
                 tab_id: tab_id,
                 filename: chosen_file.clone(),
                 filter: &filter,
-                tab_filter: &mut tab.filter,
             };
 
             t.ui(ui);
@@ -331,6 +329,7 @@ fn main() -> eframe::Result {
                 counter: 2,
                 files_list: vec![],
                 global_filter: "".to_string(),
+                filters: HashMap::new(),
             }))
         }),
     )
@@ -449,11 +448,12 @@ impl MyApp {
         for tab in self.tree.iter_all_tabs_mut() {
             let sheet_tab = tab.1;
             sheet_tab.columns.insert(file_name.clone(), headers.clone());
-            sheet_tab.filter.insert(file_name.clone(), "".to_string());
 
             if let Some(tab_id) = tab_id {
                 if sheet_tab.id == tab_id {
                     sheet_tab.chosen_file = file_name.clone();
+                    self.filters
+                        .insert((file_name.clone(), tab_id), "".to_string());
                 }
             }
         }
@@ -588,6 +588,8 @@ impl eframe::App for MyApp {
                     }
                 }
                 UiMessage::FilterSheet(filename, filter, tab_id, column) => {
+                    self.filters
+                        .insert((filename.clone(), tab_id), filter.clone());
                     self.filter_current_sheet(ctx, filename, filter, tab_id);
                 }
                 UiMessage::SortSheet(filename, sort_order, tab_id) => {
@@ -663,6 +665,7 @@ impl eframe::App for MyApp {
                     tabs_no,
                     focused_tab,
                     global_filter: &self.global_filter,
+                    filters: &mut self.filters,
                 },
             );
 
@@ -671,15 +674,10 @@ impl eframe::App for MyApp {
 
             let last_tab = self.tree.iter_all_tabs().last().unwrap().1;
             let columns = last_tab.columns.clone();
-            let mut filter = last_tab.filter.clone();
-            for value in filter.values_mut() {
-                *value = "".to_string();
-            }
 
             self.tree.push_to_focused_leaf(SheetTab {
                 id: self.counter,
                 columns,
-                filter,
                 chosen_file: filename,
                 ..Default::default()
             });

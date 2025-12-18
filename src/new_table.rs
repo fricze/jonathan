@@ -9,7 +9,7 @@ use egui::{Align2, Color32, Context, Id, Margin, NumExt as _, TextFormat};
 use crate::types::{FileHeader, Filename, SortOrder, TabId, UiMessage};
 
 pub struct Table<'a> {
-    pub tab_filter: &'a mut HashMap<Filename, String>,
+    // pub tab_filter: &'a mut HashMap<Filename, String>,
     pub data: &'a Vec<Arc<StringRecord>>,
     pub num_columns: usize,
     pub columns: &'a mut Vec<FileHeader>,
@@ -110,8 +110,8 @@ impl<'a> Table<'a> {
                 };
 
                 if label.clicked() {
-                    self.tab_filter
-                        .insert(self.filename.clone(), cell_content.to_string());
+                    // self.tab_filter
+                    //     .insert(self.filename.clone(), cell_content.to_string());
 
                     if let Err(e) = self.sender.send(UiMessage::FilterSheet(
                         self.filename.to_string(),

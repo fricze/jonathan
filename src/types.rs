@@ -53,10 +53,11 @@ pub struct SheetTab {
     pub content_height: f32,
     pub chosen_file: String,
     pub columns: HashMap<Filename, Vec<FileHeader>>,
-    pub filter: HashMap<Filename, String>,
 }
 
 pub type Chan<Msg> = (Sender<Msg>, Receiver<Msg>);
+
+pub type Filters = HashMap<(Filename, TabId), String>;
 
 pub struct MyApp {
     pub dropped_files: Vec<egui::DroppedFile>,
@@ -76,6 +77,7 @@ pub struct MyApp {
     pub counter: usize,
     pub files_list: Vec<String>,
     pub global_filter: String,
+    pub filters: Filters,
 }
 
 pub struct CsvTabViewer<'a> {
@@ -88,4 +90,5 @@ pub struct CsvTabViewer<'a> {
     pub tabs_no: usize,
     pub focused_tab: Option<usize>,
     pub global_filter: &'a String,
+    pub filters: &'a mut Filters,
 }
