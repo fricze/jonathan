@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     sync::{Arc, mpsc::Sender},
 };
 
@@ -9,7 +9,6 @@ use egui::{Align2, Color32, Context, Id, Margin, NumExt as _, TextFormat};
 use crate::types::{FileHeader, Filename, SortOrder, TabId, UiMessage};
 
 pub struct Table<'a> {
-    // pub tab_filter: &'a mut HashMap<Filename, String>,
     pub data: &'a Vec<Arc<StringRecord>>,
     pub num_columns: usize,
     pub columns: &'a mut Vec<FileHeader>,
