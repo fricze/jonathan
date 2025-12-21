@@ -2,7 +2,6 @@
 
 use egui::Key;
 use egui_dock::{DockArea, DockState, Style};
-use fakeit::file;
 use std::thread;
 
 use std::collections::HashMap;
