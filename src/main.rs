@@ -2,6 +2,7 @@
 
 use egui::Key;
 use egui_dock::{DockArea, DockState, Style};
+use fakeit::file;
 use std::thread;
 
 use std::collections::HashMap;
@@ -122,8 +123,8 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
     }
 }
 
-fn sort_data(mut master_clone: SheetVec, sort_by: (usize, SortOrder)) -> SheetVec {
-    master_clone.sort_by(|a, b| -> std::cmp::Ordering {
+fn sort_data(mut sheet_clone: SheetVec, sort_by: (usize, SortOrder)) -> SheetVec {
+    sheet_clone.sort_by(|a, b| -> std::cmp::Ordering {
         let val_a = a.get(sort_by.0).unwrap();
         let val_b = b.get(sort_by.0).unwrap();
 
@@ -134,7 +135,7 @@ fn sort_data(mut master_clone: SheetVec, sort_by: (usize, SortOrder)) -> SheetVe
         }
     });
 
-    master_clone
+    sheet_clone
 }
 
 fn filter_data(master_data: SheetVec, filter: String) -> SheetVec {
@@ -200,8 +201,21 @@ impl MyApp {
             let sheet_tab = tab.1;
 
             if sheet_tab.id == tab_id {
-                if let Some(master_data) = self.sheets_data.get(&filename) {
-                    let master_clone = master_data.clone();
+                let filter = self.filters.get(&(filename.to_string(), tab_id));
+
+                let sheet_data = match (
+                    self.sheets_data.get(&filename),
+                    self.filtered_data.get(&(filename.to_string(), tab_id)),
+                    filter,
+                ) {
+                    (Some(_), None, Some(filter)) if !filter.is_empty() => &vec![],
+                    (Some(master), None, _) => master,
+                    (Some(_), Some(filtered), _) => filtered,
+                    _ => &vec![],
+                };
+
+                if !sheet_data.is_empty() {
+                    let master_clone = sheet_data.clone();
                     let chan = chan.clone();
                     let ctx = ctx.clone();
                     let filename = filename.clone();
