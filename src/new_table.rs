@@ -1,15 +1,11 @@
-use std::{
-    collections::BTreeMap,
-    sync::{Arc, mpsc::Sender},
-};
+use std::{collections::BTreeMap, sync::mpsc::Sender};
 
-use csv::StringRecord;
 use egui::{Align2, Color32, Context, Id, Margin, NumExt as _, TextFormat};
 
-use crate::types::{FileHeader, Filename, SortOrder, TabId, UiMessage};
+use crate::types::{FileHeader, Filename, SheetVec, SortOrder, TabId, UiMessage};
 
 pub struct Table<'a> {
-    pub data: &'a Vec<Arc<StringRecord>>,
+    pub data: &'a SheetVec,
     pub num_columns: usize,
     pub columns: &'a mut Vec<FileHeader>,
     pub num_rows: u64,
@@ -66,7 +62,7 @@ impl<'a> Table<'a> {
                                 cell_content,
                                 0.0,
                                 TextFormat {
-                                    color: Color32::YELLOW,
+                                    color: Color32::DARK_BLUE,
                                     ..Default::default()
                                 },
                             );
@@ -80,7 +76,7 @@ impl<'a> Table<'a> {
                                     &filter,
                                     0.0,
                                     TextFormat {
-                                        color: Color32::YELLOW,
+                                        color: Color32::DARK_BLUE,
                                         ..Default::default()
                                     },
                                 );
@@ -92,7 +88,7 @@ impl<'a> Table<'a> {
                                     &filter,
                                     0.0,
                                     TextFormat {
-                                        color: Color32::YELLOW,
+                                        color: Color32::DARK_BLUE,
                                         ..Default::default()
                                     },
                                 );
@@ -109,9 +105,6 @@ impl<'a> Table<'a> {
                 };
 
                 if label.clicked() {
-                    // self.tab_filter
-                    //     .insert(self.filename.clone(), cell_content.to_string());
-
                     if let Err(e) = self.sender.send(UiMessage::FilterSheet(
                         self.filename.to_string(),
                         cell_content.to_string(),

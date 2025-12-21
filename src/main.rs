@@ -1,9 +1,7 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 
-use csv::StringRecord;
 use egui::Key;
 use egui_dock::{DockArea, DockState, Style};
-use std::sync::Arc;
 use std::thread;
 
 use std::collections::HashMap;
@@ -16,7 +14,7 @@ mod tabs;
 mod types;
 mod ui;
 
-use crate::types::{Ping, SortOrder};
+use crate::types::{Ping, SheetVec, SortOrder};
 use eframe::egui;
 use read_csv::open_csv_file;
 use types::{CsvTabViewer, MyApp, SheetTab, UiMessage};
@@ -124,10 +122,7 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
     }
 }
 
-fn sort_data(
-    mut master_clone: Vec<Arc<StringRecord>>,
-    sort_by: (usize, SortOrder),
-) -> Vec<Arc<StringRecord>> {
+fn sort_data(mut master_clone: SheetVec, sort_by: (usize, SortOrder)) -> SheetVec {
     master_clone.sort_by(|a, b| -> std::cmp::Ordering {
         let val_a = a.get(sort_by.0).unwrap();
         let val_b = b.get(sort_by.0).unwrap();
@@ -142,7 +137,7 @@ fn sort_data(
     master_clone
 }
 
-fn filter_data(master_data: Vec<Arc<StringRecord>>, filter: String) -> Vec<Arc<StringRecord>> {
+fn filter_data(master_data: SheetVec, filter: String) -> SheetVec {
     master_data
         .iter()
         .filter(|r| r.iter().any(|c| c.contains(&filter)))
@@ -182,7 +177,6 @@ impl MyApp {
             let master_data = reader
                 .records()
                 .filter_map(|record| record.ok())
-                .map(|r| Arc::new(r))
                 .collect::<Vec<_>>();
 
             if let Err(e) = chan.send(UiMessage::SetMaster(master_data, file_name.clone())) {
