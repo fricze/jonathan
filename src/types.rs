@@ -1,4 +1,3 @@
-use csv::StringRecord;
 use egui::Context;
 use egui_dock::{DockState, NodeIndex, SurfaceIndex};
 use polars::frame::DataFrame;
@@ -8,12 +7,12 @@ use std::sync::mpsc::{Receiver, Sender};
 
 #[derive(Clone, Default)]
 pub struct FileHeader {
-    pub unique_vals: Vec<String>,
     pub name: String,
     pub visible: bool,
-    pub dtype: Option<String>,
     pub sort: Option<SortOrder>,
-    pub sort_dir: Option<bool>,
+    // pub dtype: Option<String>,
+    // pub unique_vals: Vec<String>,
+    // pub sort_dir: Option<bool>,
 }
 
 pub type TabId = usize;
@@ -23,15 +22,13 @@ pub type Filename = String;
 
 pub type Ping = bool;
 
-pub type SheetVec = Vec<StringRecord>;
-
 pub enum UiMessage {
     OpenFile(String, Option<TabId>),
     FilterSheet(Filename, Filter, TabId, Option<usize>),
     SortSheet(Filename, (ColumnId, SortOrder), TabId),
     FilterGlobal(Filter),
-    SetSorted(SheetVec, String, TabId),
-    SetMaster(SheetVec, String),
+    SetSorted(DataFrame, String, TabId),
+    SetMaster(DataFrame, String, Option<TabId>, Vec<FileHeader>),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -59,12 +56,12 @@ pub struct MyApp {
     pub ui_chan: Chan<Ping>,
     pub sort_by_column: Option<usize>,
     pub sort_order: Option<SortOrder>,
-    pub sheets_data: HashMap<String, SheetVec>,
+    pub master_data: HashMap<String, DataFrame>,
     // Filtered data is stored per file and per tab. Filtered data coming from
     // one master file can be used in many tabs. It's all Arcs, so
     // even if we show the same data in many tabs, filtered in different ways
     // we're just using references to the same master data.
-    pub filtered_data: HashMap<(Filename, TabId), SheetVec>,
+    pub filtered_data: HashMap<(Filename, TabId), DataFrame>,
     pub tree: DockState<SheetTab>,
     pub counter: usize,
     pub files_list: Vec<String>,
@@ -76,8 +73,8 @@ pub struct MyApp {
 
 pub struct CsvTabViewer<'a> {
     pub added_nodes: &'a mut Vec<(SurfaceIndex, NodeIndex, Filename)>,
-    pub promised_data: &'a HashMap<Filename, SheetVec>,
-    pub filtered_data: &'a HashMap<(Filename, TabId), SheetVec>,
+    pub master_data: &'a HashMap<Filename, DataFrame>,
+    pub filtered_data: &'a HashMap<(Filename, TabId), DataFrame>,
     pub ctx: &'a Context,
     pub sender: &'a Sender<UiMessage>,
     pub files_list: &'a Vec<String>,
@@ -85,6 +82,6 @@ pub struct CsvTabViewer<'a> {
     pub focused_tab: Option<usize>,
     pub global_filter: &'a String,
     pub filters: &'a mut Filters,
-    pub df: &'a mut DataFrame,
-    pub filtered_df: &'a mut DataFrame,
+    // pub df: &'a mut DataFrame,
+    // pub filtered_df: &'a mut DataFrame,
 }

@@ -3,13 +3,12 @@ use std::{collections::BTreeMap, sync::mpsc::Sender};
 use egui::{Align2, Color32, Context, Id, Margin, NumExt as _, TextFormat};
 use polars::frame::DataFrame;
 
-use crate::types::{FileHeader, Filename, SheetVec, SortOrder, TabId, UiMessage};
+use crate::types::{FileHeader, Filename, SortOrder, TabId, UiMessage};
 
 pub struct Table<'a> {
     pub df: &'a DataFrame,
-    pub filtered_df: &'a DataFrame,
+    // pub filtered_df: &'a DataFrame,
     pub view: DataFrame,
-    pub data: &'a SheetVec,
     pub num_columns: usize,
     pub columns: &'a mut Vec<FileHeader>,
     pub num_rows: u64,
@@ -156,15 +155,17 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
         // Overscan to reduce thrash when scrolling:
         let overscan = 20i64;
 
-        self.view = if !self.filtered_df.is_empty() {
-            let res = self
-                .filtered_df
-                .slice(start.saturating_sub(overscan), end + 200);
+        // self.view = if !self.filtered_df.is_empty() {
+        //     let res = self
+        //         .filtered_df
+        //         .slice(start.saturating_sub(overscan), end + 200);
 
-            res
-        } else {
-            self.df.slice(start.saturating_sub(overscan), end + 200)
-        };
+        //     res
+        // } else {
+        //     self.df.slice(start.saturating_sub(overscan), end + 200)
+        // };
+
+        self.view = self.df.slice(start.saturating_sub(overscan), end + 200);
 
         assert!(
             info.visible_rows.end <= self.num_rows,

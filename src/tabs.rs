@@ -209,7 +209,7 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
             }
         }
 
-        if let Some(sheet) = self.promised_data.get(chosen_file) {
+        if let Some(sheet) = self.master_data.get(chosen_file) {
             if sheet.is_empty() {
                 let painter = self
                     .ctx
@@ -239,43 +239,22 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
                 &"".to_string()
             };
 
-            let sheet_data = match (
-                self.promised_data.get(chosen_file),
+            let active_df = match (
+                self.master_data.get(chosen_file),
                 self.filtered_data.get(&(chosen_file.to_string(), tab_id)),
             ) {
-                (Some(_), None) if !filter.is_empty() => &vec![],
+                (Some(_), None) if !filter.is_empty() => &DataFrame::empty(),
                 (Some(master), None) => master,
                 (Some(_), Some(filtered)) => filtered,
-                _ => &vec![],
+                _ => &DataFrame::empty(),
             };
 
-            // let len = sheet_data.len();
-
-            // let first_row = sheet_data.get(0);
-            // let num_columns = if let Some(first_row) = first_row {
-            //     first_row.len()
-            // } else {
-            //     0
-            // };
-
-            // let col_len = columns.len();
-
-            let len = if !self.filtered_df.is_empty() {
-                self.filtered_df.height()
-            } else {
-                self.df.height()
-            };
-
-            let num_columns = if !self.filtered_df.is_empty() {
-                self.filtered_df.width()
-            } else {
-                self.df.width()
-            };
+            let len = active_df.height();
+            let num_columns = active_df.width();
 
             let col_len = columns.len();
 
             let mut table = Table {
-                data: sheet_data,
                 num_columns,
                 columns: columns.as_mut(),
                 num_rows: len as u64,
@@ -292,8 +271,7 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
                 tab_id: tab_id,
                 filename: chosen_file.clone(),
                 filter: &filter,
-                df: self.df,
-                filtered_df: &self.filtered_df,
+                df: active_df,
                 view: DataFrame::empty(),
                 start: 0,
             };
