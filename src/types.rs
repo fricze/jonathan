@@ -1,6 +1,7 @@
 use csv::StringRecord;
 use egui::Context;
 use egui_dock::{DockState, NodeIndex, SurfaceIndex};
+use polars::frame::DataFrame;
 use std::collections::HashMap;
 
 use std::sync::mpsc::{Receiver, Sender};
@@ -42,9 +43,6 @@ pub enum SortOrder {
 #[derive(Default)]
 pub struct SheetTab {
     pub id: usize,
-    pub scroll_y: f32,
-    pub inner_rect: f32,
-    pub content_height: f32,
     pub chosen_file: String,
     pub columns: HashMap<Filename, Vec<FileHeader>>,
 }
@@ -72,6 +70,8 @@ pub struct MyApp {
     pub files_list: Vec<String>,
     pub global_filter: String,
     pub filters: Filters,
+    pub df: DataFrame,
+    pub filtered_df: DataFrame,
 }
 
 pub struct CsvTabViewer<'a> {
@@ -85,4 +85,6 @@ pub struct CsvTabViewer<'a> {
     pub focused_tab: Option<usize>,
     pub global_filter: &'a String,
     pub filters: &'a mut Filters,
+    pub df: &'a mut DataFrame,
+    pub filtered_df: &'a mut DataFrame,
 }

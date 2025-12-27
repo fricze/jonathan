@@ -4,6 +4,7 @@ use egui_dock::tab_viewer::OnCloseResponse;
 use egui_dock::{NodeIndex, SurfaceIndex};
 
 use egui::Color32;
+use polars::frame::DataFrame;
 
 use crate::types::{CsvTabViewer, FileHeader, SheetTab, UiMessage};
 use eframe::egui;
@@ -248,18 +249,32 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
                 _ => &vec![],
             };
 
-            let len = sheet_data.len();
+            // let len = sheet_data.len();
 
-            let first_row = sheet_data.get(0);
-            let num_columns = if let Some(first_row) = first_row {
-                first_row.len()
+            // let first_row = sheet_data.get(0);
+            // let num_columns = if let Some(first_row) = first_row {
+            //     first_row.len()
+            // } else {
+            //     0
+            // };
+
+            // let col_len = columns.len();
+
+            let len = if !self.filtered_df.is_empty() {
+                self.filtered_df.height()
             } else {
-                0
+                self.df.height()
+            };
+
+            let num_columns = if !self.filtered_df.is_empty() {
+                self.filtered_df.width()
+            } else {
+                self.df.width()
             };
 
             let col_len = columns.len();
 
-            let mut t = Table {
+            let mut table = Table {
                 data: sheet_data,
                 num_columns,
                 columns: columns.as_mut(),
@@ -277,9 +292,13 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
                 tab_id: tab_id,
                 filename: chosen_file.clone(),
                 filter: &filter,
+                df: self.df,
+                filtered_df: &self.filtered_df,
+                view: DataFrame::empty(),
+                start: 0,
             };
 
-            t.ui(ui);
+            table.ui(ui);
         }
     }
 

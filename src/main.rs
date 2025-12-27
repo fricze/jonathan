@@ -2,6 +2,7 @@
 
 use egui::Key;
 use egui_dock::{DockArea, DockState, Style};
+use polars::prelude::*;
 use std::thread;
 
 use std::collections::HashMap;
@@ -12,7 +13,6 @@ mod new_table;
 mod read_csv;
 mod tabs;
 mod types;
-mod ui;
 
 use crate::types::{Ping, SheetVec, SortOrder};
 use eframe::egui;
@@ -83,6 +83,8 @@ fn main() -> eframe::Result {
                 files_list: vec![],
                 global_filter: "".to_string(),
                 filters: HashMap::new(),
+                df: DataFrame::empty(),
+                filtered_df: DataFrame::empty(),
             }))
         }),
     )
@@ -145,11 +147,78 @@ fn filter_data(master_data: SheetVec, filter: String) -> SheetVec {
         .collect::<Vec<_>>()
 }
 
+fn filter_df_contains(df: &DataFrame, needle: &str) -> PolarsResult<DataFrame> {
+    if needle.is_empty() {
+        return Ok(df.clone());
+    }
+
+    let mut mask: Option<BooleanChunked> = None;
+
+    for s in df.get_columns() {
+        let is_string = matches!(s.dtype(), DataType::String);
+        if !is_string {
+            continue;
+        }
+
+        let ca = s.str()?; // works for Utf8/String
+        let col_mask: BooleanChunked = ca
+            .into_iter()
+            .map(|opt| opt.map_or(false, |v| v.contains(needle)))
+            .collect();
+
+        mask = Some(match mask {
+            None => col_mask,
+            Some(prev) => &prev | &col_mask,
+        });
+    }
+
+    let mask = mask.unwrap_or_else(|| BooleanChunked::full(PlSmallStr::EMPTY, false, df.height()));
+    df.filter(&mask)
+}
+
+fn load_polars(file_name: &str) -> Result<DataFrame, Box<dyn std::error::Error>> {
+    // let mut file = std::fs::File::open(file_name)?;
+    let file = std::fs::File::open(file_name)?;
+    let df = CsvReader::new(file).finish()?;
+
+    // let csv = LazyCsvReader::new(file_name)
+    //     .with_has_header(true)
+    //     .finish()?;
+
+    Ok(df)
+}
+
 impl MyApp {
     fn load_file(&mut self, ctx: &egui::Context, file_name: String, tab_id: Option<usize>) {
         self.picked_path = Some(file_name.clone());
 
         self.files_list.push(file_name.clone());
+
+        match load_polars(&file_name) {
+            Ok(df) => {
+                self.df = df;
+                // let view = df.slice(100, 100);
+
+                // eprintln!("view = {:?}", view);
+
+                // eprintln!("loaded!");
+                // eprintln!(
+                //     "{}",
+                //     df.get_column_names()
+                //         .iter()
+                //         .map(|s| s.as_str())
+                //         .collect::<Vec<_>>()
+                //         .join(", ")
+                // )
+            }
+            Err(_) => {
+                eprintln!("ERROR")
+            }
+        };
+        // let mut file = std::fs::File::open(&file_name)?;
+        // let df = CsvReader::new(file).finish()?;
+
+        // print!("{}", df.head(None));
 
         let (mut reader, headers) = open_csv_file(&file_name);
 
@@ -310,7 +379,10 @@ impl eframe::App for MyApp {
                 UiMessage::FilterSheet(filename, filter, tab_id, column) => {
                     self.filters
                         .insert((filename.clone(), tab_id), filter.clone());
-                    self.filter_current_sheet(ctx, filename, filter, tab_id);
+                    // self.filter_current_sheet(ctx, filename, filter, tab_id);
+                    if let Ok(df) = filter_df_contains(&self.df, &filter) {
+                        self.filtered_df = df;
+                    }
                 }
                 UiMessage::SortSheet(filename, sort_order, tab_id) => {
                     self.sort_current_sheet(ctx, filename, sort_order, tab_id);
@@ -386,6 +458,8 @@ impl eframe::App for MyApp {
                     focused_tab,
                     global_filter: &self.global_filter,
                     filters: &mut self.filters,
+                    df: &mut self.df,
+                    filtered_df: &mut self.filtered_df,
                 },
             );
 

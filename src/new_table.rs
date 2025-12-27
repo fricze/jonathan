@@ -1,10 +1,14 @@
 use std::{collections::BTreeMap, sync::mpsc::Sender};
 
 use egui::{Align2, Color32, Context, Id, Margin, NumExt as _, TextFormat};
+use polars::frame::DataFrame;
 
 use crate::types::{FileHeader, Filename, SheetVec, SortOrder, TabId, UiMessage};
 
 pub struct Table<'a> {
+    pub df: &'a DataFrame,
+    pub filtered_df: &'a DataFrame,
+    pub view: DataFrame,
     pub data: &'a SheetVec,
     pub num_columns: usize,
     pub columns: &'a mut Vec<FileHeader>,
@@ -20,6 +24,7 @@ pub struct Table<'a> {
     pub filename: Filename,
     pub tab_id: TabId,
     pub filter: &'a str,
+    pub start: i64,
 }
 
 impl<'a> Table<'a> {
@@ -43,76 +48,85 @@ impl<'a> Table<'a> {
         // let expandedness = ui.ctx().animate_bool(Id::new(row_nr), is_expanded);
         //
 
-        let row = self.data.get(row_nr as usize);
-        if let Some(row) = row {
-            let cell = row.get(col_nr as usize);
-            if let Some(cell_content) = cell {
-                let filter = self.filter;
+        // let df_row = self.view.get_row_amortized(idx, row)
 
-                let label = if filter.is_empty() {
-                    ui.label(cell_content)
-                } else {
-                    use egui::text::LayoutJob;
+        let mut row_idx = row_nr as usize;
+        let start = self.start as usize;
+        row_idx = row_idx - start;
 
-                    if cell_content.contains(filter) {
-                        let mut job = LayoutJob::default();
+        let df_row = self.view.get_row(row_idx);
 
-                        if cell_content == filter {
+        if let Ok(row) = df_row
+            && let Some(val) = row.0.get(col_nr)
+        {
+            let cell_content = val.str_value();
+
+            let filter = self.filter;
+
+            let label = if filter.is_empty() {
+                ui.label(cell_content.clone())
+            } else {
+                use egui::text::LayoutJob;
+
+                if cell_content.contains(filter) {
+                    let cell_content = &cell_content;
+                    let mut job = LayoutJob::default();
+
+                    if cell_content == filter {
+                        job.append(
+                            cell_content,
+                            0.0,
+                            TextFormat {
+                                color: Color32::DARK_BLUE,
+                                ..Default::default()
+                            },
+                        );
+
+                        ui.label(job)
+                    } else {
+                        let text: Vec<&str> = cell_content.split(&filter).collect();
+
+                        if text.len() == 1 {
                             job.append(
-                                cell_content,
+                                &filter,
                                 0.0,
                                 TextFormat {
                                     color: Color32::DARK_BLUE,
                                     ..Default::default()
                                 },
                             );
+                            job.append(text[0], 0.0, TextFormat::default());
+                            ui.label(job)
+                        } else if text.len() == 2 {
+                            job.append(text[0], 0.0, TextFormat::default());
+                            job.append(
+                                &filter,
+                                0.0,
+                                TextFormat {
+                                    color: Color32::DARK_BLUE,
+                                    ..Default::default()
+                                },
+                            );
+                            job.append(text[1], 0.0, TextFormat::default());
 
                             ui.label(job)
                         } else {
-                            let text: Vec<&str> = cell_content.split(&filter).collect();
-
-                            if text.len() == 1 {
-                                job.append(
-                                    &filter,
-                                    0.0,
-                                    TextFormat {
-                                        color: Color32::DARK_BLUE,
-                                        ..Default::default()
-                                    },
-                                );
-                                job.append(text[0], 0.0, TextFormat::default());
-                                ui.label(job)
-                            } else if text.len() == 2 {
-                                job.append(text[0], 0.0, TextFormat::default());
-                                job.append(
-                                    &filter,
-                                    0.0,
-                                    TextFormat {
-                                        color: Color32::DARK_BLUE,
-                                        ..Default::default()
-                                    },
-                                );
-                                job.append(text[1], 0.0, TextFormat::default());
-
-                                ui.label(job)
-                            } else {
-                                ui.label(job)
-                            }
+                            ui.label(job)
                         }
-                    } else {
-                        ui.label(cell_content)
                     }
-                };
+                } else {
+                    ui.label(cell_content.clone())
+                }
+            };
 
-                if label.clicked() {
-                    if let Err(e) = self.sender.send(UiMessage::FilterSheet(
-                        self.filename.to_string(),
-                        cell_content.to_string(),
-                        self.tab_id,
-                        None,
-                    )) {
-                        eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                    }
+            if label.clicked() {
+                if let Err(e) = self.sender.send(UiMessage::FilterSheet(
+                    self.filename.to_string(),
+                    cell_content.to_string(),
+                    self.tab_id,
+                    None,
+                )) {
+                    eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
                 }
             }
         }
@@ -135,6 +149,23 @@ impl<'a> Table<'a> {
 
 impl<'a> egui_table::TableDelegate for Table<'a> {
     fn prepare(&mut self, info: &egui_table::PrefetchInfo) {
+        let start = info.visible_rows.start as i64;
+        let end = info.visible_rows.end as usize;
+        self.start = start;
+
+        // Overscan to reduce thrash when scrolling:
+        let overscan = 20i64;
+
+        self.view = if !self.filtered_df.is_empty() {
+            let res = self
+                .filtered_df
+                .slice(start.saturating_sub(overscan), end + 200);
+
+            res
+        } else {
+            self.df.slice(start.saturating_sub(overscan), end + 200)
+        };
+
         assert!(
             info.visible_rows.end <= self.num_rows,
             "Was asked to prefetch rows {:?}, but we only have {} rows. This is a bug in egui_table.",
@@ -273,7 +304,7 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
 
 impl<'a> Table<'a> {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
-        let id_salt = Id::new("table_demo");
+        let id_salt = Id::new(("table", &self.filename, self.filter));
         let state_id = egui_table::Table::new().id_salt(id_salt).get_id(ui); // Note: must be here (in the correct outer `ui` scope) to be correct.
 
         let table = egui_table::Table::new()
