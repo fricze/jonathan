@@ -72,6 +72,15 @@ fn main() -> eframe::Result {
         Box::new(|cc| {
             replace_fonts(&cc.egui_ctx);
 
+            // Initialize macOS menu after eframe has created the NSApp
+            #[cfg(target_os = "macos")]
+            {
+                let menu = menu::build_menu();
+                menu.init_for_nsapp();
+                // Leak to keep alive
+                Box::leak(Box::new(menu));
+            }
+
             Ok(Box::new(MyApp {
                 worker_chan: worker_chan,
                 ui_chan: ui_chan,
@@ -90,8 +99,6 @@ fn main() -> eframe::Result {
                 files_list: vec![],
                 global_filter: "".to_string(),
                 filters: HashMap::new(),
-                #[cfg(target_os = "macos")]
-                menu_initialized: false,
             }))
         }),
     )
@@ -284,16 +291,6 @@ impl MyApp {
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Initialize macOS menu on first frame (after NSApp exists)
-        #[cfg(target_os = "macos")]
-        if !self.menu_initialized {
-            self.menu_initialized = true;
-            let menu = menu::build_menu();
-            menu.init_for_nsapp();
-            // Leak the menu to keep it alive for the app's lifetime
-            std::mem::forget(menu);
-        }
-
         // Handle macOS menu events
         #[cfg(target_os = "macos")]
         if let Ok(event) = MenuEvent::receiver().try_recv() {

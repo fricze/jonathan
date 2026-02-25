@@ -72,8 +72,6 @@ pub struct MyApp {
     pub files_list: Vec<String>,
     pub global_filter: String,
     pub filters: Filters,
-    #[cfg(target_os = "macos")]
-    pub menu_initialized: bool,
 }
 
 pub struct CsvTabViewer<'a> {
