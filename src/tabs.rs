@@ -8,7 +8,6 @@ use egui::Color32;
 use crate::types::{CsvTabViewer, FileHeader, SheetTab, UiMessage};
 use eframe::egui;
 
-use std::collections::HashSet;
 use std::sync::mpsc::Sender;
 
 use crate::new_table::Table;
@@ -32,30 +31,17 @@ fn get_last_element_from_path(s: &str) -> Option<&str> {
 }
 
 fn display_headers(ui: &mut egui::Ui, headers: &mut Vec<FileHeader>) {
-    ui.collapsing("Show/hide columns", |ui| {
-        ui.horizontal_wrapped(|ui| {
-            let mut hidden = HashSet::new();
+    ui.horizontal_wrapped(|ui| {
+        for (index, file_header) in headers.iter_mut().enumerate() {
+            let name = if file_header.name.is_empty() && index == 0 {
+                "id"
+            } else {
+                &file_header.name
+            };
 
-            for (index, file_header) in headers.iter_mut().enumerate() {
-                if file_header.visible {
-                    hidden.remove(&index);
-                } else {
-                    hidden.insert(index);
-                }
-
-                if ui
-                    .checkbox(&mut file_header.visible, &file_header.name)
-                    .on_hover_text(format!("Show/hide column {}", file_header.name))
-                    .clicked()
-                {
-                    if file_header.visible {
-                        hidden.remove(&index);
-                    } else {
-                        hidden.insert(index);
-                    }
-                }
-            }
-        });
+            ui.checkbox(&mut file_header.visible, name)
+                .on_hover_text(format!("Show/hide column {}", name));
+        }
     });
 }
 

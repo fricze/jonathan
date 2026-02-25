@@ -186,13 +186,12 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
                 } else {
                     let header = self.columns.get(actual_col_index);
                     if let Some(header) = header {
-                        let name = &header.name;
-
-                        if col_range.start == 0 && name.is_empty() {
-                            ui.heading("ID");
+                        let name = if header.name.is_empty() && actual_col_index == 0 {
+                            "id"
                         } else {
-                            ui.heading(&header.name);
-                        }
+                            &header.name
+                        };
+                        ui.heading(name);
 
                         let button_symbol = if let Some(sort) = header.sort {
                             if sort == SortOrder::Asc { "⬆" } else { "⬇" }
