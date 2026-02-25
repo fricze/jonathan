@@ -250,21 +250,23 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
 
             let len = sheet_data.len();
 
-            let first_row = sheet_data.get(0);
-            let num_columns = if let Some(first_row) = first_row {
-                first_row.len()
-            } else {
-                0
-            };
+            // Calculate visible column indices
+            let visible_col_indices: Vec<usize> = columns
+                .iter()
+                .enumerate()
+                .filter(|(_, h)| h.visible)
+                .map(|(i, _)| i)
+                .collect();
 
-            let col_len = columns.len();
+            let num_visible_columns = visible_col_indices.len();
 
             let mut t = Table {
                 data: sheet_data,
-                num_columns,
+                num_columns: num_visible_columns,
                 columns: columns.as_mut(),
+                visible_col_indices,
                 num_rows: len as u64,
-                num_sticky_cols: if col_len > 0 { 1 } else { 0 },
+                num_sticky_cols: if num_visible_columns > 0 { 1 } else { 0 },
                 default_column: egui_table::Column::new(30.0)
                     .range(10.0..=500.0)
                     .resizable(true),

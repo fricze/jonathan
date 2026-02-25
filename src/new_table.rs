@@ -8,6 +8,8 @@ pub struct Table<'a> {
     pub data: &'a SheetVec,
     pub num_columns: usize,
     pub columns: &'a mut Vec<FileHeader>,
+    /// Maps visible column index to actual data column index
+    pub visible_col_indices: Vec<usize>,
     pub num_rows: u64,
     pub num_sticky_cols: usize,
     pub default_column: egui_table::Column,
@@ -30,22 +32,12 @@ impl<'a> Table<'a> {
     // }
 
     fn cell_content_ui(&mut self, row_nr: u64, col_nr: usize, ui: &mut egui::Ui) {
-        // assert!(
-        //     self.was_row_prefetched(row_nr),
-        //     "Was asked to show row {row_nr} which was not prefetched! This is a bug in egui_table."
-        // );
-
-        // let is_expanded = self
-        //     .is_row_expanded
-        //     .get(&row_nr)
-        //     .copied()
-        //     .unwrap_or_default();
-        // let expandedness = ui.ctx().animate_bool(Id::new(row_nr), is_expanded);
-        //
+        // Map visible column index to actual data column index
+        let actual_col = self.visible_col_indices.get(col_nr).copied().unwrap_or(col_nr);
 
         let row = self.data.get(row_nr as usize);
         if let Some(row) = row {
-            let cell = row.get(col_nr as usize);
+            let cell = row.get(actual_col);
             if let Some(cell_content) = cell {
                 let filter = self.filter;
 
@@ -152,6 +144,9 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
             ..
         } = cell_inf;
 
+        // Map visible column index to actual column index
+        let actual_col_index = self.visible_col_indices.get(*group_index).copied().unwrap_or(*group_index);
+
         let margin = 4;
 
         egui::Frame::NONE
@@ -189,7 +184,7 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
                         }
                     }
                 } else {
-                    let header = self.columns.get(group_index.clone());
+                    let header = self.columns.get(actual_col_index);
                     if let Some(header) = header {
                         let name = &header.name;
 
@@ -210,7 +205,7 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
                                 .iter_mut()
                                 .enumerate()
                                 .for_each(|(idx, header)| {
-                                    if idx == group_index.clone() {
+                                    if idx == actual_col_index {
                                         let new_sort = if let Some(sort) = header.sort {
                                             if sort == SortOrder::Asc {
                                                 SortOrder::Dsc
@@ -225,7 +220,7 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
 
                                         if let Err(e) = self.sender.send(UiMessage::SortSheet(
                                             self.filename.clone(),
-                                            (group_index.clone(), new_sort.clone()),
+                                            (actual_col_index, new_sort.clone()),
                                             self.tab_id,
                                         )) {
                                             println!("{:?}", e)
