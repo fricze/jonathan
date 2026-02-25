@@ -7,6 +7,8 @@ use std::thread;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::{self};
+mod menu;
+
 
 mod new_table;
 mod read_csv;
@@ -18,6 +20,11 @@ use crate::types::{Ping, SheetVec, SortOrder};
 use eframe::egui;
 use read_csv::open_csv_file;
 use types::{CsvTabViewer, MyApp, SheetTab, UiMessage};
+
+#[cfg(target_os = "macos")]
+use muda::MenuEvent;
+
+use menu::OPEN_FILE_ID;
 
 fn replace_fonts(ctx: &egui::Context) {
     // Start with the default fonts (we will be adding to them rather than replacing them).
@@ -83,6 +90,8 @@ fn main() -> eframe::Result {
                 files_list: vec![],
                 global_filter: "".to_string(),
                 filters: HashMap::new(),
+                #[cfg(target_os = "macos")]
+                menu_initialized: false,
             }))
         }),
     )
@@ -275,6 +284,35 @@ impl MyApp {
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        // Initialize macOS menu on first frame (after NSApp exists)
+        #[cfg(target_os = "macos")]
+        if !self.menu_initialized {
+            self.menu_initialized = true;
+            let menu = menu::build_menu();
+            menu.init_for_nsapp();
+            // Leak the menu to keep it alive for the app's lifetime
+            std::mem::forget(menu);
+        }
+
+        // Handle macOS menu events
+        #[cfg(target_os = "macos")]
+        if let Ok(event) = MenuEvent::receiver().try_recv() {
+            if event.id.as_ref() == OPEN_FILE_ID {
+                // Open file dialog
+                if let Some(path) = rfd::FileDialog::new()
+                    .add_filter("CSV", &["csv"])
+                    .pick_file()
+                {
+                    if let Some(path_str) = path.to_str() {
+                        let _ = self
+                            .worker_chan
+                            .0
+                            .send(UiMessage::OpenFile(path_str.to_string(), None));
+                    }
+                }
+            }
+        }
+
         while let Ok(ui_ping) = self.ui_chan.1.try_recv() {
             if ui_ping {
                 eprintln!("requested ui ping");
@@ -337,36 +375,36 @@ impl eframe::App for MyApp {
                 }
             });
 
-            ui.vertical(|ui| {
-                ui.add_space(4.0);
+            // ui.vertical(|ui| {
+            //     ui.add_space(4.0);
 
-                ui.horizontal_wrapped(|ui| {
-                    ui.label("Global filter");
+            //     ui.horizontal_wrapped(|ui| {
+            //         ui.label("Global filter");
 
-                    let filter = &self.global_filter.to_string();
-                    if ui.text_edit_singleline(&mut self.global_filter).changed() {
-                        if let Err(e) = &self
-                            .worker_chan
-                            .0
-                            .send(UiMessage::FilterGlobal(filter.to_string()))
-                        {
-                            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                        }
-                    }
+            //         let filter = &self.global_filter.to_string();
+            //         if ui.text_edit_singleline(&mut self.global_filter).changed() {
+            //             if let Err(e) = &self
+            //                 .worker_chan
+            //                 .0
+            //                 .send(UiMessage::FilterGlobal(filter.to_string()))
+            //             {
+            //                 eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+            //             }
+            //         }
 
-                    if ui.button("Clear (x)").clicked() {
-                        if let Err(e) = &self
-                            .worker_chan
-                            .0
-                            .send(UiMessage::FilterGlobal("".to_string()))
-                        {
-                            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                        }
-                    }
-                });
+            //         if ui.button("Clear (x)").clicked() {
+            //             if let Err(e) = &self
+            //                 .worker_chan
+            //                 .0
+            //                 .send(UiMessage::FilterGlobal("".to_string()))
+            //             {
+            //                 eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+            //             }
+            //         }
+            //     });
 
-                ui.add_space(4.0);
-            });
+            //     ui.add_space(4.0);
+            // });
         });
 
         DockArea::new(&mut self.tree)
