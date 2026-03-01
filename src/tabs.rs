@@ -265,6 +265,8 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
                 tab_id: tab_id,
                 filename: chosen_file.clone(),
                 filter: &filter,
+                editing_cell: &mut tab.editing_cell,
+                edit_buffer: &mut tab.edit_buffer,
             };
 
             t.ui(ui);

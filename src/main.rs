@@ -351,6 +351,42 @@ impl eframe::App for MyApp {
                     self.sort_current_sheet(ctx, filename, sort_order, tab_id);
                 }
                 UiMessage::OpenFile(file, tab) => self.load_file(ctx, file, tab),
+                UiMessage::EditCell(filename, tab_id, row_nr, actual_col, new_value) => {
+                    // Try to update the filtered/sorted view first (what the user sees)
+                    let updated = if let Some(filtered) =
+                        self.filtered_data.get_mut(&(filename.clone(), tab_id))
+                    {
+                        if let Some(record) = filtered.get_mut(row_nr as usize) {
+                            let mut fields: Vec<String> =
+                                record.iter().map(|s| s.to_string()).collect();
+                            if let Some(field) = fields.get_mut(actual_col) {
+                                *field = new_value.clone();
+                                *record = fields.iter().map(|s| s.as_str()).collect();
+                                true
+                            } else {
+                                false
+                            }
+                        } else {
+                            false
+                        }
+                    } else {
+                        false
+                    };
+
+                    // Fall back to the master data when no filtered view exists
+                    if !updated {
+                        if let Some(sheet) = self.sheets_data.get_mut(&filename) {
+                            if let Some(record) = sheet.get_mut(row_nr as usize) {
+                                let mut fields: Vec<String> =
+                                    record.iter().map(|s| s.to_string()).collect();
+                                if let Some(field) = fields.get_mut(actual_col) {
+                                    *field = new_value;
+                                    *record = fields.iter().map(|s| s.as_str()).collect();
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 

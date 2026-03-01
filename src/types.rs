@@ -31,6 +31,8 @@ pub enum UiMessage {
     FilterGlobal(Filter),
     SetSorted(SheetVec, String, TabId),
     SetMaster(SheetVec, String),
+    /// filename, tab_id, row_nr (in displayed data), actual col index, new value
+    EditCell(Filename, TabId, u64, usize, String),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -47,6 +49,9 @@ pub struct SheetTab {
     pub content_height: f32,
     pub chosen_file: String,
     pub columns: HashMap<Filename, Vec<FileHeader>>,
+    /// Currently edited cell: (row_nr, visible col index)
+    pub editing_cell: Option<(u64, usize)>,
+    pub edit_buffer: String,
 }
 
 pub type Chan<Msg> = (Sender<Msg>, Receiver<Msg>);

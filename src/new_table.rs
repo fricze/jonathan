@@ -1,6 +1,6 @@
 use std::{collections::BTreeMap, sync::mpsc::Sender};
 
-use egui::{Align2, Color32, Context, Id, Margin, NumExt as _, TextFormat};
+use egui::{Align2, Color32, Context, Id, Margin, NumExt as _, Sense, TextFormat};
 
 use crate::types::{FileHeader, Filename, SheetVec, SortOrder, TabId, UiMessage};
 
@@ -22,6 +22,8 @@ pub struct Table<'a> {
     pub filename: Filename,
     pub tab_id: TabId,
     pub filter: &'a str,
+    pub editing_cell: &'a mut Option<(u64, usize)>,
+    pub edit_buffer: &'a mut String,
 }
 
 impl<'a> Table<'a> {
@@ -35,6 +37,36 @@ impl<'a> Table<'a> {
         // Map visible column index to actual data column index
         let actual_col = self.visible_col_indices.get(col_nr).copied().unwrap_or(col_nr);
 
+        // --- Edit mode ---
+        if *self.editing_cell == Some((row_nr, col_nr)) {
+            let edit_id = Id::new(("cell_edit", row_nr, col_nr, self.tab_id));
+            let response = ui.add(
+                egui::TextEdit::singleline(self.edit_buffer)
+                    .id(edit_id)
+                    .desired_width(f32::INFINITY),
+            );
+            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
+            if response.lost_focus() {
+                if enter {
+                    if let Err(e) = self.sender.send(UiMessage::EditCell(
+                        self.filename.clone(),
+                        self.tab_id,
+                        row_nr,
+                        actual_col,
+                        self.edit_buffer.clone(),
+                    )) {
+                        eprintln!("Failed to send EditCell: {:?}", e);
+                    }
+                }
+                // Enter → commit, Escape/click-away → revert (buffer is discarded)
+                *self.editing_cell = None;
+            } else {
+                response.request_focus();
+            }
+            return;
+        }
+
+        // --- Display mode ---
         let row = self.data.get(row_nr as usize);
         if let Some(row) = row {
             let cell = row.get(actual_col);
@@ -42,7 +74,7 @@ impl<'a> Table<'a> {
                 let filter = self.filter;
 
                 let label = if filter.is_empty() {
-                    ui.label(cell_content)
+                    ui.add(egui::Label::new(cell_content).sense(Sense::click()))
                 } else {
                     use egui::text::LayoutJob;
 
@@ -59,7 +91,7 @@ impl<'a> Table<'a> {
                                 },
                             );
 
-                            ui.label(job)
+                            ui.add(egui::Label::new(job).sense(Sense::click()))
                         } else {
                             let text: Vec<&str> = cell_content.split(&filter).collect();
 
@@ -73,7 +105,7 @@ impl<'a> Table<'a> {
                                     },
                                 );
                                 job.append(text[0], 0.0, TextFormat::default());
-                                ui.label(job)
+                                ui.add(egui::Label::new(job).sense(Sense::click()))
                             } else if text.len() == 2 {
                                 job.append(text[0], 0.0, TextFormat::default());
                                 job.append(
@@ -86,17 +118,20 @@ impl<'a> Table<'a> {
                                 );
                                 job.append(text[1], 0.0, TextFormat::default());
 
-                                ui.label(job)
+                                ui.add(egui::Label::new(job).sense(Sense::click()))
                             } else {
-                                ui.label(job)
+                                ui.add(egui::Label::new(job).sense(Sense::click()))
                             }
                         }
                     } else {
-                        ui.label(cell_content)
+                        ui.add(egui::Label::new(cell_content).sense(Sense::click()))
                     }
                 };
 
-                if label.clicked() {
+                if label.double_clicked() {
+                    *self.editing_cell = Some((row_nr, col_nr));
+                    *self.edit_buffer = cell_content.to_string();
+                } else if label.clicked() {
                     if let Err(e) = self.sender.send(UiMessage::FilterSheet(
                         self.filename.to_string(),
                         cell_content.to_string(),
