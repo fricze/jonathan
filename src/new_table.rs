@@ -35,18 +35,21 @@ impl<'a> Table<'a> {
 
     fn cell_content_ui(&mut self, row_nr: u64, col_nr: usize, ui: &mut egui::Ui) {
         // Map visible column index to actual data column index
-        let actual_col = self.visible_col_indices.get(col_nr).copied().unwrap_or(col_nr);
+        let actual_col = self
+            .visible_col_indices
+            .get(col_nr)
+            .copied()
+            .unwrap_or(col_nr);
 
         // --- Edit mode ---
         if *self.editing_cell == Some((row_nr, col_nr)) {
             let edit_id = Id::new(("cell_edit", row_nr, col_nr, self.tab_id));
-            let response = ui.add(
-                egui::TextEdit::singleline(self.edit_buffer)
-                    .id(edit_id)
-                    .desired_width(f32::INFINITY),
-            );
+            let output = ui.text_edit_singleline(self.edit_buffer);
+            // .id(edit_id)
+            // .desired_width(f32::INFINITY)
+            // .show(ui);
             let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if response.lost_focus() {
+            if output.lost_focus() {
                 if enter {
                     if let Err(e) = self.sender.send(UiMessage::EditCell(
                         self.filename.clone(),
@@ -61,7 +64,7 @@ impl<'a> Table<'a> {
                 // Enter → commit, Escape/click-away → revert (buffer is discarded)
                 *self.editing_cell = None;
             } else {
-                response.request_focus();
+                output.request_focus();
             }
             return;
         }
@@ -131,7 +134,7 @@ impl<'a> Table<'a> {
                 if label.double_clicked() {
                     *self.editing_cell = Some((row_nr, col_nr));
                     *self.edit_buffer = cell_content.to_string();
-                } else if label.clicked() {
+                } else if label.clicked() && ui.ctx().input(|i| i.modifiers.command) {
                     if let Err(e) = self.sender.send(UiMessage::FilterSheet(
                         self.filename.to_string(),
                         cell_content.to_string(),
@@ -180,7 +183,11 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
         } = cell_inf;
 
         // Map visible column index to actual column index
-        let actual_col_index = self.visible_col_indices.get(*group_index).copied().unwrap_or(*group_index);
+        let actual_col_index = self
+            .visible_col_indices
+            .get(*group_index)
+            .copied()
+            .unwrap_or(*group_index);
 
         let margin = 4;
 

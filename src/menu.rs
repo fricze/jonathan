@@ -8,13 +8,21 @@ pub fn build_menu() -> Menu {
 
     // App menu (required for proper macOS behavior)
     let app_menu = Submenu::new("Jonathan", true);
-    app_menu.append(&PredefinedMenuItem::about(None, None)).unwrap();
+    app_menu
+        .append(&PredefinedMenuItem::about(None, None))
+        .unwrap();
     app_menu.append(&PredefinedMenuItem::separator()).unwrap();
-    app_menu.append(&PredefinedMenuItem::services(None)).unwrap();
+    app_menu
+        .append(&PredefinedMenuItem::services(None))
+        .unwrap();
     app_menu.append(&PredefinedMenuItem::separator()).unwrap();
     app_menu.append(&PredefinedMenuItem::hide(None)).unwrap();
-    app_menu.append(&PredefinedMenuItem::hide_others(None)).unwrap();
-    app_menu.append(&PredefinedMenuItem::show_all(None)).unwrap();
+    app_menu
+        .append(&PredefinedMenuItem::hide_others(None))
+        .unwrap();
+    app_menu
+        .append(&PredefinedMenuItem::show_all(None))
+        .unwrap();
     app_menu.append(&PredefinedMenuItem::separator()).unwrap();
     app_menu.append(&PredefinedMenuItem::quit(None)).unwrap();
 
@@ -24,27 +32,24 @@ pub fn build_menu() -> Menu {
     let file_menu = Submenu::new("File", true);
     file_menu.append(&open_item).unwrap();
     file_menu.append(&PredefinedMenuItem::separator()).unwrap();
-    file_menu.append(&PredefinedMenuItem::close_window(None)).unwrap();
-
-    // Edit menu (standard macOS copy/paste etc.)
-    let edit_menu = Submenu::new("Edit", true);
-    edit_menu.append(&PredefinedMenuItem::undo(None)).unwrap();
-    edit_menu.append(&PredefinedMenuItem::redo(None)).unwrap();
-    edit_menu.append(&PredefinedMenuItem::separator()).unwrap();
-    edit_menu.append(&PredefinedMenuItem::cut(None)).unwrap();
-    edit_menu.append(&PredefinedMenuItem::copy(None)).unwrap();
-    edit_menu.append(&PredefinedMenuItem::paste(None)).unwrap();
-    edit_menu.append(&PredefinedMenuItem::select_all(None)).unwrap();
+    file_menu
+        .append(&PredefinedMenuItem::close_window(None))
+        .unwrap();
 
     // Window menu
     let window_menu = Submenu::new("Window", true);
-    window_menu.append(&PredefinedMenuItem::minimize(None)).unwrap();
-    window_menu.append(&PredefinedMenuItem::maximize(None)).unwrap();
-    window_menu.append(&PredefinedMenuItem::fullscreen(None)).unwrap();
+    window_menu
+        .append(&PredefinedMenuItem::minimize(None))
+        .unwrap();
+    window_menu
+        .append(&PredefinedMenuItem::maximize(None))
+        .unwrap();
+    window_menu
+        .append(&PredefinedMenuItem::fullscreen(None))
+        .unwrap();
 
     menu.append(&app_menu).unwrap();
     menu.append(&file_menu).unwrap();
-    menu.append(&edit_menu).unwrap();
     menu.append(&window_menu).unwrap();
 
     menu
