@@ -24,6 +24,7 @@ pub struct Table<'a> {
     pub filter: &'a str,
     pub editing_cell: &'a mut Option<(u64, usize)>,
     pub edit_buffer: &'a mut String,
+    pub selected_cell: &'a mut Option<(u64, usize)>,
 }
 
 impl<'a> Table<'a> {
@@ -77,7 +78,12 @@ impl<'a> Table<'a> {
                 let filter = self.filter;
 
                 let label = if filter.is_empty() {
-                    ui.add(egui::Label::new(cell_content).sense(Sense::click()))
+                    ui.add_sized(
+                        ui.available_size(),
+                        egui::Label::new(cell_content)
+                            .sense(Sense::click())
+                            .extend(),
+                    )
                 } else {
                     use egui::text::LayoutJob;
 
@@ -94,7 +100,7 @@ impl<'a> Table<'a> {
                                 },
                             );
 
-                            ui.add(egui::Label::new(job).sense(Sense::click()))
+                            ui.add(egui::Label::new(job).sense(Sense::click()).extend())
                         } else {
                             let text: Vec<&str> = cell_content.split(&filter).collect();
 
@@ -108,7 +114,7 @@ impl<'a> Table<'a> {
                                     },
                                 );
                                 job.append(text[0], 0.0, TextFormat::default());
-                                ui.add(egui::Label::new(job).sense(Sense::click()))
+                                ui.add(egui::Label::new(job).sense(Sense::click()).extend())
                             } else if text.len() == 2 {
                                 job.append(text[0], 0.0, TextFormat::default());
                                 job.append(
@@ -121,15 +127,37 @@ impl<'a> Table<'a> {
                                 );
                                 job.append(text[1], 0.0, TextFormat::default());
 
-                                ui.add(egui::Label::new(job).sense(Sense::click()))
+                                ui.add(egui::Label::new(job).sense(Sense::click()).extend())
                             } else {
-                                ui.add(egui::Label::new(job).sense(Sense::click()))
+                                ui.add(egui::Label::new(job).sense(Sense::click()).extend())
                             }
                         }
                     } else {
-                        ui.add(egui::Label::new(cell_content).sense(Sense::click()))
+                        // ui.add(
+                        //     egui::Label::new(cell_content)
+                        //         .sense(Sense::click())
+                        //         .extend(),
+                        // )
+
+                        ui.add_sized(
+                            ui.available_size(),
+                            egui::Label::new(cell_content)
+                                .sense(Sense::click())
+                                .extend(),
+                        )
+
+                        // ui.label(cell_content)
                     }
                 };
+
+                if *self.selected_cell == Some((row_nr, col_nr)) {
+                    ui.painter().rect_stroke(
+                        label.rect,
+                        0.0,
+                        egui::Stroke::new(2.0, Color32::GREEN),
+                        egui::StrokeKind::Outside,
+                    );
+                }
 
                 if label.double_clicked() {
                     *self.editing_cell = Some((row_nr, col_nr));
@@ -143,6 +171,8 @@ impl<'a> Table<'a> {
                     )) {
                         eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
                     }
+                } else if label.clicked() {
+                    *self.selected_cell = Some((row_nr, col_nr));
                 }
             }
         }
