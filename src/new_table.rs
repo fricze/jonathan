@@ -26,6 +26,7 @@ pub struct Table<'a> {
     pub edit_buffer: &'a mut String,
     pub selected_cells: &'a mut HashSet<(u64, usize)>,
     pub anchor_cell: &'a mut Option<(u64, usize)>,
+    pub drag_origin: &'a mut Option<(u64, usize)>,
 }
 
 impl<'a> Table<'a> {
@@ -313,8 +314,33 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
         let cell_response = ui.interact(
             cell_rect,
             Id::new(("cell", row_nr, col_nr, self.tab_id)),
-            Sense::click(),
+            Sense::click_and_drag(),
         );
+
+        if cell_response.drag_started() {
+            *self.drag_origin = Some((row_nr, col_nr));
+            *self.anchor_cell = Some((row_nr, col_nr));
+            self.selected_cells.clear();
+            self.selected_cells.insert((row_nr, col_nr));
+        } else if self.drag_origin.is_some() && ui.input(|i| i.pointer.is_decidedly_dragging()) {
+            if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
+                if cell_rect.contains(pos) {
+                    if let Some((origin_row, origin_col)) = *self.drag_origin {
+                        let row_min = origin_row.min(row_nr);
+                        let row_max = origin_row.max(row_nr);
+                        let col_min = origin_col.min(col_nr);
+                        let col_max = origin_col.max(col_nr);
+                        self.selected_cells.clear();
+                        for r in row_min..=row_max {
+                            for c in col_min..=col_max {
+                                self.selected_cells.insert((r, c));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         if cell_response.double_clicked() {
             let actual_col = self.visible_col_indices.get(col_nr).copied().unwrap_or(col_nr);
             if let Some(content) = self.data.get(row_nr as usize).and_then(|r| r.get(actual_col)) {
@@ -392,6 +418,10 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
 impl<'a> Table<'a> {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let mut scroll_to_row: Option<u64> = None;
+
+        if ui.input(|i| i.pointer.any_released()) {
+            *self.drag_origin = None;
+        }
 
         if let Some((row_nr, col_nr)) = *self.anchor_cell {
             let pressed_up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));

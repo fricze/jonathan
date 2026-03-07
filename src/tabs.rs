@@ -269,6 +269,7 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
                 edit_buffer: &mut tab.edit_buffer,
                 selected_cells: &mut tab.selected_cells,
                 anchor_cell: &mut tab.anchor_cell,
+                drag_origin: &mut tab.drag_origin,
             };
 
             t.ui(ui);
