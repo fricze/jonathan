@@ -45,10 +45,11 @@ impl<'a> Table<'a> {
         // --- Edit mode ---
         if *self.editing_cell == Some((row_nr, col_nr)) {
             let edit_id = Id::new(("cell_edit", row_nr, col_nr, self.tab_id));
-            let output = ui.text_edit_singleline(self.edit_buffer);
-            // .id(edit_id)
-            // .desired_width(f32::INFINITY)
-            // .show(ui);
+            let output = egui::TextEdit::singleline(self.edit_buffer)
+                .margin(egui::Margin::ZERO)
+                .frame(false)
+                .show(ui)
+                .response;
             let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
             if output.lost_focus() {
                 if enter {
