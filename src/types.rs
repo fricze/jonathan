@@ -56,6 +56,8 @@ pub struct SheetTab {
     pub selected_cells: HashSet<(u64, usize)>,
     /// Anchor cell for keyboard navigation and shift-range selection
     pub anchor_cell: Option<(u64, usize)>,
+    /// Movable end of the selection rectangle when shift+arrow extending
+    pub selection_end: Option<(u64, usize)>,
     /// Cell where a drag-select started
     pub drag_origin: Option<(u64, usize)>,
 }

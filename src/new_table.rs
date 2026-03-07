@@ -26,6 +26,7 @@ pub struct Table<'a> {
     pub edit_buffer: &'a mut String,
     pub selected_cells: &'a mut HashSet<(u64, usize)>,
     pub anchor_cell: &'a mut Option<(u64, usize)>,
+    pub selection_end: &'a mut Option<(u64, usize)>,
     pub drag_origin: &'a mut Option<(u64, usize)>,
 }
 
@@ -320,6 +321,7 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
         if cell_response.drag_started() {
             *self.drag_origin = Some((row_nr, col_nr));
             *self.anchor_cell = Some((row_nr, col_nr));
+            *self.selection_end = None;
             self.selected_cells.clear();
             self.selected_cells.insert((row_nr, col_nr));
         } else if self.drag_origin.is_some() && ui.input(|i| i.pointer.is_decidedly_dragging()) {
@@ -336,6 +338,7 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
                                 self.selected_cells.insert((r, c));
                             }
                         }
+                        *self.selection_end = Some((row_nr, col_nr));
                     }
                 }
             }
@@ -370,16 +373,19 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
                             self.selected_cells.insert((r, c));
                         }
                     }
+                    *self.selection_end = Some((row_nr, col_nr));
                 } else {
                     self.selected_cells.clear();
                     self.selected_cells.insert((row_nr, col_nr));
                     *self.anchor_cell = Some((row_nr, col_nr));
+                    *self.selection_end = None;
                 }
             } else {
                 // Plain click: single select
                 self.selected_cells.clear();
                 self.selected_cells.insert((row_nr, col_nr));
                 *self.anchor_cell = Some((row_nr, col_nr));
+                *self.selection_end = None;
             }
         }
 
@@ -423,7 +429,8 @@ impl<'a> Table<'a> {
             *self.drag_origin = None;
         }
 
-        if let Some((row_nr, col_nr)) = *self.anchor_cell {
+        if let Some((anchor_row, anchor_col)) = *self.anchor_cell {
+            let shift = ui.input(|i| i.modifiers.shift);
             let pressed_up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
             let pressed_down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
             let pressed_left = ui.input(|i| i.key_pressed(egui::Key::ArrowLeft));
@@ -431,26 +438,46 @@ impl<'a> Table<'a> {
             let pressed_pgup = ui.input(|i| i.key_pressed(egui::Key::PageUp));
             let pressed_pgdown = ui.input(|i| i.key_pressed(egui::Key::PageDown));
 
-            let new_pos: Option<(u64, usize)> = if pressed_up && row_nr > 0 {
-                Some((row_nr - 1, col_nr))
-            } else if pressed_down && row_nr + 1 < self.num_rows {
-                Some((row_nr + 1, col_nr))
+            // The movable corner: selection_end when shift-extending, else anchor itself
+            let (cur_row, cur_col) = self.selection_end.unwrap_or((anchor_row, anchor_col));
+
+            let new_pos: Option<(u64, usize)> = if pressed_up && cur_row > 0 {
+                Some((cur_row - 1, cur_col))
+            } else if pressed_down && cur_row + 1 < self.num_rows {
+                Some((cur_row + 1, cur_col))
             } else if pressed_pgup {
-                Some((row_nr.saturating_sub(20), col_nr))
+                Some((cur_row.saturating_sub(20), cur_col))
             } else if pressed_pgdown {
-                Some(((row_nr + 20).min(self.num_rows - 1), col_nr))
-            } else if pressed_left && col_nr > 0 {
-                Some((row_nr, col_nr - 1))
-            } else if pressed_right && col_nr + 1 < self.num_columns {
-                Some((row_nr, col_nr + 1))
+                Some(((cur_row + 20).min(self.num_rows - 1), cur_col))
+            } else if pressed_left && cur_col > 0 {
+                Some((cur_row, cur_col - 1))
+            } else if pressed_right && cur_col + 1 < self.num_columns {
+                Some((cur_row, cur_col + 1))
             } else {
                 None
             };
 
             if let Some((new_row, new_col)) = new_pos {
-                *self.anchor_cell = Some((new_row, new_col));
-                self.selected_cells.clear();
-                self.selected_cells.insert((new_row, new_col));
+                if shift {
+                    // Extend selection rectangle from anchor to new end
+                    *self.selection_end = Some((new_row, new_col));
+                    let row_min = anchor_row.min(new_row);
+                    let row_max = anchor_row.max(new_row);
+                    let col_min = anchor_col.min(new_col);
+                    let col_max = anchor_col.max(new_col);
+                    self.selected_cells.clear();
+                    for r in row_min..=row_max {
+                        for c in col_min..=col_max {
+                            self.selected_cells.insert((r, c));
+                        }
+                    }
+                } else {
+                    // Plain navigation: move anchor, reset selection
+                    *self.anchor_cell = Some((new_row, new_col));
+                    *self.selection_end = None;
+                    self.selected_cells.clear();
+                    self.selected_cells.insert((new_row, new_col));
+                }
                 scroll_to_row = Some(new_row);
             }
         }
