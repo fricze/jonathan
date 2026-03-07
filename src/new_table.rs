@@ -357,6 +357,8 @@ impl<'a> Table<'a> {
         if let Some((row_nr, col_nr)) = *self.selected_cell {
             let pressed_up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
             let pressed_down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
+            let pressed_left = ui.input(|i| i.key_pressed(egui::Key::ArrowLeft));
+            let pressed_right = ui.input(|i| i.key_pressed(egui::Key::ArrowRight));
             if pressed_up && row_nr > 0 {
                 let new_row = row_nr - 1;
                 *self.selected_cell = Some((new_row, col_nr));
@@ -365,6 +367,10 @@ impl<'a> Table<'a> {
                 let new_row = row_nr + 1;
                 *self.selected_cell = Some((new_row, col_nr));
                 scroll_to_row = Some(new_row);
+            } else if pressed_left && col_nr > 0 {
+                *self.selected_cell = Some((row_nr, col_nr - 1));
+            } else if pressed_right && col_nr + 1 < self.num_columns {
+                *self.selected_cell = Some((row_nr, col_nr + 1));
             }
         }
 
