@@ -352,20 +352,26 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
 
 impl<'a> Table<'a> {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        let mut scroll_to_row: Option<u64> = None;
+
         if let Some((row_nr, col_nr)) = *self.selected_cell {
             let pressed_up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
             let pressed_down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
             if pressed_up && row_nr > 0 {
-                *self.selected_cell = Some((row_nr - 1, col_nr));
+                let new_row = row_nr - 1;
+                *self.selected_cell = Some((new_row, col_nr));
+                scroll_to_row = Some(new_row);
             } else if pressed_down && row_nr + 1 < self.num_rows {
-                *self.selected_cell = Some((row_nr + 1, col_nr));
+                let new_row = row_nr + 1;
+                *self.selected_cell = Some((new_row, col_nr));
+                scroll_to_row = Some(new_row);
             }
         }
 
         let id_salt = Id::new("table_demo");
         let state_id = egui_table::Table::new().id_salt(id_salt).get_id(ui); // Note: must be here (in the correct outer `ui` scope) to be correct.
 
-        let table = egui_table::Table::new()
+        let mut table = egui_table::Table::new()
             .id_salt(id_salt)
             .num_rows(self.num_rows)
             .columns(vec![self.default_column; self.num_columns])
@@ -382,6 +388,10 @@ impl<'a> Table<'a> {
                 egui_table::HeaderRow::new(self.top_row_height),
             ])
             .auto_size_mode(self.auto_size_mode);
+
+        if let Some(row) = scroll_to_row {
+            table = table.scroll_to_row(row, None);
+        }
 
         table.show(ui, self);
     }
