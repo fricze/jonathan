@@ -359,12 +359,22 @@ impl<'a> Table<'a> {
             let pressed_down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
             let pressed_left = ui.input(|i| i.key_pressed(egui::Key::ArrowLeft));
             let pressed_right = ui.input(|i| i.key_pressed(egui::Key::ArrowRight));
+            let pressed_pgup = ui.input(|i| i.key_pressed(egui::Key::PageUp));
+            let pressed_pgdown = ui.input(|i| i.key_pressed(egui::Key::PageDown));
             if pressed_up && row_nr > 0 {
                 let new_row = row_nr - 1;
                 *self.selected_cell = Some((new_row, col_nr));
                 scroll_to_row = Some(new_row);
             } else if pressed_down && row_nr + 1 < self.num_rows {
                 let new_row = row_nr + 1;
+                *self.selected_cell = Some((new_row, col_nr));
+                scroll_to_row = Some(new_row);
+            } else if pressed_pgup {
+                let new_row = row_nr.saturating_sub(20);
+                *self.selected_cell = Some((new_row, col_nr));
+                scroll_to_row = Some(new_row);
+            } else if pressed_pgdown {
+                let new_row = (row_nr + 20).min(self.num_rows - 1);
                 *self.selected_cell = Some((new_row, col_nr));
                 scroll_to_row = Some(new_row);
             } else if pressed_left && col_nr > 0 {
