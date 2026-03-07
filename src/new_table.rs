@@ -78,8 +78,7 @@ impl<'a> Table<'a> {
                 let filter = self.filter;
 
                 let label = if filter.is_empty() {
-                    ui.add_sized(
-                        ui.available_size(),
+                    ui.add(
                         egui::Label::new(cell_content)
                             .sense(Sense::click())
                             .extend(),
@@ -139,8 +138,7 @@ impl<'a> Table<'a> {
                         //         .extend(),
                         // )
 
-                        ui.add_sized(
-                            ui.available_size(),
+                        ui.add(
                             egui::Label::new(cell_content)
                                 .sense(Sense::click())
                                 .extend(),
@@ -150,19 +148,7 @@ impl<'a> Table<'a> {
                     }
                 };
 
-                if *self.selected_cell == Some((row_nr, col_nr)) {
-                    ui.painter().rect_stroke(
-                        label.rect,
-                        0.0,
-                        egui::Stroke::new(2.0, Color32::GREEN),
-                        egui::StrokeKind::Outside,
-                    );
-                }
-
-                if label.double_clicked() {
-                    *self.editing_cell = Some((row_nr, col_nr));
-                    *self.edit_buffer = cell_content.to_string();
-                } else if label.clicked() && ui.ctx().input(|i| i.modifiers.command) {
+                if label.clicked() && ui.ctx().input(|i| i.modifiers.command) {
                     if let Err(e) = self.sender.send(UiMessage::FilterSheet(
                         self.filename.to_string(),
                         cell_content.to_string(),
@@ -171,8 +157,6 @@ impl<'a> Table<'a> {
                     )) {
                         eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
                     }
-                } else if label.clicked() {
-                    *self.selected_cell = Some((row_nr, col_nr));
                 }
             }
         }
@@ -316,11 +300,40 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
                 .rect_filled(ui.max_rect(), 0.0, ui.visuals().faint_bg_color);
         }
 
+        let cell_rect = ui.max_rect();
+
         egui::Frame::NONE
             .inner_margin(Margin::symmetric(4, 0))
             .show(ui, |ui| {
                 self.cell_content_ui(row_nr, col_nr, ui);
             });
+
+        let cell_response = ui.interact(
+            cell_rect,
+            Id::new(("cell", row_nr, col_nr, self.tab_id)),
+            Sense::click(),
+        );
+        if cell_response.double_clicked() {
+            let actual_col = self.visible_col_indices.get(col_nr).copied().unwrap_or(col_nr);
+            if let Some(content) = self.data.get(row_nr as usize).and_then(|r| r.get(actual_col)) {
+                *self.editing_cell = Some((row_nr, col_nr));
+                *self.edit_buffer = content.to_string();
+            }
+        } else if cell_response.clicked() {
+            *self.selected_cell = Some((row_nr, col_nr));
+        }
+
+        if *self.selected_cell == Some((row_nr, col_nr)) {
+            let stroke = egui::Stroke::new(2.0, Color32::GREEN);
+            let dash = 4.0;
+            let gap = 3.0;
+            let r = cell_rect;
+            let painter = ui.painter();
+            painter.extend(egui::Shape::dashed_line(&[r.left_top(), r.right_top()], stroke, dash, gap));
+            painter.extend(egui::Shape::dashed_line(&[r.right_top(), r.right_bottom()], stroke, dash, gap));
+            painter.extend(egui::Shape::dashed_line(&[r.right_bottom(), r.left_bottom()], stroke, dash, gap));
+            painter.extend(egui::Shape::dashed_line(&[r.left_bottom(), r.left_top()], stroke, dash, gap));
+        }
     }
 
     fn row_top_offset(&self, ctx: &Context, _table_id: Id, row_nr: u64) -> f32 {
@@ -339,6 +352,16 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
 
 impl<'a> Table<'a> {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
+        if let Some((row_nr, col_nr)) = *self.selected_cell {
+            let pressed_up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
+            let pressed_down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
+            if pressed_up && row_nr > 0 {
+                *self.selected_cell = Some((row_nr - 1, col_nr));
+            } else if pressed_down && row_nr + 1 < self.num_rows {
+                *self.selected_cell = Some((row_nr + 1, col_nr));
+            }
+        }
+
         let id_salt = Id::new("table_demo");
         let state_id = egui_table::Table::new().id_salt(id_salt).get_id(ui); // Note: must be here (in the correct outer `ui` scope) to be correct.
 
