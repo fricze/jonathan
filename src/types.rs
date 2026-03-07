@@ -1,7 +1,7 @@
 use csv::StringRecord;
 use egui::Context;
 use egui_dock::{DockState, NodeIndex, SurfaceIndex};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -52,8 +52,10 @@ pub struct SheetTab {
     /// Currently edited cell: (row_nr, visible col index)
     pub editing_cell: Option<(u64, usize)>,
     pub edit_buffer: String,
-    /// Currently selected cell: (row_nr, visible col index)
-    pub selected_cell: Option<(u64, usize)>,
+    /// All selected cells: (row_nr, visible col index)
+    pub selected_cells: HashSet<(u64, usize)>,
+    /// Anchor cell for keyboard navigation and shift-range selection
+    pub anchor_cell: Option<(u64, usize)>,
 }
 
 pub type Chan<Msg> = (Sender<Msg>, Receiver<Msg>);

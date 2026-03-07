@@ -1,4 +1,4 @@
-use std::{collections::BTreeMap, sync::mpsc::Sender};
+use std::{collections::{BTreeMap, HashSet}, sync::mpsc::Sender};
 
 use egui::{Align2, Color32, Context, Id, Margin, NumExt as _, Sense, TextFormat};
 
@@ -24,7 +24,8 @@ pub struct Table<'a> {
     pub filter: &'a str,
     pub editing_cell: &'a mut Option<(u64, usize)>,
     pub edit_buffer: &'a mut String,
-    pub selected_cell: &'a mut Option<(u64, usize)>,
+    pub selected_cells: &'a mut HashSet<(u64, usize)>,
+    pub anchor_cell: &'a mut Option<(u64, usize)>,
 }
 
 impl<'a> Table<'a> {
@@ -321,19 +322,56 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
                 *self.edit_buffer = content.to_string();
             }
         } else if cell_response.clicked() {
-            *self.selected_cell = Some((row_nr, col_nr));
+            let modifiers = ui.ctx().input(|i| i.modifiers);
+            if modifiers.command {
+                // Cmd/Ctrl+click: toggle this cell
+                if self.selected_cells.contains(&(row_nr, col_nr)) {
+                    self.selected_cells.remove(&(row_nr, col_nr));
+                } else {
+                    self.selected_cells.insert((row_nr, col_nr));
+                }
+                *self.anchor_cell = Some((row_nr, col_nr));
+            } else if modifiers.shift {
+                // Shift+click: select rectangle from anchor to this cell
+                if let Some((anchor_row, anchor_col)) = *self.anchor_cell {
+                    let row_min = anchor_row.min(row_nr);
+                    let row_max = anchor_row.max(row_nr);
+                    let col_min = anchor_col.min(col_nr);
+                    let col_max = anchor_col.max(col_nr);
+                    self.selected_cells.clear();
+                    for r in row_min..=row_max {
+                        for c in col_min..=col_max {
+                            self.selected_cells.insert((r, c));
+                        }
+                    }
+                } else {
+                    self.selected_cells.clear();
+                    self.selected_cells.insert((row_nr, col_nr));
+                    *self.anchor_cell = Some((row_nr, col_nr));
+                }
+            } else {
+                // Plain click: single select
+                self.selected_cells.clear();
+                self.selected_cells.insert((row_nr, col_nr));
+                *self.anchor_cell = Some((row_nr, col_nr));
+            }
         }
 
-        if *self.selected_cell == Some((row_nr, col_nr)) {
+        if self.selected_cells.contains(&(row_nr, col_nr)) {
+            ui.painter().rect_filled(cell_rect, 0.0, Color32::from_rgba_unmultiplied(0, 200, 80, 30));
             let stroke = egui::Stroke::new(2.0, Color32::GREEN);
             let dash = 4.0;
             let gap = 3.0;
             let r = cell_rect;
             let painter = ui.painter();
-            painter.extend(egui::Shape::dashed_line(&[r.left_top(), r.right_top()], stroke, dash, gap));
-            painter.extend(egui::Shape::dashed_line(&[r.right_top(), r.right_bottom()], stroke, dash, gap));
-            painter.extend(egui::Shape::dashed_line(&[r.right_bottom(), r.left_bottom()], stroke, dash, gap));
-            painter.extend(egui::Shape::dashed_line(&[r.left_bottom(), r.left_top()], stroke, dash, gap));
+            let no_top = row_nr > 0 && self.selected_cells.contains(&(row_nr - 1, col_nr));
+            let no_bottom = self.selected_cells.contains(&(row_nr + 1, col_nr));
+            let no_left = col_nr > 0 && self.selected_cells.contains(&(row_nr, col_nr - 1));
+            let no_right = self.selected_cells.contains(&(row_nr, col_nr + 1));
+            if !no_top    { painter.extend(egui::Shape::dashed_line(&[r.left_top(),     r.right_top()],    stroke, dash, gap)); }
+            if !no_right  { painter.extend(egui::Shape::dashed_line(&[r.right_top(),    r.right_bottom()], stroke, dash, gap)); }
+            if !no_bottom { painter.extend(egui::Shape::dashed_line(&[r.right_bottom(), r.left_bottom()],  stroke, dash, gap)); }
+            if !no_left   { painter.extend(egui::Shape::dashed_line(&[r.left_bottom(),  r.left_top()],     stroke, dash, gap)); }
         }
     }
 
@@ -355,33 +393,35 @@ impl<'a> Table<'a> {
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let mut scroll_to_row: Option<u64> = None;
 
-        if let Some((row_nr, col_nr)) = *self.selected_cell {
+        if let Some((row_nr, col_nr)) = *self.anchor_cell {
             let pressed_up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
             let pressed_down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
             let pressed_left = ui.input(|i| i.key_pressed(egui::Key::ArrowLeft));
             let pressed_right = ui.input(|i| i.key_pressed(egui::Key::ArrowRight));
             let pressed_pgup = ui.input(|i| i.key_pressed(egui::Key::PageUp));
             let pressed_pgdown = ui.input(|i| i.key_pressed(egui::Key::PageDown));
-            if pressed_up && row_nr > 0 {
-                let new_row = row_nr - 1;
-                *self.selected_cell = Some((new_row, col_nr));
-                scroll_to_row = Some(new_row);
+
+            let new_pos: Option<(u64, usize)> = if pressed_up && row_nr > 0 {
+                Some((row_nr - 1, col_nr))
             } else if pressed_down && row_nr + 1 < self.num_rows {
-                let new_row = row_nr + 1;
-                *self.selected_cell = Some((new_row, col_nr));
-                scroll_to_row = Some(new_row);
+                Some((row_nr + 1, col_nr))
             } else if pressed_pgup {
-                let new_row = row_nr.saturating_sub(20);
-                *self.selected_cell = Some((new_row, col_nr));
-                scroll_to_row = Some(new_row);
+                Some((row_nr.saturating_sub(20), col_nr))
             } else if pressed_pgdown {
-                let new_row = (row_nr + 20).min(self.num_rows - 1);
-                *self.selected_cell = Some((new_row, col_nr));
-                scroll_to_row = Some(new_row);
+                Some(((row_nr + 20).min(self.num_rows - 1), col_nr))
             } else if pressed_left && col_nr > 0 {
-                *self.selected_cell = Some((row_nr, col_nr - 1));
+                Some((row_nr, col_nr - 1))
             } else if pressed_right && col_nr + 1 < self.num_columns {
-                *self.selected_cell = Some((row_nr, col_nr + 1));
+                Some((row_nr, col_nr + 1))
+            } else {
+                None
+            };
+
+            if let Some((new_row, new_col)) = new_pos {
+                *self.anchor_cell = Some((new_row, new_col));
+                self.selected_cells.clear();
+                self.selected_cells.insert((new_row, new_col));
+                scroll_to_row = Some(new_row);
             }
         }
 

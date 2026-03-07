@@ -267,7 +267,8 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
                 filter: &filter,
                 editing_cell: &mut tab.editing_cell,
                 edit_buffer: &mut tab.edit_buffer,
-                selected_cell: &mut tab.selected_cell,
+                selected_cells: &mut tab.selected_cells,
+                anchor_cell: &mut tab.anchor_cell,
             };
 
             t.ui(ui);
