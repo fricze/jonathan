@@ -267,10 +267,7 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
                 filter: &filter,
                 editing_cell: &mut tab.editing_cell,
                 edit_buffer: &mut tab.edit_buffer,
-                selected_cells: &mut tab.selected_cells,
-                anchor_cell: &mut tab.anchor_cell,
-                selection_end: &mut tab.selection_end,
-                drag_origin: &mut tab.drag_origin,
+                selection: &mut tab.selection,
                 last_visible_rows: &mut tab.last_visible_rows,
             };
 

@@ -42,6 +42,94 @@ pub enum SortOrder {
 }
 
 #[derive(Default)]
+pub struct SelectionState {
+    pub selected_cells: HashSet<(u64, usize)>,
+    /// Fixed corner for range operations (keyboard nav, shift+click, drag)
+    pub anchor_cell: Option<(u64, usize)>,
+    /// Movable corner of the selection rectangle
+    pub selection_end: Option<(u64, usize)>,
+    /// Cell where a drag-select started
+    pub drag_origin: Option<(u64, usize)>,
+}
+
+impl SelectionState {
+    /// The current movable corner: `selection_end` if set, otherwise `anchor_cell`.
+    pub fn cursor(&self) -> Option<(u64, usize)> {
+        self.selection_end.or(self.anchor_cell)
+    }
+
+    pub fn contains(&self, row: u64, col: usize) -> bool {
+        self.selected_cells.contains(&(row, col))
+    }
+
+    pub fn is_dragging(&self) -> bool {
+        self.drag_origin.is_some()
+    }
+
+    /// Clear everything and select a single cell, resetting the anchor.
+    pub fn select_single(&mut self, row: u64, col: usize) {
+        self.selected_cells.clear();
+        self.selected_cells.insert((row, col));
+        self.anchor_cell = Some((row, col));
+        self.selection_end = None;
+    }
+
+    /// Toggle a cell in/out of the selection; updates anchor but keeps other cells.
+    pub fn toggle(&mut self, row: u64, col: usize) {
+        if self.selected_cells.contains(&(row, col)) {
+            self.selected_cells.remove(&(row, col));
+        } else {
+            self.selected_cells.insert((row, col));
+        }
+        self.anchor_cell = Some((row, col));
+    }
+
+    /// Fill the rectangle from `anchor_cell` to `(row, col)` and update `selection_end`.
+    /// Falls back to `select_single` if there is no anchor yet.
+    pub fn extend_to(&mut self, row: u64, col: usize) {
+        if let Some((anchor_row, anchor_col)) = self.anchor_cell {
+            self.fill_rect(anchor_row, anchor_col, row, col);
+            self.selection_end = Some((row, col));
+        } else {
+            self.select_single(row, col);
+        }
+    }
+
+    pub fn start_drag(&mut self, row: u64, col: usize) {
+        self.drag_origin = Some((row, col));
+        self.anchor_cell = Some((row, col));
+        self.selection_end = None;
+        self.selected_cells.clear();
+        self.selected_cells.insert((row, col));
+    }
+
+    /// Extend the drag rectangle from `drag_origin` to `(row, col)`.
+    pub fn update_drag(&mut self, row: u64, col: usize) {
+        if let Some((origin_row, origin_col)) = self.drag_origin {
+            self.fill_rect(origin_row, origin_col, row, col);
+            self.selection_end = Some((row, col));
+        }
+    }
+
+    pub fn end_drag(&mut self) {
+        self.drag_origin = None;
+    }
+
+    fn fill_rect(&mut self, r1: u64, c1: usize, r2: u64, c2: usize) {
+        let row_min = r1.min(r2);
+        let row_max = r1.max(r2);
+        let col_min = c1.min(c2);
+        let col_max = c1.max(c2);
+        self.selected_cells.clear();
+        for r in row_min..=row_max {
+            for c in col_min..=col_max {
+                self.selected_cells.insert((r, c));
+            }
+        }
+    }
+}
+
+#[derive(Default)]
 pub struct SheetTab {
     pub id: usize,
     pub scroll_y: f32,
@@ -52,14 +140,7 @@ pub struct SheetTab {
     /// Currently edited cell: (row_nr, visible col index)
     pub editing_cell: Option<(u64, usize)>,
     pub edit_buffer: String,
-    /// All selected cells: (row_nr, visible col index)
-    pub selected_cells: HashSet<(u64, usize)>,
-    /// Anchor cell for keyboard navigation and shift-range selection
-    pub anchor_cell: Option<(u64, usize)>,
-    /// Movable end of the selection rectangle when shift+arrow extending
-    pub selection_end: Option<(u64, usize)>,
-    /// Cell where a drag-select started
-    pub drag_origin: Option<(u64, usize)>,
+    pub selection: SelectionState,
     /// Last known visible row range (from previous frame's prepare())
     pub last_visible_rows: Option<std::ops::Range<u64>>,
 }

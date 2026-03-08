@@ -9,7 +9,6 @@ use std::path::PathBuf;
 use std::sync::mpsc::{self};
 mod menu;
 
-
 mod new_table;
 mod read_csv;
 mod tabs;
@@ -407,37 +406,6 @@ impl eframe::App for MyApp {
                     }
                 }
             });
-
-            // ui.vertical(|ui| {
-            //     ui.add_space(4.0);
-
-            //     ui.horizontal_wrapped(|ui| {
-            //         ui.label("Global filter");
-
-            //         let filter = &self.global_filter.to_string();
-            //         if ui.text_edit_singleline(&mut self.global_filter).changed() {
-            //             if let Err(e) = &self
-            //                 .worker_chan
-            //                 .0
-            //                 .send(UiMessage::FilterGlobal(filter.to_string()))
-            //             {
-            //                 eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-            //             }
-            //         }
-
-            //         if ui.button("Clear (x)").clicked() {
-            //             if let Err(e) = &self
-            //                 .worker_chan
-            //                 .0
-            //                 .send(UiMessage::FilterGlobal("".to_string()))
-            //             {
-            //                 eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-            //             }
-            //         }
-            //     });
-
-            //     ui.add_space(4.0);
-            // });
         });
 
         DockArea::new(&mut self.tree)

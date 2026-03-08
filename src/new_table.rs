@@ -1,8 +1,8 @@
-use std::{collections::{BTreeMap, HashSet}, sync::mpsc::Sender};
+use std::{collections::BTreeMap, sync::mpsc::Sender};
 
 use egui::{Align2, Color32, Context, Id, Margin, NumExt as _, Sense, TextFormat};
 
-use crate::types::{FileHeader, Filename, SheetVec, SortOrder, TabId, UiMessage};
+use crate::types::{FileHeader, Filename, SelectionState, SheetVec, SortOrder, TabId, UiMessage};
 
 pub struct Table<'a> {
     pub data: &'a SheetVec,
@@ -24,10 +24,7 @@ pub struct Table<'a> {
     pub filter: &'a str,
     pub editing_cell: &'a mut Option<(u64, usize)>,
     pub edit_buffer: &'a mut String,
-    pub selected_cells: &'a mut HashSet<(u64, usize)>,
-    pub anchor_cell: &'a mut Option<(u64, usize)>,
-    pub selection_end: &'a mut Option<(u64, usize)>,
-    pub drag_origin: &'a mut Option<(u64, usize)>,
+    pub selection: &'a mut SelectionState,
     pub last_visible_rows: &'a mut Option<std::ops::Range<u64>>,
 }
 
@@ -325,27 +322,11 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
         );
 
         if cell_response.drag_started() {
-            *self.drag_origin = Some((row_nr, col_nr));
-            *self.anchor_cell = Some((row_nr, col_nr));
-            *self.selection_end = None;
-            self.selected_cells.clear();
-            self.selected_cells.insert((row_nr, col_nr));
-        } else if self.drag_origin.is_some() && ui.input(|i| i.pointer.is_decidedly_dragging()) {
+            self.selection.start_drag(row_nr, col_nr);
+        } else if self.selection.is_dragging() && ui.input(|i| i.pointer.is_decidedly_dragging()) {
             if let Some(pos) = ui.input(|i| i.pointer.latest_pos()) {
                 if cell_rect.contains(pos) {
-                    if let Some((origin_row, origin_col)) = *self.drag_origin {
-                        let row_min = origin_row.min(row_nr);
-                        let row_max = origin_row.max(row_nr);
-                        let col_min = origin_col.min(col_nr);
-                        let col_max = origin_col.max(col_nr);
-                        self.selected_cells.clear();
-                        for r in row_min..=row_max {
-                            for c in col_min..=col_max {
-                                self.selected_cells.insert((r, c));
-                            }
-                        }
-                        *self.selection_end = Some((row_nr, col_nr));
-                    }
+                    self.selection.update_drag(row_nr, col_nr);
                 }
             }
         }
@@ -359,43 +340,15 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
         } else if cell_response.clicked() {
             let modifiers = ui.ctx().input(|i| i.modifiers);
             if modifiers.command {
-                // Cmd/Ctrl+click: toggle this cell
-                if self.selected_cells.contains(&(row_nr, col_nr)) {
-                    self.selected_cells.remove(&(row_nr, col_nr));
-                } else {
-                    self.selected_cells.insert((row_nr, col_nr));
-                }
-                *self.anchor_cell = Some((row_nr, col_nr));
+                self.selection.toggle(row_nr, col_nr);
             } else if modifiers.shift {
-                // Shift+click: select rectangle from anchor to this cell
-                if let Some((anchor_row, anchor_col)) = *self.anchor_cell {
-                    let row_min = anchor_row.min(row_nr);
-                    let row_max = anchor_row.max(row_nr);
-                    let col_min = anchor_col.min(col_nr);
-                    let col_max = anchor_col.max(col_nr);
-                    self.selected_cells.clear();
-                    for r in row_min..=row_max {
-                        for c in col_min..=col_max {
-                            self.selected_cells.insert((r, c));
-                        }
-                    }
-                    *self.selection_end = Some((row_nr, col_nr));
-                } else {
-                    self.selected_cells.clear();
-                    self.selected_cells.insert((row_nr, col_nr));
-                    *self.anchor_cell = Some((row_nr, col_nr));
-                    *self.selection_end = None;
-                }
+                self.selection.extend_to(row_nr, col_nr);
             } else {
-                // Plain click: single select
-                self.selected_cells.clear();
-                self.selected_cells.insert((row_nr, col_nr));
-                *self.anchor_cell = Some((row_nr, col_nr));
-                *self.selection_end = None;
+                self.selection.select_single(row_nr, col_nr);
             }
         }
 
-        if self.selected_cells.contains(&(row_nr, col_nr)) {
+        if self.selection.contains(row_nr, col_nr) {
             let is_editing = *self.editing_cell == Some((row_nr, col_nr));
             if !is_editing {
                 ui.painter().rect_filled(cell_rect, 0.0, Color32::from_rgba_unmultiplied(0, 200, 80, 15));
@@ -405,10 +358,10 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
             let gap = 3.0;
             let r = cell_rect;
             let painter = ui.painter();
-            let no_top = row_nr > 0 && self.selected_cells.contains(&(row_nr - 1, col_nr));
-            let no_bottom = self.selected_cells.contains(&(row_nr + 1, col_nr));
-            let no_left = col_nr > 0 && self.selected_cells.contains(&(row_nr, col_nr - 1));
-            let no_right = self.selected_cells.contains(&(row_nr, col_nr + 1));
+            let no_top    = row_nr > 0 && self.selection.contains(row_nr - 1, col_nr);
+            let no_bottom = self.selection.contains(row_nr + 1, col_nr);
+            let no_left   = col_nr > 0 && self.selection.contains(row_nr, col_nr - 1);
+            let no_right  = self.selection.contains(row_nr, col_nr + 1);
             if !no_top    { painter.extend(egui::Shape::dashed_line(&[r.left_top(),     r.right_top()],    stroke, dash, gap)); }
             if !no_right  { painter.extend(egui::Shape::dashed_line(&[r.right_top(),    r.right_bottom()], stroke, dash, gap)); }
             if !no_bottom { painter.extend(egui::Shape::dashed_line(&[r.right_bottom(), r.left_bottom()],  stroke, dash, gap)); }
@@ -435,10 +388,10 @@ impl<'a> Table<'a> {
         let mut scroll_to_row: Option<u64> = None;
 
         if ui.input(|i| i.pointer.any_released()) {
-            *self.drag_origin = None;
+            self.selection.end_drag();
         }
 
-        if let Some((anchor_row, anchor_col)) = *self.anchor_cell {
+        if let Some((anchor_row, anchor_col)) = self.selection.anchor_cell {
             let shift = ui.input(|i| i.modifiers.shift);
             let pressed_up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
             let pressed_down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
@@ -447,8 +400,7 @@ impl<'a> Table<'a> {
             let pressed_pgup = ui.input(|i| i.key_pressed(egui::Key::PageUp));
             let pressed_pgdown = ui.input(|i| i.key_pressed(egui::Key::PageDown));
 
-            // The movable corner: selection_end when shift-extending, else anchor itself
-            let (cur_row, cur_col) = self.selection_end.unwrap_or((anchor_row, anchor_col));
+            let (cur_row, cur_col) = self.selection.cursor().unwrap_or((anchor_row, anchor_col));
 
             let new_pos: Option<(u64, usize)> = if pressed_up && cur_row > 0 {
                 Some((cur_row - 1, cur_col))
@@ -468,41 +420,23 @@ impl<'a> Table<'a> {
 
             if let Some((new_row, new_col)) = new_pos {
                 if shift {
-                    // Extend selection rectangle from anchor to new end
-                    *self.selection_end = Some((new_row, new_col));
-                    let row_min = anchor_row.min(new_row);
-                    let row_max = anchor_row.max(new_row);
-                    let col_min = anchor_col.min(new_col);
-                    let col_max = anchor_col.max(new_col);
-                    self.selected_cells.clear();
-                    for r in row_min..=row_max {
-                        for c in col_min..=col_max {
-                            self.selected_cells.insert((r, c));
-                        }
-                    }
+                    self.selection.extend_to(new_row, new_col);
                 } else {
-                    // Plain navigation: move anchor, reset selection
-                    *self.anchor_cell = Some((new_row, new_col));
-                    *self.selection_end = None;
-                    self.selected_cells.clear();
-                    self.selected_cells.insert((new_row, new_col));
+                    self.selection.select_single(new_row, new_col);
                 }
                 scroll_to_row = Some(new_row);
             }
         }
 
         // Auto-scroll + selection extension when dragging near the top/bottom edge
-        if self.drag_origin.is_some() && ui.input(|i| i.pointer.is_decidedly_dragging()) {
+        if self.selection.is_dragging() && ui.input(|i| i.pointer.is_decidedly_dragging()) {
             if let (Some(pos), Some(vis)) = (
                 ui.input(|i| i.pointer.latest_pos()),
                 self.last_visible_rows.clone(),
             ) {
                 let rect = ui.clip_rect();
                 let edge_zone = 40.0;
-                let end_col = self.selection_end
-                    .or(*self.anchor_cell)
-                    .map(|(_, c)| c)
-                    .unwrap_or(0);
+                let end_col = self.selection.cursor().map(|(_, c)| c).unwrap_or(0);
 
                 let target_row = if pos.y < rect.min.y + edge_zone && vis.start > 0 {
                     Some(vis.start - 1)
@@ -515,19 +449,7 @@ impl<'a> Table<'a> {
                 if let Some(target_row) = target_row {
                     let target_row = target_row.min(self.num_rows - 1);
                     scroll_to_row = Some(target_row);
-                    if let Some((anchor_row, anchor_col)) = *self.anchor_cell {
-                        let row_min = anchor_row.min(target_row);
-                        let row_max = anchor_row.max(target_row);
-                        let col_min = anchor_col.min(end_col);
-                        let col_max = anchor_col.max(end_col);
-                        self.selected_cells.clear();
-                        for r in row_min..=row_max {
-                            for c in col_min..=col_max {
-                                self.selected_cells.insert((r, c));
-                            }
-                        }
-                        *self.selection_end = Some((target_row, end_col));
-                    }
+                    self.selection.extend_to(target_row, end_col);
                     ui.ctx().request_repaint();
                 }
             }
