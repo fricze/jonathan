@@ -306,6 +306,10 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
 
         let cell_rect = ui.max_rect();
 
+        if *self.editing_cell == Some((row_nr, col_nr)) {
+            ui.painter().rect_filled(cell_rect, 0.0, Color32::WHITE);
+        }
+
         egui::Frame::NONE
             .inner_margin(Margin::symmetric(4, 0))
             .show(ui, |ui| {
@@ -390,7 +394,10 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
         }
 
         if self.selected_cells.contains(&(row_nr, col_nr)) {
-            ui.painter().rect_filled(cell_rect, 0.0, Color32::from_rgba_unmultiplied(0, 200, 80, 30));
+            let is_editing = *self.editing_cell == Some((row_nr, col_nr));
+            if !is_editing {
+                ui.painter().rect_filled(cell_rect, 0.0, Color32::from_rgba_unmultiplied(0, 200, 80, 15));
+            }
             let stroke = egui::Stroke::new(2.0, Color32::GREEN);
             let dash = 4.0;
             let gap = 3.0;
