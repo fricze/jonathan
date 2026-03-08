@@ -28,6 +28,7 @@ pub struct Table<'a> {
     pub anchor_cell: &'a mut Option<(u64, usize)>,
     pub selection_end: &'a mut Option<(u64, usize)>,
     pub drag_origin: &'a mut Option<(u64, usize)>,
+    pub last_visible_rows: &'a mut Option<std::ops::Range<u64>>,
 }
 
 impl<'a> Table<'a> {
@@ -189,6 +190,7 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
             info.visible_rows,
             self.num_rows
         );
+        *self.last_visible_rows = Some(info.visible_rows.clone());
         self.prefetched.push(info.clone());
     }
 
@@ -486,6 +488,48 @@ impl<'a> Table<'a> {
                     self.selected_cells.insert((new_row, new_col));
                 }
                 scroll_to_row = Some(new_row);
+            }
+        }
+
+        // Auto-scroll + selection extension when dragging near the top/bottom edge
+        if self.drag_origin.is_some() && ui.input(|i| i.pointer.is_decidedly_dragging()) {
+            if let (Some(pos), Some(vis)) = (
+                ui.input(|i| i.pointer.latest_pos()),
+                self.last_visible_rows.clone(),
+            ) {
+                let rect = ui.clip_rect();
+                let edge_zone = 40.0;
+                let end_col = self.selection_end
+                    .or(*self.anchor_cell)
+                    .map(|(_, c)| c)
+                    .unwrap_or(0);
+
+                let target_row = if pos.y < rect.min.y + edge_zone && vis.start > 0 {
+                    Some(vis.start - 1)
+                } else if pos.y > rect.max.y - edge_zone && vis.end < self.num_rows {
+                    Some(vis.end)
+                } else {
+                    None
+                };
+
+                if let Some(target_row) = target_row {
+                    let target_row = target_row.min(self.num_rows - 1);
+                    scroll_to_row = Some(target_row);
+                    if let Some((anchor_row, anchor_col)) = *self.anchor_cell {
+                        let row_min = anchor_row.min(target_row);
+                        let row_max = anchor_row.max(target_row);
+                        let col_min = anchor_col.min(end_col);
+                        let col_max = anchor_col.max(end_col);
+                        self.selected_cells.clear();
+                        for r in row_min..=row_max {
+                            for c in col_min..=col_max {
+                                self.selected_cells.insert((r, c));
+                            }
+                        }
+                        *self.selection_end = Some((target_row, end_col));
+                    }
+                    ui.ctx().request_repaint();
+                }
             }
         }
 

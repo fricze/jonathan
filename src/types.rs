@@ -60,6 +60,8 @@ pub struct SheetTab {
     pub selection_end: Option<(u64, usize)>,
     /// Cell where a drag-select started
     pub drag_origin: Option<(u64, usize)>,
+    /// Last known visible row range (from previous frame's prepare())
+    pub last_visible_rows: Option<std::ops::Range<u64>>,
 }
 
 pub type Chan<Msg> = (Sender<Msg>, Receiver<Msg>);
