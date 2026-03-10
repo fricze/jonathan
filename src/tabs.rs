@@ -125,29 +125,29 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
 
         ui.add_space(4.0);
 
-        if ui.button("Open file…").clicked() {
-            open_file_dialog(&self.sender, &tab_id);
-        }
+        ui.horizontal(|ui| {
+            if ui.button("Open file…").clicked() {
+                open_file_dialog(&self.sender, &tab_id);
+            }
+
+            if !self.files_list.is_empty() {
+                let radio = &tab.chosen_file;
+                egui::ComboBox::from_id_salt("file_selector")
+                    .selected_text(get_last_element_from_path(radio).unwrap_or(""))
+                    .show_ui(ui, |ui| {
+                        for file in self.files_list {
+                            let filename = file.clone();
+                            ui.selectable_value(
+                                &mut tab.chosen_file,
+                                filename,
+                                get_last_element_from_path(file).unwrap_or(""),
+                            );
+                        }
+                    });
+            }
+        });
 
         ui.add_space(4.0);
-
-        if !self.files_list.is_empty() {
-            let radio = &tab.chosen_file;
-            egui::ComboBox::from_label("Select file")
-                .selected_text(get_last_element_from_path(radio).unwrap_or(""))
-                .show_ui(ui, |ui| {
-                    for file in self.files_list {
-                        let filename = file.clone();
-                        ui.selectable_value(
-                            &mut tab.chosen_file,
-                            filename,
-                            get_last_element_from_path(file).unwrap_or(""),
-                        );
-                    }
-                });
-
-            ui.add_space(4.0);
-        }
 
         let chosen_file = &tab.chosen_file.clone();
 
