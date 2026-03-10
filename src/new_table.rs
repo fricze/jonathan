@@ -45,7 +45,7 @@ impl<'a> Table<'a> {
 
         // --- Edit mode ---
         if *self.editing_cell == Some((row_nr, col_nr)) {
-            let edit_id = Id::new(("cell_edit", row_nr, col_nr, self.tab_id));
+            let _edit_id = Id::new(("cell_edit", row_nr, col_nr, self.tab_id));
             let output = egui::TextEdit::singleline(self.edit_buffer)
                 .margin(egui::Margin::ZERO)
                 .frame(false)
@@ -456,7 +456,7 @@ impl<'a> Table<'a> {
         }
 
         let id_salt = Id::new("table_demo");
-        let state_id = egui_table::Table::new().id_salt(id_salt).get_id(ui); // Note: must be here (in the correct outer `ui` scope) to be correct.
+        let _state_id = egui_table::Table::new().id_salt(id_salt).get_id(ui); // Note: must be here (in the correct outer `ui` scope) to be correct.
 
         let mut table = egui_table::Table::new()
             .id_salt(id_salt)

@@ -328,7 +328,7 @@ impl eframe::App for MyApp {
                 UiMessage::FilterGlobal(filter) => {
                     for tab in self.tree.iter_all_tabs_mut() {
                         let sheet_tab = tab.1;
-                        let chosen_file = sheet_tab.chosen_file.clone();
+                        let _chosen_file = sheet_tab.chosen_file.clone();
 
                         self.global_filter = filter.clone();
 
@@ -341,7 +341,7 @@ impl eframe::App for MyApp {
                         // );
                     }
                 }
-                UiMessage::FilterSheet(filename, filter, tab_id, column) => {
+                UiMessage::FilterSheet(filename, filter, tab_id, _column) => {
                     self.filters
                         .insert((filename.clone(), tab_id), filter.clone());
                     self.filter_current_sheet(ctx, filename, filter, tab_id);
@@ -394,7 +394,7 @@ impl eframe::App for MyApp {
         let tabs_no = self.tree.iter_all_tabs().count();
         let focused_tab = self.tree.find_active_focused().map(|(_, tab)| tab.id);
 
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+        egui::TopBottomPanel::top("top_panel").show(ctx, |_ui| {
             ctx.input(|input| {
                 if input.key_pressed(Key::X) {
                     if let Err(e) = &self

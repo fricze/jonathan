@@ -275,7 +275,7 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
         }
     }
 
-    fn on_close(&mut self, tab: &mut Self::Tab) -> OnCloseResponse {
+    fn on_close(&mut self, _tab: &mut Self::Tab) -> OnCloseResponse {
         if self.tabs_no > 1 {
             OnCloseResponse::Close
         } else {
