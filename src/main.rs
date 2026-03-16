@@ -129,7 +129,7 @@ fn filter_df_contains(df: &DataFrame, needle: &str) -> PolarsResult<DataFrame> {
 
     let mut mask: Option<BooleanChunked> = None;
 
-    for s in df.get_columns() {
+    for s in df.columns() {
         let is_string = matches!(s.dtype(), DataType::String);
         if !is_string {
             continue;
@@ -179,7 +179,7 @@ impl MyApp {
         thread::spawn(move || {
             if let Ok(df) = load_polars(&t_file_name) {
                 let headers = df
-                    .get_columns()
+                    .columns()
                     .iter()
                     .map(|col| FileHeader {
                         name: col.name().to_string(),
@@ -228,7 +228,7 @@ impl MyApp {
                     _ => &DataFrame::empty(),
                 };
 
-                if !sheet_data.is_empty() {
+                if sheet_data.height() != 0 {
                     let master_clone = sheet_data.clone();
                     let chan = chan.clone();
                     let ctx = ctx.clone();

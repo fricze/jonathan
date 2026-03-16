@@ -167,31 +167,30 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
         let chosen_file = &tab.chosen_file.clone();
 
         if !chosen_file.is_empty() {
-            if let Some(filter) = self.filters.get_mut(&(chosen_file.clone(), tab_id)) {
-                ui.horizontal_wrapped(|ui| {
-                    if ui.text_edit_singleline(filter).changed() {
-                        if let Err(e) = &self.sender.send(UiMessage::FilterSheet(
-                            chosen_file.to_string(),
-                            filter.to_string(),
-                            tab_id,
-                            None,
-                        )) {
-                            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                        }
+            let filter = self.filters.entry((chosen_file.clone(), tab_id)).or_default();
+            ui.horizontal_wrapped(|ui| {
+                if ui.text_edit_singleline(filter).changed() {
+                    if let Err(e) = &self.sender.send(UiMessage::FilterSheet(
+                        chosen_file.to_string(),
+                        filter.to_string(),
+                        tab_id,
+                        None,
+                    )) {
+                        eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
                     }
+                }
 
-                    if ui.button("Clear (esc)").clicked() {
-                        if let Err(e) = &self.sender.send(UiMessage::FilterSheet(
-                            chosen_file.to_string(),
-                            "".to_string(),
-                            tab_id,
-                            None,
-                        )) {
-                            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                        }
+                if ui.button("Clear (esc)").clicked() {
+                    if let Err(e) = &self.sender.send(UiMessage::FilterSheet(
+                        chosen_file.to_string(),
+                        "".to_string(),
+                        tab_id,
+                        None,
+                    )) {
+                        eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
                     }
-                });
-            }
+                }
+            });
         }
 
         if let Some(focused_tab) = self.focused_tab {
@@ -210,7 +209,7 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
         }
 
         if let Some(sheet) = self.master_data.get(chosen_file) {
-            if sheet.is_empty() {
+            if sheet.height() == 0 {
                 let painter = self
                     .ctx
                     .layer_painter(LayerId::new(Order::Foreground, Id::new("file_drop_target")));
