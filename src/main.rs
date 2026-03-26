@@ -13,9 +13,8 @@ mod new_table;
 mod read_csv;
 mod tabs;
 mod types;
-mod ui;
 
-use crate::types::{Ping, SheetVec, SortOrder};
+use crate::types::{Ping, SheetVec, SortOrder, active_sheet_data};
 use eframe::egui;
 use read_csv::open_csv_file;
 use types::{CsvTabViewer, MyApp, SheetTab, UiMessage};
@@ -81,11 +80,8 @@ fn main() -> eframe::Result {
             }
 
             Ok(Box::new(MyApp {
-                worker_chan: worker_chan,
-                ui_chan: ui_chan,
-                sort_by_column: None,
-                sort_order: None,
-                dropped_files: Vec::new(),
+                worker_chan,
+                ui_chan,
                 picked_path: None,
                 loading: false,
                 sheets_data: HashMap::new(),
@@ -139,8 +135,8 @@ fn preview_files_being_dropped(ctx: &egui::Context) {
 
 fn sort_data(mut sheet_clone: SheetVec, sort_by: (usize, SortOrder)) -> SheetVec {
     sheet_clone.sort_by(|a, b| -> std::cmp::Ordering {
-        let val_a = a.get(sort_by.0).unwrap();
-        let val_b = b.get(sort_by.0).unwrap();
+        let val_a = a.get(sort_by.0).unwrap_or_default();
+        let val_b = b.get(sort_by.0).unwrap_or_default();
 
         if sort_by.1 == SortOrder::Dsc {
             val_a.cmp(val_b)
@@ -215,18 +211,18 @@ impl MyApp {
             let sheet_tab = tab.1;
 
             if sheet_tab.id == tab_id {
-                let filter = self.filters.get(&(filename.to_string(), tab_id));
+                let filter_active = self
+                    .filters
+                    .get(&(filename.to_string(), tab_id))
+                    .map_or(false, |f| !f.is_empty());
 
-                let sheet_data = match (
-                    self.sheets_data.get(&filename),
-                    self.filtered_data.get(&(filename.to_string(), tab_id)),
-                    filter,
-                ) {
-                    (Some(_), None, Some(filter)) if !filter.is_empty() => &vec![],
-                    (Some(master), None, _) => master,
-                    (Some(_), Some(filtered), _) => filtered,
-                    _ => &vec![],
-                };
+                let sheet_data = active_sheet_data(
+                    &self.sheets_data,
+                    &self.filtered_data,
+                    &filename,
+                    tab_id,
+                    filter_active,
+                );
 
                 if !sheet_data.is_empty() {
                     let master_clone = sheet_data.clone();
@@ -237,8 +233,10 @@ impl MyApp {
                     thread::spawn(move || {
                         let sorted = sort_data(master_clone, sort_order);
 
-                        if let Err(e) = chan.send(UiMessage::SetSorted(sorted, filename, tab_id)) {
-                            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                        if let Err(e) =
+                            chan.send(UiMessage::SetDisplayData(sorted, filename, tab_id))
+                        {
+                            eprintln!("Worker: Failed to send sorted data to UI thread: {:?}", e);
                         }
 
                         ctx.request_repaint();
@@ -246,8 +244,6 @@ impl MyApp {
                 }
             };
         }
-
-        ()
     }
 
     fn filter_current_sheet(
@@ -273,9 +269,10 @@ impl MyApp {
                     thread::spawn(move || {
                         let filtered = filter_data(master_clone, filter);
 
-                        if let Err(e) = chan.send(UiMessage::SetSorted(filtered, filename, tab_id))
+                        if let Err(e) =
+                            chan.send(UiMessage::SetDisplayData(filtered, filename, tab_id))
                         {
-                            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
+                            eprintln!("Worker: Failed to send filtered data to UI thread: {:?}", e);
                         }
 
                         ctx.request_repaint();
@@ -283,8 +280,6 @@ impl MyApp {
                 }
             };
         }
-
-        ()
     }
 }
 
@@ -322,24 +317,11 @@ impl eframe::App for MyApp {
                 UiMessage::SetMaster(master, file_name) => {
                     self.sheets_data.insert(file_name, master);
                 }
-                UiMessage::SetSorted(sorted, file_name, tab_id) => {
+                UiMessage::SetDisplayData(sorted, file_name, tab_id) => {
                     self.filtered_data.insert((file_name, tab_id), sorted);
                 }
                 UiMessage::FilterGlobal(filter) => {
-                    for tab in self.tree.iter_all_tabs_mut() {
-                        let sheet_tab = tab.1;
-                        let _chosen_file = sheet_tab.chosen_file.clone();
-
-                        self.global_filter = filter.clone();
-
-                        // filter_data(
-                        //     &mut self.filtered_data,
-                        //     &self.sheets_data,
-                        //     filter.clone(),
-                        //     chosen_file,
-                        //     sheet_tab.id,
-                        // );
-                    }
+                    self.global_filter = filter;
                 }
                 UiMessage::FilterSheet(filename, filter, tab_id, _column) => {
                     self.filters
@@ -431,8 +413,12 @@ impl eframe::App for MyApp {
         added_nodes.drain(..).for_each(|(surface, node, filename)| {
             self.tree.set_focused_node_and_surface((surface, node));
 
-            let last_tab = self.tree.iter_all_tabs().last().unwrap().1;
-            let columns = last_tab.columns.clone();
+            let columns = self
+                .tree
+                .iter_all_tabs()
+                .last()
+                .map(|(_, tab)| tab.columns.clone())
+                .unwrap_or_default();
 
             self.tree.push_to_focused_leaf(SheetTab {
                 id: self.counter,

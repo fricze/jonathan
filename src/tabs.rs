@@ -5,7 +5,7 @@ use egui_dock::{NodeIndex, SurfaceIndex};
 
 use egui::Color32;
 
-use crate::types::{CsvTabViewer, FileHeader, SheetTab, UiMessage};
+use crate::types::{active_sheet_data, CsvTabViewer, FileHeader, SheetTab, UiMessage};
 use eframe::egui;
 
 use std::sync::mpsc::Sender;
@@ -46,14 +46,17 @@ fn display_headers(ui: &mut egui::Ui, headers: &mut Vec<FileHeader>) {
 }
 
 fn file_button(ui: &mut egui::Ui, file: &str) -> Response {
-    let mut l: Option<Response> = None;
+    let mut label_rect: Option<egui::Rect> = None;
     egui::Frame::new()
-        .inner_margin(egui::Margin::symmetric(4, 8)) // Horizontal 20, Vertical 10 padding
+        .inner_margin(egui::Margin::symmetric(4, 8))
         .show(ui, |ui| {
-            l = Some(ui.selectable_label(false, file));
+            label_rect = Some(ui.selectable_label(false, file).rect);
         });
 
-    let mut rect = l.unwrap().rect;
+    let Some(label_rect) = label_rect else {
+        return ui.label("");
+    };
+    let mut rect = label_rect;
 
     rect.set_left(rect.left() - 4.0);
     rect.set_top(rect.top() - 4.0);
@@ -149,12 +152,17 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
 
         ui.add_space(4.0);
 
-        let chosen_file = &tab.chosen_file.clone();
+        let chosen_file = &tab.chosen_file;
+
+        let filter_input_id = Id::new(("filter_input", tab_id));
 
         if !chosen_file.is_empty() {
             if let Some(filter) = self.filters.get_mut(&(chosen_file.clone(), tab_id)) {
                 ui.horizontal_wrapped(|ui| {
-                    if ui.text_edit_singleline(filter).changed() {
+                    let response = ui.add(
+                        egui::TextEdit::singleline(filter).id(filter_input_id),
+                    );
+                    if response.changed() {
                         if let Err(e) = &self.sender.send(UiMessage::FilterSheet(
                             chosen_file.to_string(),
                             filter.to_string(),
@@ -181,7 +189,13 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
 
         if let Some(focused_tab) = self.focused_tab {
             if focused_tab == tab.id {
+                let cmd_f = self.ctx.input(|i| i.key_pressed(Key::F) && i.modifiers.command);
+                if cmd_f {
+                    self.ctx.memory_mut(|m| m.request_focus(filter_input_id));
+                }
+
                 if self.ctx.input(|i| i.key_pressed(Key::Escape)) {
+                    self.ctx.memory_mut(|m| m.surrender_focus(filter_input_id));
                     if let Err(e) = &self.sender.send(UiMessage::FilterSheet(
                         chosen_file.to_string(),
                         "".to_string(),
@@ -224,15 +238,13 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
                 &"".to_string()
             };
 
-            let sheet_data = match (
-                self.promised_data.get(chosen_file),
-                self.filtered_data.get(&(chosen_file.to_string(), tab_id)),
-            ) {
-                (Some(_), None) if !filter.is_empty() => &vec![],
-                (Some(master), None) => master,
-                (Some(_), Some(filtered)) => filtered,
-                _ => &vec![],
-            };
+            let sheet_data = active_sheet_data(
+                self.promised_data,
+                self.filtered_data,
+                chosen_file,
+                tab_id,
+                !filter.is_empty(),
+            );
 
             let len = sheet_data.len();
 
@@ -283,7 +295,4 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
         }
     }
 
-    // fn on_add(&mut self, surface: SurfaceIndex, node: NodeIndex) {
-    //     self.added_nodes.push((surface, node));
-    // }
 }

@@ -7,12 +7,9 @@ use std::sync::mpsc::{Receiver, Sender};
 
 #[derive(Clone, Default)]
 pub struct FileHeader {
-    pub unique_vals: Vec<String>,
     pub name: String,
     pub visible: bool,
-    pub dtype: Option<String>,
     pub sort: Option<SortOrder>,
-    pub sort_dir: Option<bool>,
 }
 
 pub type TabId = usize;
@@ -29,7 +26,7 @@ pub enum UiMessage {
     FilterSheet(Filename, Filter, TabId, Option<usize>),
     SortSheet(Filename, (ColumnId, SortOrder), TabId),
     FilterGlobal(Filter),
-    SetSorted(SheetVec, String, TabId),
+    SetDisplayData(SheetVec, String, TabId),
     SetMaster(SheetVec, String),
     /// filename, tab_id, row_nr (in displayed data), actual col index, new value
     EditCell(Filename, TabId, u64, usize, String),
@@ -132,9 +129,6 @@ impl SelectionState {
 #[derive(Default)]
 pub struct SheetTab {
     pub id: usize,
-    pub scroll_y: f32,
-    pub inner_rect: f32,
-    pub content_height: f32,
     pub chosen_file: String,
     pub columns: HashMap<Filename, Vec<FileHeader>>,
     /// Currently edited cell: (row_nr, visible col index)
@@ -149,19 +143,35 @@ pub type Chan<Msg> = (Sender<Msg>, Receiver<Msg>);
 
 pub type Filters = HashMap<(Filename, TabId), String>;
 
+/// Returns the sheet data to display for a given file+tab:
+/// - the filtered/sorted view if one exists
+/// - master data if no filter is active
+/// - an empty slice if a filter is pending but results haven't arrived yet
+pub fn active_sheet_data<'a>(
+    master: &'a HashMap<Filename, SheetVec>,
+    filtered: &'a HashMap<(Filename, TabId), SheetVec>,
+    filename: &str,
+    tab_id: TabId,
+    filter_active: bool,
+) -> &'a SheetVec {
+    use std::sync::LazyLock;
+    static EMPTY: LazyLock<SheetVec> = LazyLock::new(Vec::new);
+    match (master.get(filename), filtered.get(&(filename.to_string(), tab_id))) {
+        (Some(_), None) if filter_active => &EMPTY,
+        (Some(data), None) => data,
+        (Some(_), Some(data)) => data,
+        _ => &EMPTY,
+    }
+}
+
 pub struct MyApp {
-    pub dropped_files: Vec<egui::DroppedFile>,
     pub picked_path: Option<String>,
     pub loading: bool,
     pub worker_chan: Chan<UiMessage>,
     pub ui_chan: Chan<Ping>,
-    pub sort_by_column: Option<usize>,
-    pub sort_order: Option<SortOrder>,
     pub sheets_data: HashMap<String, SheetVec>,
-    // Filtered data is stored per file and per tab. Filtered data coming from
-    // one master file can be used in many tabs. It's all Arcs, so
-    // even if we show the same data in many tabs, filtered in different ways
-    // we're just using references to the same master data.
+    // Filtered/sorted views keyed by (filename, tab_id). Each tab can show
+    // the same master file filtered or sorted differently.
     pub filtered_data: HashMap<(Filename, TabId), SheetVec>,
     pub tree: DockState<SheetTab>,
     pub counter: usize,

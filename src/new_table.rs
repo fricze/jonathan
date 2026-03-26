@@ -29,12 +29,6 @@ pub struct Table<'a> {
 }
 
 impl<'a> Table<'a> {
-    // fn was_row_prefetched(&self, row_nr: u64) -> bool {
-    //     self.prefetched
-    //         .iter()
-    //         .any(|info| info.visible_rows.contains(&row_nr))
-    // }
-
     fn cell_content_ui(&mut self, row_nr: u64, col_nr: usize, ui: &mut egui::Ui) {
         // Map visible column index to actual data column index
         let actual_col = self
@@ -88,66 +82,21 @@ impl<'a> Table<'a> {
                 } else {
                     use egui::text::LayoutJob;
 
-                    if cell_content.contains(filter) {
-                        let mut job = LayoutJob::default();
-
-                        if cell_content == filter {
-                            job.append(
-                                cell_content,
-                                0.0,
-                                TextFormat {
-                                    color: Color32::DARK_BLUE,
-                                    ..Default::default()
-                                },
-                            );
-
-                            ui.add(egui::Label::new(job).sense(Sense::click()).extend())
-                        } else {
-                            let text: Vec<&str> = cell_content.split(&filter).collect();
-
-                            if text.len() == 1 {
-                                job.append(
-                                    &filter,
-                                    0.0,
-                                    TextFormat {
-                                        color: Color32::DARK_BLUE,
-                                        ..Default::default()
-                                    },
-                                );
-                                job.append(text[0], 0.0, TextFormat::default());
-                                ui.add(egui::Label::new(job).sense(Sense::click()).extend())
-                            } else if text.len() == 2 {
-                                job.append(text[0], 0.0, TextFormat::default());
-                                job.append(
-                                    &filter,
-                                    0.0,
-                                    TextFormat {
-                                        color: Color32::DARK_BLUE,
-                                        ..Default::default()
-                                    },
-                                );
-                                job.append(text[1], 0.0, TextFormat::default());
-
-                                ui.add(egui::Label::new(job).sense(Sense::click()).extend())
-                            } else {
-                                ui.add(egui::Label::new(job).sense(Sense::click()).extend())
-                            }
+                    let highlight = TextFormat {
+                        color: Color32::DARK_BLUE,
+                        ..Default::default()
+                    };
+                    let mut job = LayoutJob::default();
+                    let mut parts = cell_content.split(filter).peekable();
+                    while let Some(part) = parts.next() {
+                        if !part.is_empty() {
+                            job.append(part, 0.0, TextFormat::default());
                         }
-                    } else {
-                        // ui.add(
-                        //     egui::Label::new(cell_content)
-                        //         .sense(Sense::click())
-                        //         .extend(),
-                        // )
-
-                        ui.add(
-                            egui::Label::new(cell_content)
-                                .sense(Sense::click())
-                                .extend(),
-                        )
-
-                        // ui.label(cell_content)
+                        if parts.peek().is_some() {
+                            job.append(filter, 0.0, highlight.clone());
+                        }
                     }
+                    ui.add(egui::Label::new(job).sense(Sense::click()).extend())
                 };
 
                 if label.clicked() && ui.ctx().input(|i| i.modifiers.command) {
@@ -162,20 +111,6 @@ impl<'a> Table<'a> {
                 }
             }
         }
-
-        // ui.vertical(|ui| {
-        //     ui.horizontal(|ui| {
-        //         ui.label(format!("({row_nr}, {col_nr})"));
-
-        //         if (row_nr + col_nr as u64) % 27 == 0 {
-        //             if !ui.is_sizing_pass() {
-        //                 // During a sizing pass we don't truncate!
-        //                 ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Truncate);
-        //             }
-        //             ui.label("Extra long cell!");
-        //         }
-        //     });
-        // });
     }
 }
 
@@ -253,11 +188,7 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
                         ui.heading(name);
 
                         let button_symbol = if let Some(sort) = header.sort {
-                            if sort == SortOrder::Asc {
-                                "⬆"
-                            } else {
-                                "⬇"
-                            }
+                            if sort == SortOrder::Asc { "⬆" } else { "⬇" }
                         } else {
                             "→"
                         };
