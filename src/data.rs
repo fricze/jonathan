@@ -1,5 +1,20 @@
 use crate::types::{SheetVec, SortOrder};
 
+/// Update a single cell in a sheet. Returns `true` if the row and column existed.
+pub fn edit_record(sheet: &mut SheetVec, row: usize, col: usize, value: &str) -> bool {
+    if let Some(record) = sheet.get_mut(row) {
+        if col < record.len() {
+            *record = record
+                .iter()
+                .enumerate()
+                .map(|(i, f)| if i == col { value } else { f })
+                .collect();
+            return true;
+        }
+    }
+    false
+}
+
 /// Wrap a CSV field value in double-quotes if it contains a comma, double-quote, or newline.
 /// Internal double-quotes are escaped by doubling them.
 pub fn csv_quote(value: &str) -> String {
@@ -15,7 +30,7 @@ pub fn sort_data(mut sheet_clone: SheetVec, sort_by: (usize, SortOrder)) -> Shee
         let val_a = a.get(sort_by.0).unwrap_or_default();
         let val_b = b.get(sort_by.0).unwrap_or_default();
 
-        if sort_by.1 == SortOrder::Dsc {
+        if sort_by.1 == SortOrder::Asc {
             val_a.cmp(val_b)
         } else {
             val_b.cmp(val_a)

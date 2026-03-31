@@ -3,7 +3,7 @@ use egui_dock::{DockArea, Style};
 use std::path::PathBuf;
 use std::thread;
 
-use crate::data::{filter_data, sort_data};
+use crate::data::{edit_record, filter_data, sort_data};
 use crate::menu::OPEN_FILE_ID;
 use crate::read_csv::open_csv_file;
 use crate::types::{CsvTabViewer, MyApp, SheetTab, SortOrder, UiMessage, active_sheet_data};
@@ -188,36 +188,16 @@ impl eframe::App for MyApp {
                 }
                 UiMessage::OpenFile(file, tab) => self.load_file(ctx, file, tab),
                 UiMessage::EditCell(filename, tab_id, row_nr, actual_col, new_value) => {
-                    let updated = if let Some(filtered) =
-                        self.filtered_data.get_mut(&(filename.clone(), tab_id))
-                    {
-                        if let Some(record) = filtered.get_mut(row_nr as usize) {
-                            let mut fields: Vec<String> =
-                                record.iter().map(|s| s.to_string()).collect();
-                            if let Some(field) = fields.get_mut(actual_col) {
-                                *field = new_value.clone();
-                                *record = fields.iter().map(|s| s.as_str()).collect();
-                                true
-                            } else {
-                                false
-                            }
-                        } else {
-                            false
-                        }
-                    } else {
-                        false
-                    };
+                    let updated = self
+                        .filtered_data
+                        .get_mut(&(filename.clone(), tab_id))
+                        .map_or(false, |sheet| {
+                            edit_record(sheet, row_nr as usize, actual_col, &new_value)
+                        });
 
                     if !updated {
                         if let Some(sheet) = self.sheets_data.get_mut(&filename) {
-                            if let Some(record) = sheet.get_mut(row_nr as usize) {
-                                let mut fields: Vec<String> =
-                                    record.iter().map(|s| s.to_string()).collect();
-                                if let Some(field) = fields.get_mut(actual_col) {
-                                    *field = new_value;
-                                    *record = fields.iter().map(|s| s.as_str()).collect();
-                                }
-                            }
+                            edit_record(sheet, row_nr as usize, actual_col, &new_value);
                         }
                     }
                 }
