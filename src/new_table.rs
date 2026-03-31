@@ -2,6 +2,7 @@ use std::{collections::BTreeMap, sync::mpsc::Sender};
 
 use egui::{Align2, Color32, Context, Id, Margin, NumExt as _, Sense, TextFormat};
 
+use crate::data::csv_quote;
 use crate::types::{FileHeader, Filename, SelectionState, SheetVec, SortOrder, TabId, UiMessage};
 
 pub struct Table<'a> {
@@ -517,12 +518,3 @@ impl<'a> Table<'a> {
     }
 }
 
-/// Wrap a CSV field value in double-quotes if it contains a comma, double-quote, or newline.
-/// Internal double-quotes are escaped by doubling them.
-fn csv_quote(value: &str) -> String {
-    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
-        format!("\"{}\"", value.replace('"', "\"\""))
-    } else {
-        value.to_string()
-    }
-}
