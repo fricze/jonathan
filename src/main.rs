@@ -5,6 +5,7 @@ use std::collections::HashMap;
 use std::sync::mpsc;
 
 mod app;
+mod data;
 mod menu;
 mod new_table;
 mod read_csv;

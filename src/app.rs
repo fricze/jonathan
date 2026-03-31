@@ -3,35 +3,13 @@ use egui_dock::{DockArea, Style};
 use std::path::PathBuf;
 use std::thread;
 
+use crate::data::{filter_data, sort_data};
 use crate::menu::OPEN_FILE_ID;
 use crate::read_csv::open_csv_file;
-use crate::types::{CsvTabViewer, MyApp, SheetTab, SheetVec, SortOrder, UiMessage, active_sheet_data};
+use crate::types::{CsvTabViewer, MyApp, SheetTab, SortOrder, UiMessage, active_sheet_data};
 
 #[cfg(target_os = "macos")]
 use muda::MenuEvent;
-
-fn sort_data(mut sheet_clone: SheetVec, sort_by: (usize, SortOrder)) -> SheetVec {
-    sheet_clone.sort_by(|a, b| -> std::cmp::Ordering {
-        let val_a = a.get(sort_by.0).unwrap_or_default();
-        let val_b = b.get(sort_by.0).unwrap_or_default();
-
-        if sort_by.1 == SortOrder::Dsc {
-            val_a.cmp(val_b)
-        } else {
-            val_b.cmp(val_a)
-        }
-    });
-
-    sheet_clone
-}
-
-fn filter_data(master_data: SheetVec, filter: String) -> SheetVec {
-    master_data
-        .iter()
-        .filter(|r| r.iter().any(|c| c.contains(&filter)))
-        .map(|r| r.clone())
-        .collect::<Vec<_>>()
-}
 
 fn preview_files_being_dropped(ctx: &egui::Context) {
     use egui::{Align2, Color32, Id, LayerId, Order, TextStyle};
