@@ -115,16 +115,39 @@ impl<'a> Table<'a> {
     }
 
     fn handle_clipboard_copy(&self, ui: &egui::Ui) {
-        let copy_requested =
-            ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
+        let copy_requested = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
         if !copy_requested || self.selection.selected_cells.is_empty() {
             return;
         }
 
-        let min_row = self.selection.selected_cells.iter().map(|&(r, _)| r).min().unwrap_or(0);
-        let max_row = self.selection.selected_cells.iter().map(|&(r, _)| r).max().unwrap_or(0);
-        let min_col = self.selection.selected_cells.iter().map(|&(_, c)| c).min().unwrap_or(0);
-        let max_col = self.selection.selected_cells.iter().map(|&(_, c)| c).max().unwrap_or(0);
+        let min_row = self
+            .selection
+            .selected_cells
+            .iter()
+            .map(|&(r, _)| r)
+            .min()
+            .unwrap_or(0);
+        let max_row = self
+            .selection
+            .selected_cells
+            .iter()
+            .map(|&(r, _)| r)
+            .max()
+            .unwrap_or(0);
+        let min_col = self
+            .selection
+            .selected_cells
+            .iter()
+            .map(|&(_, c)| c)
+            .min()
+            .unwrap_or(0);
+        let max_col = self
+            .selection
+            .selected_cells
+            .iter()
+            .map(|&(_, c)| c)
+            .max()
+            .unwrap_or(0);
 
         let mut csv_rows: Vec<String> = Vec::new();
         for r in min_row..=max_row {
@@ -149,6 +172,9 @@ impl<'a> Table<'a> {
     }
 
     fn handle_keyboard_navigation(&mut self, ui: &egui::Ui) -> Option<u64> {
+        if self.editing_cell.is_some() {
+            return None;
+        }
         let (anchor_row, anchor_col) = self.selection.anchor_cell?;
 
         let shift = ui.input(|i| i.modifiers.shift);
@@ -212,13 +238,7 @@ impl<'a> Table<'a> {
         Some(target_row)
     }
 
-    fn draw_selection_border(
-        &self,
-        ui: &egui::Ui,
-        row_nr: u64,
-        col_nr: usize,
-        r: egui::Rect,
-    ) {
+    fn draw_selection_border(&self, ui: &egui::Ui, row_nr: u64, col_nr: usize, r: egui::Rect) {
         let is_editing = *self.editing_cell == Some((row_nr, col_nr));
         if !is_editing {
             ui.painter()
@@ -270,6 +290,16 @@ impl<'a> Table<'a> {
         }
 
         self.handle_clipboard_copy(ui);
+
+        if self.editing_cell.is_none() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+            if let Some((row_nr, col_nr)) = self.selection.cursor().or(self.selection.anchor_cell) {
+                let actual_col = self.visible_col_indices.get(col_nr).copied().unwrap_or(col_nr);
+                if let Some(content) = self.data.get(row_nr as usize).and_then(|r| r.get(actual_col)) {
+                    *self.editing_cell = Some((row_nr, col_nr));
+                    *self.edit_buffer = content.to_string();
+                }
+            }
+        }
 
         let nav_scroll = self.handle_keyboard_navigation(ui);
         let drag_scroll = self.handle_drag_autoscroll(ui);
