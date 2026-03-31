@@ -113,6 +113,195 @@ impl<'a> Table<'a> {
             }
         }
     }
+
+    fn handle_clipboard_copy(&self, ui: &egui::Ui) {
+        let copy_requested =
+            ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
+        if !copy_requested || self.selection.selected_cells.is_empty() {
+            return;
+        }
+
+        let min_row = self.selection.selected_cells.iter().map(|&(r, _)| r).min().unwrap_or(0);
+        let max_row = self.selection.selected_cells.iter().map(|&(r, _)| r).max().unwrap_or(0);
+        let min_col = self.selection.selected_cells.iter().map(|&(_, c)| c).min().unwrap_or(0);
+        let max_col = self.selection.selected_cells.iter().map(|&(_, c)| c).max().unwrap_or(0);
+
+        let mut csv_rows: Vec<String> = Vec::new();
+        for r in min_row..=max_row {
+            let mut row_fields: Vec<String> = Vec::new();
+            for c in min_col..=max_col {
+                if self.selection.selected_cells.contains(&(r, c)) {
+                    let actual_col = self.visible_col_indices.get(c).copied().unwrap_or(c);
+                    let value = self
+                        .data
+                        .get(r as usize)
+                        .and_then(|row| row.get(actual_col))
+                        .unwrap_or("");
+                    row_fields.push(csv_quote(value));
+                } else {
+                    row_fields.push(String::new());
+                }
+            }
+            csv_rows.push(row_fields.join(","));
+        }
+
+        ui.ctx().copy_text(csv_rows.join("\n"));
+    }
+
+    fn handle_keyboard_navigation(&mut self, ui: &egui::Ui) -> Option<u64> {
+        let (anchor_row, anchor_col) = self.selection.anchor_cell?;
+
+        let shift = ui.input(|i| i.modifiers.shift);
+        let pressed_up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
+        let pressed_down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
+        let pressed_left = ui.input(|i| i.key_pressed(egui::Key::ArrowLeft));
+        let pressed_right = ui.input(|i| i.key_pressed(egui::Key::ArrowRight));
+        let pressed_pgup = ui.input(|i| i.key_pressed(egui::Key::PageUp));
+        let pressed_pgdown = ui.input(|i| i.key_pressed(egui::Key::PageDown));
+
+        let (cur_row, cur_col) = self.selection.cursor().unwrap_or((anchor_row, anchor_col));
+
+        let new_pos: Option<(u64, usize)> = if pressed_up && cur_row > 0 {
+            Some((cur_row - 1, cur_col))
+        } else if pressed_down && cur_row + 1 < self.num_rows {
+            Some((cur_row + 1, cur_col))
+        } else if pressed_pgup {
+            Some((cur_row.saturating_sub(20), cur_col))
+        } else if pressed_pgdown {
+            Some(((cur_row + 20).min(self.num_rows - 1), cur_col))
+        } else if pressed_left && cur_col > 0 {
+            Some((cur_row, cur_col - 1))
+        } else if pressed_right && cur_col + 1 < self.num_columns {
+            Some((cur_row, cur_col + 1))
+        } else {
+            None
+        };
+
+        let (new_row, new_col) = new_pos?;
+        if shift {
+            self.selection.extend_to(new_row, new_col);
+        } else {
+            self.selection.select_single(new_row, new_col);
+        }
+        Some(new_row)
+    }
+
+    fn handle_drag_autoscroll(&mut self, ui: &egui::Ui) -> Option<u64> {
+        if !self.selection.is_dragging() || !ui.input(|i| i.pointer.is_decidedly_dragging()) {
+            return None;
+        }
+
+        let pos = ui.input(|i| i.pointer.latest_pos())?;
+        let vis = self.last_visible_rows.clone()?;
+
+        let rect = ui.clip_rect();
+        let edge_zone = 40.0;
+        let end_col = self.selection.cursor().map(|(_, c)| c).unwrap_or(0);
+
+        let target_row = if pos.y < rect.min.y + edge_zone && vis.start > 0 {
+            Some(vis.start - 1)
+        } else if pos.y > rect.max.y - edge_zone && vis.end < self.num_rows {
+            Some(vis.end)
+        } else {
+            None
+        }?;
+
+        let target_row = target_row.min(self.num_rows - 1);
+        self.selection.extend_to(target_row, end_col);
+        ui.ctx().request_repaint();
+        Some(target_row)
+    }
+
+    fn draw_selection_border(
+        &self,
+        ui: &egui::Ui,
+        row_nr: u64,
+        col_nr: usize,
+        r: egui::Rect,
+    ) {
+        let is_editing = *self.editing_cell == Some((row_nr, col_nr));
+        if !is_editing {
+            ui.painter()
+                .rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0, 200, 80, 15));
+        }
+
+        let stroke = egui::Stroke::new(2.0, Color32::GREEN);
+        let dash = 4.0;
+        let gap = 3.0;
+        let painter = ui.painter();
+
+        if !(row_nr > 0 && self.selection.contains(row_nr - 1, col_nr)) {
+            painter.extend(egui::Shape::dashed_line(
+                &[r.left_top(), r.right_top()],
+                stroke,
+                dash,
+                gap,
+            ));
+        }
+        if !self.selection.contains(row_nr, col_nr + 1) {
+            painter.extend(egui::Shape::dashed_line(
+                &[r.right_top(), r.right_bottom()],
+                stroke,
+                dash,
+                gap,
+            ));
+        }
+        if !self.selection.contains(row_nr + 1, col_nr) {
+            painter.extend(egui::Shape::dashed_line(
+                &[r.right_bottom(), r.left_bottom()],
+                stroke,
+                dash,
+                gap,
+            ));
+        }
+        if !(col_nr > 0 && self.selection.contains(row_nr, col_nr - 1)) {
+            painter.extend(egui::Shape::dashed_line(
+                &[r.left_bottom(), r.left_top()],
+                stroke,
+                dash,
+                gap,
+            ));
+        }
+    }
+
+    pub fn ui(&mut self, ui: &mut egui::Ui) {
+        if ui.input(|i| i.pointer.any_released()) {
+            self.selection.end_drag();
+        }
+
+        self.handle_clipboard_copy(ui);
+
+        let nav_scroll = self.handle_keyboard_navigation(ui);
+        let drag_scroll = self.handle_drag_autoscroll(ui);
+        let scroll_to_row = drag_scroll.or(nav_scroll);
+
+        let id_salt = Id::new("table_demo");
+        let _state_id = egui_table::Table::new().id_salt(id_salt).get_id(ui);
+
+        let mut table = egui_table::Table::new()
+            .id_salt(id_salt)
+            .num_rows(self.num_rows)
+            .columns(vec![self.default_column; self.num_columns])
+            .num_sticky_cols(self.num_sticky_cols)
+            .headers([
+                egui_table::HeaderRow {
+                    height: self.top_row_height,
+                    groups: if self.num_columns > 0 {
+                        vec![0..self.num_columns]
+                    } else {
+                        vec![]
+                    },
+                },
+                egui_table::HeaderRow::new(self.top_row_height),
+            ])
+            .auto_size_mode(self.auto_size_mode);
+
+        if let Some(row) = scroll_to_row {
+            table = table.scroll_to_row(row, None);
+        }
+
+        table.show(ui, self);
+    }
 }
 
 impl<'a> egui_table::TableDelegate for Table<'a> {
@@ -293,55 +482,7 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
         }
 
         if self.selection.contains(row_nr, col_nr) {
-            let is_editing = *self.editing_cell == Some((row_nr, col_nr));
-            if !is_editing {
-                ui.painter().rect_filled(
-                    cell_rect,
-                    0.0,
-                    Color32::from_rgba_unmultiplied(0, 200, 80, 15),
-                );
-            }
-            let stroke = egui::Stroke::new(2.0, Color32::GREEN);
-            let dash = 4.0;
-            let gap = 3.0;
-            let r = cell_rect;
-            let painter = ui.painter();
-            let no_top = row_nr > 0 && self.selection.contains(row_nr - 1, col_nr);
-            let no_bottom = self.selection.contains(row_nr + 1, col_nr);
-            let no_left = col_nr > 0 && self.selection.contains(row_nr, col_nr - 1);
-            let no_right = self.selection.contains(row_nr, col_nr + 1);
-            if !no_top {
-                painter.extend(egui::Shape::dashed_line(
-                    &[r.left_top(), r.right_top()],
-                    stroke,
-                    dash,
-                    gap,
-                ));
-            }
-            if !no_right {
-                painter.extend(egui::Shape::dashed_line(
-                    &[r.right_top(), r.right_bottom()],
-                    stroke,
-                    dash,
-                    gap,
-                ));
-            }
-            if !no_bottom {
-                painter.extend(egui::Shape::dashed_line(
-                    &[r.right_bottom(), r.left_bottom()],
-                    stroke,
-                    dash,
-                    gap,
-                ));
-            }
-            if !no_left {
-                painter.extend(egui::Shape::dashed_line(
-                    &[r.left_bottom(), r.left_top()],
-                    stroke,
-                    dash,
-                    gap,
-                ));
-            }
+            self.draw_selection_border(ui, row_nr, col_nr, cell_rect);
         }
     }
 
@@ -358,163 +499,3 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
             + row_nr as f32 * self.row_height
     }
 }
-
-impl<'a> Table<'a> {
-    pub fn ui(&mut self, ui: &mut egui::Ui) {
-        let mut scroll_to_row: Option<u64> = None;
-
-        if ui.input(|i| i.pointer.any_released()) {
-            self.selection.end_drag();
-        }
-
-        // --- Cmd+C: copy selected cells as CSV to clipboard ---
-        // egui translates Cmd+C into Event::Copy; check for that rather than key_pressed.
-        let copy_requested = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
-        if copy_requested && !self.selection.selected_cells.is_empty() {
-            // Determine the bounding rectangle of the selection
-            let min_row = self
-                .selection
-                .selected_cells
-                .iter()
-                .map(|&(r, _)| r)
-                .min()
-                .unwrap_or(0);
-            let max_row = self
-                .selection
-                .selected_cells
-                .iter()
-                .map(|&(r, _)| r)
-                .max()
-                .unwrap_or(0);
-            let min_col = self
-                .selection
-                .selected_cells
-                .iter()
-                .map(|&(_, c)| c)
-                .min()
-                .unwrap_or(0);
-            let max_col = self
-                .selection
-                .selected_cells
-                .iter()
-                .map(|&(_, c)| c)
-                .max()
-                .unwrap_or(0);
-
-            let mut csv_rows: Vec<String> = Vec::new();
-            for r in min_row..=max_row {
-                let mut row_fields: Vec<String> = Vec::new();
-                for c in min_col..=max_col {
-                    if self.selection.selected_cells.contains(&(r, c)) {
-                        // Map visible column index → actual data column index
-                        let actual_col = self.visible_col_indices.get(c).copied().unwrap_or(c);
-                        let value = self
-                            .data
-                            .get(r as usize)
-                            .and_then(|row| row.get(actual_col))
-                            .unwrap_or("");
-                        row_fields.push(csv_quote(value));
-                    } else {
-                        row_fields.push(String::new());
-                    }
-                }
-                csv_rows.push(row_fields.join(","));
-            }
-
-            let csv_text = csv_rows.join("\n");
-            ui.ctx().copy_text(csv_text);
-        }
-
-        if let Some((anchor_row, anchor_col)) = self.selection.anchor_cell {
-            let shift = ui.input(|i| i.modifiers.shift);
-            let pressed_up = ui.input(|i| i.key_pressed(egui::Key::ArrowUp));
-            let pressed_down = ui.input(|i| i.key_pressed(egui::Key::ArrowDown));
-            let pressed_left = ui.input(|i| i.key_pressed(egui::Key::ArrowLeft));
-            let pressed_right = ui.input(|i| i.key_pressed(egui::Key::ArrowRight));
-            let pressed_pgup = ui.input(|i| i.key_pressed(egui::Key::PageUp));
-            let pressed_pgdown = ui.input(|i| i.key_pressed(egui::Key::PageDown));
-
-            let (cur_row, cur_col) = self.selection.cursor().unwrap_or((anchor_row, anchor_col));
-
-            let new_pos: Option<(u64, usize)> = if pressed_up && cur_row > 0 {
-                Some((cur_row - 1, cur_col))
-            } else if pressed_down && cur_row + 1 < self.num_rows {
-                Some((cur_row + 1, cur_col))
-            } else if pressed_pgup {
-                Some((cur_row.saturating_sub(20), cur_col))
-            } else if pressed_pgdown {
-                Some(((cur_row + 20).min(self.num_rows - 1), cur_col))
-            } else if pressed_left && cur_col > 0 {
-                Some((cur_row, cur_col - 1))
-            } else if pressed_right && cur_col + 1 < self.num_columns {
-                Some((cur_row, cur_col + 1))
-            } else {
-                None
-            };
-
-            if let Some((new_row, new_col)) = new_pos {
-                if shift {
-                    self.selection.extend_to(new_row, new_col);
-                } else {
-                    self.selection.select_single(new_row, new_col);
-                }
-                scroll_to_row = Some(new_row);
-            }
-        }
-
-        // Auto-scroll + selection extension when dragging near the top/bottom edge
-        if self.selection.is_dragging() && ui.input(|i| i.pointer.is_decidedly_dragging()) {
-            if let (Some(pos), Some(vis)) = (
-                ui.input(|i| i.pointer.latest_pos()),
-                self.last_visible_rows.clone(),
-            ) {
-                let rect = ui.clip_rect();
-                let edge_zone = 40.0;
-                let end_col = self.selection.cursor().map(|(_, c)| c).unwrap_or(0);
-
-                let target_row = if pos.y < rect.min.y + edge_zone && vis.start > 0 {
-                    Some(vis.start - 1)
-                } else if pos.y > rect.max.y - edge_zone && vis.end < self.num_rows {
-                    Some(vis.end)
-                } else {
-                    None
-                };
-
-                if let Some(target_row) = target_row {
-                    let target_row = target_row.min(self.num_rows - 1);
-                    scroll_to_row = Some(target_row);
-                    self.selection.extend_to(target_row, end_col);
-                    ui.ctx().request_repaint();
-                }
-            }
-        }
-
-        let id_salt = Id::new("table_demo");
-        let _state_id = egui_table::Table::new().id_salt(id_salt).get_id(ui); // Note: must be here (in the correct outer `ui` scope) to be correct.
-
-        let mut table = egui_table::Table::new()
-            .id_salt(id_salt)
-            .num_rows(self.num_rows)
-            .columns(vec![self.default_column; self.num_columns])
-            .num_sticky_cols(self.num_sticky_cols)
-            .headers([
-                egui_table::HeaderRow {
-                    height: self.top_row_height,
-                    groups: if self.num_columns > 0 {
-                        vec![0..self.num_columns]
-                    } else {
-                        vec![]
-                    },
-                },
-                egui_table::HeaderRow::new(self.top_row_height),
-            ])
-            .auto_size_mode(self.auto_size_mode);
-
-        if let Some(row) = scroll_to_row {
-            table = table.scroll_to_row(row, None);
-        }
-
-        table.show(ui, self);
-    }
-}
-
