@@ -1,4 +1,4 @@
-use crate::types::{SheetVec, SortOrder};
+use crate::types::{FileHeader, SheetVec, SortOrder};
 
 /// Update a single cell in a sheet. Returns `true` if the row and column existed.
 pub fn edit_record(sheet: &mut SheetVec, row: usize, col: usize, value: &str) -> bool {
@@ -23,6 +23,16 @@ pub fn csv_quote(value: &str) -> String {
     } else {
         value.to_string()
     }
+}
+
+pub fn write_csv(path: &str, headers: &[FileHeader], data: &SheetVec) -> Result<(), csv::Error> {
+    let mut writer = csv::Writer::from_path(path)?;
+    writer.write_record(headers.iter().map(|h| h.name.as_str()))?;
+    for record in data {
+        writer.write_record(record)?;
+    }
+    writer.flush()?;
+    Ok(())
 }
 
 pub fn sort_data(mut sheet_clone: SheetVec, sort_by: (usize, SortOrder)) -> SheetVec {

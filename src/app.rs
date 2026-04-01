@@ -3,7 +3,7 @@ use egui_dock::{DockArea, Style};
 use std::path::PathBuf;
 use std::thread;
 
-use crate::data::{edit_record, filter_data, sort_data};
+use crate::data::{edit_record, filter_data, sort_data, write_csv};
 use crate::menu::OPEN_FILE_ID;
 use crate::read_csv::open_csv_file;
 use crate::types::{CsvTabViewer, MyApp, SheetTab, SortOrder, UiMessage, active_sheet_data};
@@ -200,6 +200,8 @@ impl eframe::App for MyApp {
                             edit_record(sheet, row_nr as usize, actual_col, &new_value);
                         }
                     }
+
+                    self.dirty_files.insert(filename);
                 }
             }
         }
@@ -208,6 +210,46 @@ impl eframe::App for MyApp {
 
         let tabs_no = self.tree.iter_all_tabs().count();
         let focused_tab = self.tree.find_active_focused().map(|(_, tab)| tab.id);
+
+        let save_file = ctx.input(|i| {
+            i.modifiers.command && i.key_pressed(Key::S)
+        }).then(|| {
+            self.tree.find_active_focused().and_then(|(_, tab)| {
+                let f = tab.chosen_file.clone();
+                if f.is_empty() { None } else { Some(f) }
+            })
+        }).flatten();
+
+        if let Some(filename) = save_file {
+            if let Some(data) = self.sheets_data.get(&filename) {
+                let headers = self.tree.iter_all_tabs()
+                    .find_map(|(_, tab)| tab.columns.get(&filename))
+                    .cloned()
+                    .unwrap_or_default();
+                if let Err(e) = write_csv(&filename, &headers, data) {
+                    eprintln!("Failed to save {}: {:?}", filename, e);
+                } else {
+                    self.dirty_files.remove(&filename);
+                    self.save_toast = Some((filename, std::time::Instant::now()));
+                }
+            }
+        }
+
+        if let Some((saved_file, saved_at)) = &self.save_toast {
+            if saved_at.elapsed() < std::time::Duration::from_secs(2) {
+                let short_name = saved_file.split('/').last().unwrap_or(saved_file.as_str()).to_string();
+                egui::Area::new(egui::Id::new("save_toast"))
+                    .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
+                    .show(ctx, |ui| {
+                        egui::Frame::popup(ui.style()).show(ui, |ui| {
+                            ui.label(format!("Saved: {short_name}"));
+                        });
+                    });
+                ctx.request_repaint();
+            } else {
+                self.save_toast = None;
+            }
+        }
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |_ui| {
             ctx.input(|input| {
@@ -240,6 +282,7 @@ impl eframe::App for MyApp {
                     focused_tab,
                     global_filter: &self.global_filter,
                     filters: &mut self.filters,
+                    dirty_files: &self.dirty_files,
                 },
             );
 

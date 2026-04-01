@@ -111,10 +111,13 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
         let file = get_last_element_from_path(&tab.chosen_file);
         let tab_id = &tab.id;
+        let dirty = self.dirty_files.contains(&tab.chosen_file);
 
         if let Some(file) = file {
             if file.is_empty() {
                 format!("[tab {tab_id}] Load file").into()
+            } else if dirty {
+                format!("[tab {tab_id}] {file} *").into()
             } else {
                 format!("[tab {tab_id}] {file}").into()
             }

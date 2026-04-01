@@ -14,6 +14,7 @@ mod types;
 mod ui;
 
 use eframe::egui;
+use std::collections::HashSet;
 use types::{MyApp, Ping, SheetTab, UiMessage};
 
 fn main() -> eframe::Result {
@@ -57,6 +58,8 @@ fn main() -> eframe::Result {
                 files_list: vec![],
                 global_filter: "".to_string(),
                 filters: HashMap::new(),
+                dirty_files: HashSet::new(),
+                save_toast: None,
             }))
         }),
     )

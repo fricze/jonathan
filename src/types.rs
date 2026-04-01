@@ -2,6 +2,7 @@ use csv::StringRecord;
 use egui::Context;
 use egui_dock::{DockState, NodeIndex, SurfaceIndex};
 use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -178,6 +179,8 @@ pub struct MyApp {
     pub files_list: Vec<String>,
     pub global_filter: String,
     pub filters: Filters,
+    pub dirty_files: HashSet<Filename>,
+    pub save_toast: Option<(String, Instant)>,
 }
 
 pub struct CsvTabViewer<'a> {
@@ -191,4 +194,5 @@ pub struct CsvTabViewer<'a> {
     pub focused_tab: Option<usize>,
     pub global_filter: &'a String,
     pub filters: &'a mut Filters,
+    pub dirty_files: &'a HashSet<Filename>,
 }
