@@ -108,6 +108,10 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
         });
     }
 
+    fn id(&mut self, tab: &mut Self::Tab) -> egui::Id {
+        egui::Id::new(("tab", tab.id))
+    }
+
     fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
         let file = get_last_element_from_path(&tab.chosen_file);
         let tab_id = &tab.id;
