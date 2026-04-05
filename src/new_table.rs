@@ -169,6 +169,7 @@ impl<'a> Table<'a> {
         }
 
         ui.ctx().copy_text(csv_rows.join("\n"));
+        crate::toast::show(ui.ctx(), "Copied to clipboard");
     }
 
     fn handle_keyboard_navigation(&mut self, ui: &egui::Ui) -> Option<u64> {
@@ -293,8 +294,16 @@ impl<'a> Table<'a> {
 
         if self.editing_cell.is_none() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             if let Some((row_nr, col_nr)) = self.selection.cursor().or(self.selection.anchor_cell) {
-                let actual_col = self.visible_col_indices.get(col_nr).copied().unwrap_or(col_nr);
-                if let Some(content) = self.data.get(row_nr as usize).and_then(|r| r.get(actual_col)) {
+                let actual_col = self
+                    .visible_col_indices
+                    .get(col_nr)
+                    .copied()
+                    .unwrap_or(col_nr);
+                if let Some(content) = self
+                    .data
+                    .get(row_nr as usize)
+                    .and_then(|r| r.get(actual_col))
+                {
                     *self.editing_cell = Some((row_nr, col_nr));
                     *self.edit_buffer = content.to_string();
                 }

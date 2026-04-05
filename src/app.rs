@@ -139,8 +139,14 @@ impl MyApp {
     }
 }
 
-impl eframe::App for MyApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+impl MyApp {
+    fn subsecond_fn(&mut self, ctx: &egui::Context) {
+        subsecond::call(|| {
+            self.update_inner(ctx);
+        });
+    }
+
+    fn update_inner(&mut self, ctx: &egui::Context) {
         // Handle macOS menu events
         #[cfg(target_os = "macos")]
         if let Ok(event) = MenuEvent::receiver().try_recv() {
@@ -230,26 +236,13 @@ impl eframe::App for MyApp {
                     eprintln!("Failed to save {}: {:?}", filename, e);
                 } else {
                     self.dirty_files.remove(&filename);
-                    self.save_toast = Some((filename, std::time::Instant::now()));
+                    let short_name = filename.split('/').last().unwrap_or(&filename).to_string();
+                    crate::toast::show(ctx, format!("Saved: {short_name}"));
                 }
             }
         }
 
-        if let Some((saved_file, saved_at)) = &self.save_toast {
-            if saved_at.elapsed() < std::time::Duration::from_secs(2) {
-                let short_name = saved_file.split('/').last().unwrap_or(saved_file.as_str()).to_string();
-                egui::Area::new(egui::Id::new("save_toast"))
-                    .anchor(egui::Align2::RIGHT_BOTTOM, egui::vec2(-16.0, -16.0))
-                    .show(ctx, |ui| {
-                        egui::Frame::popup(ui.style()).show(ui, |ui| {
-                            ui.label(format!("Saved: {short_name}"));
-                        });
-                    });
-                ctx.request_repaint();
-            } else {
-                self.save_toast = None;
-            }
-        }
+        crate::toast::render(ctx);
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |_ui| {
             ctx.input(|input| {
@@ -331,6 +324,14 @@ impl eframe::App for MyApp {
                     }
                 }
             }
+        });
+    }
+}
+
+impl eframe::App for MyApp {
+    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        subsecond::call(|| {
+            self.subsecond_fn(ctx);
         });
     }
 }
