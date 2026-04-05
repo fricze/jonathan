@@ -321,7 +321,7 @@ impl<'a> Table<'a> {
             .id_salt(id_salt)
             .num_rows(self.num_rows)
             .columns(vec![self.default_column; self.num_columns])
-            .num_sticky_cols(self.num_sticky_cols)
+            // .num_sticky_cols(self.num_sticky_cols)
             .headers([
                 egui_table::HeaderRow {
                     height: self.top_row_height,
@@ -376,7 +376,7 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
             .inner_margin(Margin::symmetric(margin, 0))
             .show(ui, |ui| {
                 if *row_nr == 0 {
-                    if 0 < col_range.start {
+                    if col_range.start > 0 {
                         // Our special grouped column.
                         let sticky = true;
                         let text = format!("This is group {group_index}");

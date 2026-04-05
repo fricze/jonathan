@@ -32,6 +32,9 @@ fn get_last_element_from_path(s: &str) -> Option<&str> {
 
 fn display_headers(ui: &mut egui::Ui, headers: &mut Vec<FileHeader>) {
     ui.horizontal_wrapped(|ui| {
+        let shift = ui.input(|i| i.modifiers.shift);
+        let mut solo: Option<usize> = None;
+
         for (index, file_header) in headers.iter_mut().enumerate() {
             let name = if file_header.name.is_empty() && index == 0 {
                 "id"
@@ -39,8 +42,18 @@ fn display_headers(ui: &mut egui::Ui, headers: &mut Vec<FileHeader>) {
                 &file_header.name
             };
 
-            ui.checkbox(&mut file_header.visible, name)
+            let resp = ui.checkbox(&mut file_header.visible, name)
                 .on_hover_text(format!("Show/hide column {}", name));
+
+            if resp.clicked() && shift {
+                solo = Some(index);
+            }
+        }
+
+        if let Some(solo_index) = solo {
+            for (index, file_header) in headers.iter_mut().enumerate() {
+                file_header.visible = index == solo_index;
+            }
         }
     });
 }
