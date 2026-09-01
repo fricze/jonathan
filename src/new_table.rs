@@ -69,7 +69,7 @@ impl<'a> Table<'a> {
 
         // --- Display mode ---
         let row = self.data.get(row_nr as usize);
-        if let Some(row) = row {
+        if let Some((_, row)) = row {
             let cell = row.get(actual_col);
             if let Some(cell_content) = cell {
                 let filter = self.filter;
@@ -158,7 +158,7 @@ impl<'a> Table<'a> {
                     let value = self
                         .data
                         .get(r as usize)
-                        .and_then(|row| row.get(actual_col))
+                        .and_then(|(_, row)| row.get(actual_col))
                         .unwrap_or("");
                     row_fields.push(csv_quote(value));
                 } else {
@@ -302,7 +302,7 @@ impl<'a> Table<'a> {
                 if let Some(content) = self
                     .data
                     .get(row_nr as usize)
-                    .and_then(|r| r.get(actual_col))
+                    .and_then(|(_, r)| r.get(actual_col))
                 {
                     *self.editing_cell = Some((row_nr, col_nr));
                     *self.edit_buffer = content.to_string();
@@ -379,6 +379,7 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
                     if col_range.start > 0 {
                         // Our special grouped column.
                         let sticky = true;
+                        // let sticky = false;
                         let text = format!("This is group {group_index}");
                         if sticky {
                             let font_id = egui::TextStyle::Heading.resolve(ui.style());
@@ -504,7 +505,7 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
             if let Some(content) = self
                 .data
                 .get(row_nr as usize)
-                .and_then(|r| r.get(actual_col))
+                .and_then(|(_, r)| r.get(actual_col))
             {
                 *self.editing_cell = Some((row_nr, col_nr));
                 *self.edit_buffer = content.to_string();

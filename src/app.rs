@@ -12,6 +12,13 @@ use crate::ui::drop::preview_files_being_dropped;
 #[cfg(target_os = "macos")]
 use muda::MenuEvent;
 
+/// Bump the request epoch for a (filename, tab_id) key and return the new value.
+fn bump_epoch(epochs: &mut std::collections::HashMap<(String, usize), u64>, key: (String, usize)) -> u64 {
+    let entry = epochs.entry(key).or_insert(0);
+    *entry += 1;
+    *entry
+}
+
 impl MyApp {
     pub fn load_file(&mut self, ctx: &egui::Context, file_name: String, tab_id: Option<usize>) {
         self.picked_path = Some(file_name.clone());
@@ -44,6 +51,7 @@ impl MyApp {
             let master_data = reader
                 .records()
                 .filter_map(|record| record.ok())
+                .enumerate()
                 .collect::<Vec<_>>();
 
             if let Err(e) = chan.send(UiMessage::SetMaster(master_data, file_name.clone())) {
@@ -85,12 +93,13 @@ impl MyApp {
                     let chan = chan.clone();
                     let ctx = ctx.clone();
                     let filename = filename.clone();
+                    let epoch = bump_epoch(&mut self.request_epoch, (filename.clone(), tab_id));
 
                     thread::spawn(move || {
                         let sorted = sort_data(master_clone, sort_order);
 
                         if let Err(e) =
-                            chan.send(UiMessage::SetDisplayData(sorted, filename, tab_id))
+                            chan.send(UiMessage::SetDisplayData(sorted, filename, tab_id, epoch))
                         {
                             eprintln!("Worker: Failed to send sorted data to UI thread: {:?}", e);
                         }
@@ -121,12 +130,13 @@ impl MyApp {
                     let chan = chan.clone();
                     let ctx = ctx.clone();
                     let filename = filename.clone();
+                    let epoch = bump_epoch(&mut self.request_epoch, (filename.clone(), tab_id));
 
                     thread::spawn(move || {
                         let filtered = filter_data(master_clone, filter);
 
                         if let Err(e) =
-                            chan.send(UiMessage::SetDisplayData(filtered, filename, tab_id))
+                            chan.send(UiMessage::SetDisplayData(filtered, filename, tab_id, epoch))
                         {
                             eprintln!("Worker: Failed to send filtered data to UI thread: {:?}", e);
                         }
@@ -178,8 +188,12 @@ impl MyApp {
                 UiMessage::SetMaster(master, file_name) => {
                     self.sheets_data.insert(file_name, master);
                 }
-                UiMessage::SetDisplayData(sorted, file_name, tab_id) => {
-                    self.filtered_data.insert((file_name, tab_id), sorted);
+                UiMessage::SetDisplayData(sorted, file_name, tab_id, epoch) => {
+                    let key = (file_name, tab_id);
+                    let current_epoch = self.request_epoch.get(&key).copied().unwrap_or(0);
+                    if epoch == current_epoch {
+                        self.filtered_data.insert(key, sorted);
+                    }
                 }
                 UiMessage::FilterGlobal(filter) => {
                     self.global_filter = filter;
@@ -194,20 +208,46 @@ impl MyApp {
                 }
                 UiMessage::OpenFile(file, tab) => self.load_file(ctx, file, tab),
                 UiMessage::EditCell(filename, tab_id, row_nr, actual_col, new_value) => {
-                    let updated = self
+                    // row_nr is an index into the currently displayed (filtered/sorted)
+                    // view. Resolve it to a stable master row index first, then always
+                    // write through to master -- the filtered view is just a cache.
+                    let key = (filename.clone(), tab_id);
+                    let master_row = self
                         .filtered_data
-                        .get_mut(&(filename.clone(), tab_id))
-                        .map_or(false, |sheet| {
-                            edit_record(sheet, row_nr as usize, actual_col, &new_value)
-                        });
+                        .get(&key)
+                        .and_then(|sheet| sheet.get(row_nr as usize))
+                        .map(|(idx, _)| *idx)
+                        .or(Some(row_nr as usize));
 
-                    if !updated {
+                    if let Some(master_row) = master_row {
                         if let Some(sheet) = self.sheets_data.get_mut(&filename) {
-                            edit_record(sheet, row_nr as usize, actual_col, &new_value);
+                            edit_record(sheet, master_row, actual_col, &new_value);
+                        }
+
+                        if let Some(display_sheet) = self.filtered_data.get_mut(&key) {
+                            edit_record(display_sheet, master_row, actual_col, &new_value);
                         }
                     }
 
                     self.dirty_files.insert(filename);
+                }
+                UiMessage::SaveFile(filename) => {
+                    if let Some(data) = self.sheets_data.get(&filename) {
+                        let headers = self
+                            .tree
+                            .iter_all_tabs()
+                            .find_map(|(_, tab)| tab.columns.get(&filename))
+                            .cloned()
+                            .unwrap_or_default();
+                        if let Err(e) = write_csv(&filename, &headers, data) {
+                            eprintln!("Failed to save {}: {:?}", filename, e);
+                        } else {
+                            self.dirty_files.remove(&filename);
+                            let short_name =
+                                filename.split('/').last().unwrap_or(&filename).to_string();
+                            crate::toast::show(ctx, format!("Saved: {short_name}"));
+                        }
+                    }
                 }
             }
         }
@@ -217,28 +257,19 @@ impl MyApp {
         let tabs_no = self.tree.iter_all_tabs().count();
         let focused_tab = self.tree.find_active_focused().map(|(_, tab)| tab.id);
 
-        let save_file = ctx.input(|i| {
-            i.modifiers.command && i.key_pressed(Key::S)
-        }).then(|| {
-            self.tree.find_active_focused().and_then(|(_, tab)| {
-                let f = tab.chosen_file.clone();
-                if f.is_empty() { None } else { Some(f) }
+        let save_file = ctx
+            .input(|i| i.modifiers.command && i.key_pressed(Key::S))
+            .then(|| {
+                self.tree.find_active_focused().and_then(|(_, tab)| {
+                    let f = tab.chosen_file.clone();
+                    if f.is_empty() { None } else { Some(f) }
+                })
             })
-        }).flatten();
+            .flatten();
 
         if let Some(filename) = save_file {
-            if let Some(data) = self.sheets_data.get(&filename) {
-                let headers = self.tree.iter_all_tabs()
-                    .find_map(|(_, tab)| tab.columns.get(&filename))
-                    .cloned()
-                    .unwrap_or_default();
-                if let Err(e) = write_csv(&filename, &headers, data) {
-                    eprintln!("Failed to save {}: {:?}", filename, e);
-                } else {
-                    self.dirty_files.remove(&filename);
-                    let short_name = filename.split('/').last().unwrap_or(&filename).to_string();
-                    crate::toast::show(ctx, format!("Saved: {short_name}"));
-                }
+            if let Err(e) = self.worker_chan.0.send(UiMessage::SaveFile(filename)) {
+                eprintln!("Worker: Failed to send SaveFile to UI thread: {:?}", e);
             }
         }
 

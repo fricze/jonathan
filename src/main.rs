@@ -69,6 +69,7 @@ fn main() -> eframe::Result {
                     global_filter: "".to_string(),
                     filters: HashMap::new(),
                     dirty_files: HashSet::new(),
+                    request_epoch: HashMap::new(),
                 }))
             }),
         )

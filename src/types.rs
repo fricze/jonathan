@@ -19,17 +19,26 @@ pub type Filename = String;
 
 pub type Ping = bool;
 
-pub type SheetVec = Vec<StringRecord>;
+/// (master row index, record). The master index is assigned once when a file
+/// is loaded and carried through sort/filter so edits to a filtered or sorted
+/// view can always be written back to the correct row in master data.
+pub type SheetRow = (usize, StringRecord);
+pub type SheetVec = Vec<SheetRow>;
 
 pub enum UiMessage {
     OpenFile(String, Option<TabId>),
     FilterSheet(Filename, Filter, TabId, Option<usize>),
     SortSheet(Filename, (ColumnId, SortOrder), TabId),
     FilterGlobal(Filter),
-    SetDisplayData(SheetVec, String, TabId),
+    /// Result of a background sort/filter. Carries the request epoch it was
+    /// computed for so a stale result (superseded by a newer request for the
+    /// same file+tab) can be dropped instead of racing to overwrite the
+    /// latest one.
+    SetDisplayData(SheetVec, String, TabId, u64),
     SetMaster(SheetVec, String),
     /// filename, tab_id, row_nr (in displayed data), actual col index, new value
     EditCell(Filename, TabId, u64, usize, String),
+    SaveFile(Filename),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -179,6 +188,9 @@ pub struct MyApp {
     pub global_filter: String,
     pub filters: Filters,
     pub dirty_files: HashSet<Filename>,
+    /// Bumped each time a sort/filter is requested for a (filename, tab_id);
+    /// used to drop results from superseded background requests.
+    pub request_epoch: HashMap<(Filename, TabId), u64>,
 }
 
 pub struct CsvTabViewer<'a> {
@@ -193,4 +205,91 @@ pub struct CsvTabViewer<'a> {
     pub global_filter: &'a String,
     pub filters: &'a mut Filters,
     pub dirty_files: &'a HashSet<Filename>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_single_clears_previous_selection() {
+        let mut s = SelectionState::default();
+        s.extend_to(0, 0);
+        s.select_single(3, 3);
+        assert!(s.selected_cells.contains(&(3, 3)));
+        assert_eq!(s.selected_cells.len(), 1);
+        assert_eq!(s.anchor_cell, Some((3, 3)));
+        assert_eq!(s.selection_end, None);
+    }
+
+    #[test]
+    fn extend_to_fills_rectangle_from_anchor() {
+        let mut s = SelectionState::default();
+        s.select_single(1, 1);
+        s.extend_to(3, 2);
+        for r in 1..=3 {
+            for c in 1..=2 {
+                assert!(s.contains(r, c), "expected ({r},{c}) selected");
+            }
+        }
+        assert_eq!(s.selected_cells.len(), 6);
+        assert_eq!(s.cursor(), Some((3, 2)));
+    }
+
+    #[test]
+    fn toggle_adds_and_removes_without_clearing_others() {
+        let mut s = SelectionState::default();
+        s.select_single(0, 0);
+        s.toggle(1, 1);
+        assert!(s.contains(0, 0));
+        assert!(s.contains(1, 1));
+        s.toggle(1, 1);
+        assert!(!s.contains(1, 1));
+        assert!(s.contains(0, 0));
+    }
+
+    #[test]
+    fn drag_updates_rectangle_and_ends_cleanly() {
+        let mut s = SelectionState::default();
+        s.start_drag(0, 0);
+        s.update_drag(2, 2);
+        assert_eq!(s.selected_cells.len(), 9);
+        assert!(s.is_dragging());
+        s.end_drag();
+        assert!(!s.is_dragging());
+    }
+
+    #[test]
+    fn active_sheet_data_prefers_filtered_view_when_present() {
+        let mut master = HashMap::new();
+        master.insert("f.csv".to_string(), vec![(0usize, StringRecord::from(vec!["m"]))]);
+        let mut filtered = HashMap::new();
+        filtered.insert(
+            ("f.csv".to_string(), 1usize),
+            vec![(0usize, StringRecord::from(vec!["filtered"]))],
+        );
+
+        let data = active_sheet_data(&master, &filtered, "f.csv", 1, true);
+        assert_eq!(data[0].1.get(0), Some("filtered"));
+    }
+
+    #[test]
+    fn active_sheet_data_falls_back_to_master_when_no_filter_active() {
+        let mut master = HashMap::new();
+        master.insert("f.csv".to_string(), vec![(0usize, StringRecord::from(vec!["m"]))]);
+        let filtered = HashMap::new();
+
+        let data = active_sheet_data(&master, &filtered, "f.csv", 1, false);
+        assert_eq!(data[0].1.get(0), Some("m"));
+    }
+
+    #[test]
+    fn active_sheet_data_returns_empty_when_filter_pending() {
+        let mut master = HashMap::new();
+        master.insert("f.csv".to_string(), vec![(0usize, StringRecord::from(vec!["m"]))]);
+        let filtered = HashMap::new();
+
+        let data = active_sheet_data(&master, &filtered, "f.csv", 1, true);
+        assert!(data.is_empty());
+    }
 }
