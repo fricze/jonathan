@@ -15,8 +15,9 @@ use crate::ui::drop::preview_files_being_dropped;
 use muda::MenuEvent;
 
 /// Outcome of a successful `apply_undo`/`apply_redo`, enough to describe the
-/// change in a toast: which column, what it had, what it's now.
+/// change in a toast: which row/column, what it had, what it's now.
 struct UndoRedoResult {
+    row: usize,
     column: Option<String>,
     overwritten: String,
     restored: String,
@@ -38,8 +39,8 @@ fn truncate_for_toast(value: &str) -> String {
 /// action and column, body shows the value change.
 fn undo_redo_toast(action: &str, result: &UndoRedoResult) -> (String, String) {
     let title = match &result.column {
-        Some(name) => format!("{action} {name}"),
-        None => action.to_string(),
+        Some(name) => format!("{action} row {} · {name}", result.row),
+        None => format!("{action} row {}", result.row),
     };
     let body = format!(
         "\"{}\" → \"{}\"",
@@ -103,6 +104,7 @@ impl MyApp {
         self.write_cell(&entry.filename, entry.master_row, entry.col, &entry.old_value);
         self.dirty_files.insert(entry.filename.clone());
         let column = self.column_name(&entry.filename, entry.col);
+        let row = entry.master_row;
         let restored = entry.old_value.clone();
         self.redo_stack.push(UndoEntry {
             filename: entry.filename,
@@ -110,7 +112,7 @@ impl MyApp {
             col: entry.col,
             old_value: current.clone(),
         });
-        Some(UndoRedoResult { column, restored, overwritten: current })
+        Some(UndoRedoResult { row, column, restored, overwritten: current })
     }
 
     /// Mirror of `apply_undo` between `redo_stack` and `undo_stack`.
@@ -120,6 +122,7 @@ impl MyApp {
         self.write_cell(&entry.filename, entry.master_row, entry.col, &entry.old_value);
         self.dirty_files.insert(entry.filename.clone());
         let column = self.column_name(&entry.filename, entry.col);
+        let row = entry.master_row;
         let restored = entry.old_value.clone();
         self.undo_stack.push(UndoEntry {
             filename: entry.filename,
@@ -127,7 +130,7 @@ impl MyApp {
             col: entry.col,
             old_value: current.clone(),
         });
-        Some(UndoRedoResult { column, restored, overwritten: current })
+        Some(UndoRedoResult { row, column, restored, overwritten: current })
     }
 }
 
