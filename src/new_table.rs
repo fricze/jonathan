@@ -58,18 +58,19 @@ impl<'a> Table<'a> {
                 .frame(false)
                 .show(ui)
                 .response;
-            let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
-            if output.lost_focus() {
-                if enter {
-                    self.sender.send_msg(UiMessage::EditCell(
-                        self.filename.clone(),
-                        self.tab_id,
-                        row_nr,
-                        actual_col,
-                        self.edit.edit_buffer.clone(),
-                    ));
-                }
-                // Enter → commit, Escape/click-away → revert (buffer is discarded)
+            let escape = ui.input(|i| i.key_pressed(egui::Key::Escape));
+            if escape {
+                // Escape → revert (buffer is discarded)
+                *self.edit.editing_cell = None;
+            } else if output.lost_focus() {
+                // Enter or click-away → commit
+                self.sender.send_msg(UiMessage::EditCell(
+                    self.filename.clone(),
+                    self.tab_id,
+                    row_nr,
+                    actual_col,
+                    self.edit.edit_buffer.clone(),
+                ));
                 *self.edit.editing_cell = None;
             } else {
                 output.request_focus();
