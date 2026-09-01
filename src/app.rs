@@ -6,7 +6,9 @@ use std::thread;
 use crate::data::{edit_record, filter_data, sort_data, write_csv};
 use crate::menu::OPEN_FILE_ID;
 use crate::read_csv::open_csv_file;
-use crate::types::{CsvTabViewer, MyApp, SendUiMessage, SheetTab, SortOrder, UiMessage, active_sheet_data};
+use crate::types::{
+    CsvTabViewer, MyApp, SendUiMessage, SheetTab, SortOrder, UiMessage, UndoEntry, active_sheet_data,
+};
 use crate::ui::drop::preview_files_being_dropped;
 
 #[cfg(target_os = "macos")]
@@ -17,6 +19,70 @@ fn bump_epoch(epochs: &mut std::collections::HashMap<(String, usize), u64>, key:
     let entry = epochs.entry(key).or_insert(0);
     *entry += 1;
     *entry
+}
+
+impl MyApp {
+    /// Read the current value of a master cell, addressed by stable row index.
+    fn read_cell(&self, filename: &str, master_row: usize, col: usize) -> Option<String> {
+        self.sheets_data
+            .get(filename)
+            .and_then(|sheet| sheet.iter().find(|(idx, _)| *idx == master_row))
+            .and_then(|(_, record)| record.get(col))
+            .map(|s| s.to_string())
+    }
+
+    /// Write `value` into a master cell (by stable row index) and every
+    /// filtered/sorted view of that file, across all tabs.
+    fn write_cell(&mut self, filename: &str, master_row: usize, col: usize, value: &str) {
+        if let Some(sheet) = self.sheets_data.get_mut(filename) {
+            edit_record(sheet, master_row, col, value);
+        }
+        for ((fname, _), display_sheet) in self.filtered_data.iter_mut() {
+            if fname == filename {
+                edit_record(display_sheet, master_row, col, value);
+            }
+        }
+    }
+
+    /// Pop `undo_stack`, write its old value back, and push the value it
+    /// overwrote onto `redo_stack`. Returns `true` if an entry was applied
+    /// (stack non-empty and the target cell still exists).
+    fn apply_undo(&mut self) -> bool {
+        let Some(entry) = self.undo_stack.pop() else {
+            return false;
+        };
+        let Some(current) = self.read_cell(&entry.filename, entry.master_row, entry.col) else {
+            return false;
+        };
+        self.write_cell(&entry.filename, entry.master_row, entry.col, &entry.old_value);
+        self.dirty_files.insert(entry.filename.clone());
+        self.redo_stack.push(UndoEntry {
+            filename: entry.filename,
+            master_row: entry.master_row,
+            col: entry.col,
+            old_value: current,
+        });
+        true
+    }
+
+    /// Mirror of `apply_undo` between `redo_stack` and `undo_stack`.
+    fn apply_redo(&mut self) -> bool {
+        let Some(entry) = self.redo_stack.pop() else {
+            return false;
+        };
+        let Some(current) = self.read_cell(&entry.filename, entry.master_row, entry.col) else {
+            return false;
+        };
+        self.write_cell(&entry.filename, entry.master_row, entry.col, &entry.old_value);
+        self.dirty_files.insert(entry.filename.clone());
+        self.undo_stack.push(UndoEntry {
+            filename: entry.filename,
+            master_row: entry.master_row,
+            col: entry.col,
+            old_value: current,
+        });
+        true
+    }
 }
 
 impl MyApp {
@@ -209,16 +275,30 @@ impl MyApp {
                         .or(Some(row_nr as usize));
 
                     if let Some(master_row) = master_row {
-                        if let Some(sheet) = self.sheets_data.get_mut(&filename) {
-                            edit_record(sheet, master_row, actual_col, &new_value);
+                        if let Some(old_value) = self.read_cell(&filename, master_row, actual_col) {
+                            self.undo_stack.push(UndoEntry {
+                                filename: filename.clone(),
+                                master_row,
+                                col: actual_col,
+                                old_value,
+                            });
+                            self.redo_stack.clear();
                         }
 
-                        if let Some(display_sheet) = self.filtered_data.get_mut(&key) {
-                            edit_record(display_sheet, master_row, actual_col, &new_value);
-                        }
+                        self.write_cell(&filename, master_row, actual_col, &new_value);
                     }
 
                     self.dirty_files.insert(filename);
+                }
+                UiMessage::Undo => {
+                    if self.apply_undo() {
+                        crate::toast::show(ctx, "Undo");
+                    }
+                }
+                UiMessage::Redo => {
+                    if self.apply_redo() {
+                        crate::toast::show(ctx, "Redo");
+                    }
                 }
                 UiMessage::SaveFile(filename) => {
                     if let Some(data) = self.sheets_data.get(&filename) {
@@ -258,6 +338,26 @@ impl MyApp {
 
         if let Some(filename) = save_file {
             self.worker_chan.0.send_msg(UiMessage::SaveFile(filename));
+        }
+
+        // Ignore undo/redo shortcuts while a cell is actively being edited so
+        // they don't clobber an in-progress edit buffer.
+        let any_cell_editing = self
+            .tree
+            .iter_all_tabs()
+            .any(|(_, tab)| tab.editing_cell.is_some());
+
+        if !any_cell_editing {
+            let (undo, redo) = ctx.input(|i| {
+                let cmd_z = i.modifiers.command && i.key_pressed(Key::Z);
+                (cmd_z && !i.modifiers.shift, cmd_z && i.modifiers.shift)
+            });
+
+            if undo {
+                self.worker_chan.0.send_msg(UiMessage::Undo);
+            } else if redo {
+                self.worker_chan.0.send_msg(UiMessage::Redo);
+            }
         }
 
         crate::toast::render(ctx);
@@ -343,5 +443,164 @@ impl eframe::App for MyApp {
         subsecond::call(|| {
             self.subsecond_fn(ctx);
         });
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::UiMessage;
+    use csv::StringRecord;
+    use egui_dock::DockState;
+    use std::collections::{HashMap, HashSet};
+    use std::sync::mpsc;
+
+    fn test_app() -> MyApp {
+        MyApp {
+            picked_path: None,
+            loading: false,
+            worker_chan: mpsc::channel::<UiMessage>(),
+            ui_chan: mpsc::channel::<crate::types::Ping>(),
+            sheets_data: HashMap::new(),
+            filtered_data: HashMap::new(),
+            tree: DockState::new(vec![SheetTab {
+                id: 1,
+                ..Default::default()
+            }]),
+            counter: 2,
+            files_list: vec![],
+            global_filter: "".to_string(),
+            filters: HashMap::new(),
+            dirty_files: HashSet::new(),
+            request_epoch: HashMap::new(),
+            undo_stack: vec![],
+            redo_stack: vec![],
+        }
+    }
+
+    fn row(idx: usize, fields: &[&str]) -> (usize, StringRecord) {
+        (idx, StringRecord::from(fields.to_vec()))
+    }
+
+    #[test]
+    fn undo_restores_previous_value_and_pushes_redo() {
+        let mut app = test_app();
+        app.sheets_data.insert(
+            "f.csv".to_string(),
+            vec![row(0, &["a"]), row(1, &["b"])],
+        );
+        app.undo_stack.push(UndoEntry {
+            filename: "f.csv".to_string(),
+            master_row: 0,
+            col: 0,
+            old_value: "original".to_string(),
+        });
+
+        assert!(app.apply_undo());
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("original".to_string()));
+        assert_eq!(app.redo_stack.len(), 1);
+        assert_eq!(app.redo_stack[0].old_value, "a");
+        assert!(app.dirty_files.contains("f.csv"));
+    }
+
+    #[test]
+    fn undo_then_redo_round_trips() {
+        let mut app = test_app();
+        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["current"])]);
+        app.undo_stack.push(UndoEntry {
+            filename: "f.csv".to_string(),
+            master_row: 0,
+            col: 0,
+            old_value: "before".to_string(),
+        });
+
+        app.apply_undo();
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("before".to_string()));
+
+        app.apply_redo();
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("current".to_string()));
+        // redo is itself undoable, so it lands back on undo_stack.
+        assert_eq!(app.undo_stack.len(), 1);
+        assert!(app.redo_stack.is_empty());
+    }
+
+    #[test]
+    fn multiple_undos_restore_in_reverse_order() {
+        let mut app = test_app();
+        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["v3"])]);
+        // Simulate two edits: v1 -> v2 -> v3, each push recording the prior value.
+        app.undo_stack.push(UndoEntry {
+            filename: "f.csv".to_string(),
+            master_row: 0,
+            col: 0,
+            old_value: "v1".to_string(),
+        });
+        app.undo_stack.push(UndoEntry {
+            filename: "f.csv".to_string(),
+            master_row: 0,
+            col: 0,
+            old_value: "v2".to_string(),
+        });
+
+        assert!(app.apply_undo());
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("v2".to_string()));
+        assert!(app.apply_undo());
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("v1".to_string()));
+    }
+
+    #[test]
+    fn undo_on_empty_stack_is_noop() {
+        let mut app = test_app();
+        assert!(!app.apply_undo());
+        assert!(app.dirty_files.is_empty());
+    }
+
+    #[test]
+    fn redo_on_empty_stack_is_noop() {
+        let mut app = test_app();
+        assert!(!app.apply_redo());
+        assert!(app.dirty_files.is_empty());
+    }
+
+    #[test]
+    fn undo_missing_target_cell_is_noop_and_drops_entry() {
+        let mut app = test_app();
+        // File was closed/removed since the edit was made.
+        app.undo_stack.push(UndoEntry {
+            filename: "gone.csv".to_string(),
+            master_row: 0,
+            col: 0,
+            old_value: "x".to_string(),
+        });
+
+        assert!(!app.apply_undo());
+        assert!(app.undo_stack.is_empty());
+        assert!(app.redo_stack.is_empty());
+    }
+
+    #[test]
+    fn new_edit_clears_redo_stack() {
+        let mut app = test_app();
+        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["b"])]);
+        app.redo_stack.push(UndoEntry {
+            filename: "f.csv".to_string(),
+            master_row: 0,
+            col: 0,
+            old_value: "stale".to_string(),
+        });
+
+        if let Some(old_value) = app.read_cell("f.csv", 0, 0) {
+            app.undo_stack.push(UndoEntry {
+                filename: "f.csv".to_string(),
+                master_row: 0,
+                col: 0,
+                old_value,
+            });
+            app.redo_stack.clear();
+        }
+        app.write_cell("f.csv", 0, 0, "c");
+
+        assert!(app.redo_stack.is_empty());
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("c".to_string()));
     }
 }

@@ -70,6 +70,8 @@ fn main() -> eframe::Result {
                     filters: HashMap::new(),
                     dirty_files: HashSet::new(),
                     request_epoch: HashMap::new(),
+                    undo_stack: vec![],
+                    redo_stack: vec![],
                 }))
             }),
         )

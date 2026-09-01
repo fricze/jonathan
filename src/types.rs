@@ -39,6 +39,8 @@ pub enum UiMessage {
     /// filename, tab_id, row_nr (in displayed data), actual col index, new value
     EditCell(Filename, TabId, u64, usize, String),
     SaveFile(Filename),
+    Undo,
+    Redo,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -187,6 +189,18 @@ pub fn active_sheet_data<'a>(
     }
 }
 
+/// A single-cell edit that can be undone/redone. Holds the value the cell
+/// had *before* the edit being recorded was applied, so undoing means
+/// writing `old_value` back and redoing means re-applying whatever was
+/// overwritten.
+#[derive(Clone)]
+pub struct UndoEntry {
+    pub filename: Filename,
+    pub master_row: usize,
+    pub col: usize,
+    pub old_value: String,
+}
+
 pub struct MyApp {
     pub picked_path: Option<String>,
     pub loading: bool,
@@ -205,6 +219,9 @@ pub struct MyApp {
     /// Bumped each time a sort/filter is requested for a (filename, tab_id);
     /// used to drop results from superseded background requests.
     pub request_epoch: HashMap<(Filename, TabId), u64>,
+    /// Global undo/redo history for cell edits. A new edit clears redo_stack.
+    pub undo_stack: Vec<UndoEntry>,
+    pub redo_stack: Vec<UndoEntry>,
 }
 
 pub struct CsvTabViewer<'a> {
