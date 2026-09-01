@@ -3,7 +3,24 @@ use std::{collections::BTreeMap, sync::mpsc::Sender};
 use egui::{Align2, Color32, Context, Id, Margin, NumExt as _, Sense, TextFormat};
 
 use crate::data::csv_quote;
-use crate::types::{FileHeader, Filename, SelectionState, SheetVec, SortOrder, TabId, UiMessage};
+use crate::types::{FileHeader, Filename, SelectionState, SendUiMessage, SheetVec, SortOrder, TabId, UiMessage};
+
+/// Sizing/rendering knobs for a `Table`. All owned, cheap to copy/construct,
+/// grouped separately from data/state so adding a render tweak doesn't widen
+/// the main `Table` field list.
+pub struct RenderConfig {
+    pub num_sticky_cols: usize,
+    pub default_column: egui_table::Column,
+    pub auto_size_mode: egui_table::AutoSizeMode,
+    pub top_row_height: f32,
+    pub row_height: f32,
+}
+
+/// In-progress cell edit state, threaded from the owning `SheetTab`.
+pub struct EditState<'a> {
+    pub editing_cell: &'a mut Option<(u64, usize)>,
+    pub edit_buffer: &'a mut String,
+}
 
 pub struct Table<'a> {
     pub data: &'a SheetVec,
@@ -12,36 +29,31 @@ pub struct Table<'a> {
     /// Maps visible column index to actual data column index
     pub visible_col_indices: Vec<usize>,
     pub num_rows: u64,
-    pub num_sticky_cols: usize,
-    pub default_column: egui_table::Column,
-    pub auto_size_mode: egui_table::AutoSizeMode,
-    pub top_row_height: f32,
-    pub row_height: f32,
+    pub render: RenderConfig,
     pub is_row_expanded: BTreeMap<u64, bool>,
     pub prefetched: Vec<egui_table::PrefetchInfo>,
     pub sender: &'a Sender<UiMessage>,
     pub filename: Filename,
     pub tab_id: TabId,
     pub filter: &'a str,
-    pub editing_cell: &'a mut Option<(u64, usize)>,
-    pub edit_buffer: &'a mut String,
+    pub edit: EditState<'a>,
     pub selection: &'a mut SelectionState,
     pub last_visible_rows: &'a mut Option<std::ops::Range<u64>>,
 }
 
 impl<'a> Table<'a> {
+    /// Maps a visible column index to its actual data column index.
+    fn actual_col(&self, col_nr: usize) -> usize {
+        self.visible_col_indices.get(col_nr).copied().unwrap_or(col_nr)
+    }
+
     fn cell_content_ui(&mut self, row_nr: u64, col_nr: usize, ui: &mut egui::Ui) {
-        // Map visible column index to actual data column index
-        let actual_col = self
-            .visible_col_indices
-            .get(col_nr)
-            .copied()
-            .unwrap_or(col_nr);
+        let actual_col = self.actual_col(col_nr);
 
         // --- Edit mode ---
-        if *self.editing_cell == Some((row_nr, col_nr)) {
+        if *self.edit.editing_cell == Some((row_nr, col_nr)) {
             let _edit_id = Id::new(("cell_edit", row_nr, col_nr, self.tab_id));
-            let output = egui::TextEdit::singleline(self.edit_buffer)
+            let output = egui::TextEdit::singleline(self.edit.edit_buffer)
                 .margin(egui::Margin::ZERO)
                 .frame(false)
                 .show(ui)
@@ -49,18 +61,16 @@ impl<'a> Table<'a> {
             let enter = ui.input(|i| i.key_pressed(egui::Key::Enter));
             if output.lost_focus() {
                 if enter {
-                    if let Err(e) = self.sender.send(UiMessage::EditCell(
+                    self.sender.send_msg(UiMessage::EditCell(
                         self.filename.clone(),
                         self.tab_id,
                         row_nr,
                         actual_col,
-                        self.edit_buffer.clone(),
-                    )) {
-                        eprintln!("Failed to send EditCell: {:?}", e);
-                    }
+                        self.edit.edit_buffer.clone(),
+                    ));
                 }
                 // Enter → commit, Escape/click-away → revert (buffer is discarded)
-                *self.editing_cell = None;
+                *self.edit.editing_cell = None;
             } else {
                 output.request_focus();
             }
@@ -101,14 +111,12 @@ impl<'a> Table<'a> {
                 };
 
                 if label.clicked() && ui.ctx().input(|i| i.modifiers.command) {
-                    if let Err(e) = self.sender.send(UiMessage::FilterSheet(
+                    self.sender.send_msg(UiMessage::FilterSheet(
                         self.filename.to_string(),
                         cell_content.to_string(),
                         self.tab_id,
                         None,
-                    )) {
-                        eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                    }
+                    ));
                 }
             }
         }
@@ -154,7 +162,7 @@ impl<'a> Table<'a> {
             let mut row_fields: Vec<String> = Vec::new();
             for c in min_col..=max_col {
                 if self.selection.selected_cells.contains(&(r, c)) {
-                    let actual_col = self.visible_col_indices.get(c).copied().unwrap_or(c);
+                    let actual_col = self.actual_col(c);
                     let value = self
                         .data
                         .get(r as usize)
@@ -173,7 +181,7 @@ impl<'a> Table<'a> {
     }
 
     fn handle_keyboard_navigation(&mut self, ui: &egui::Ui) -> Option<u64> {
-        if self.editing_cell.is_some() {
+        if self.edit.editing_cell.is_some() {
             return None;
         }
         let (anchor_row, anchor_col) = self.selection.anchor_cell?;
@@ -240,7 +248,7 @@ impl<'a> Table<'a> {
     }
 
     fn draw_selection_border(&self, ui: &egui::Ui, row_nr: u64, col_nr: usize, r: egui::Rect) {
-        let is_editing = *self.editing_cell == Some((row_nr, col_nr));
+        let is_editing = *self.edit.editing_cell == Some((row_nr, col_nr));
         if !is_editing {
             ui.painter()
                 .rect_filled(r, 0.0, Color32::from_rgba_unmultiplied(0, 200, 80, 15));
@@ -292,20 +300,16 @@ impl<'a> Table<'a> {
 
         self.handle_clipboard_copy(ui);
 
-        if self.editing_cell.is_none() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+        if self.edit.editing_cell.is_none() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             if let Some((row_nr, col_nr)) = self.selection.cursor().or(self.selection.anchor_cell) {
-                let actual_col = self
-                    .visible_col_indices
-                    .get(col_nr)
-                    .copied()
-                    .unwrap_or(col_nr);
+                let actual_col = self.actual_col(col_nr);
                 if let Some(content) = self
                     .data
                     .get(row_nr as usize)
                     .and_then(|(_, r)| r.get(actual_col))
                 {
-                    *self.editing_cell = Some((row_nr, col_nr));
-                    *self.edit_buffer = content.to_string();
+                    *self.edit.editing_cell = Some((row_nr, col_nr));
+                    *self.edit.edit_buffer = content.to_string();
                 }
             }
         }
@@ -314,26 +318,26 @@ impl<'a> Table<'a> {
         let drag_scroll = self.handle_drag_autoscroll(ui);
         let scroll_to_row = drag_scroll.or(nav_scroll);
 
-        let id_salt = Id::new("table_demo");
+        let id_salt = Id::new(("csv_table", self.tab_id));
         let _state_id = egui_table::Table::new().id_salt(id_salt).get_id(ui);
 
         let mut table = egui_table::Table::new()
             .id_salt(id_salt)
             .num_rows(self.num_rows)
-            .columns(vec![self.default_column; self.num_columns])
-            // .num_sticky_cols(self.num_sticky_cols)
+            .columns(vec![self.render.default_column; self.num_columns])
+            // .num_sticky_cols(self.render.num_sticky_cols)
             .headers([
                 egui_table::HeaderRow {
-                    height: self.top_row_height,
+                    height: self.render.top_row_height,
                     groups: if self.num_columns > 0 {
                         vec![0..self.num_columns]
                     } else {
                         vec![]
                     },
                 },
-                egui_table::HeaderRow::new(self.top_row_height),
+                egui_table::HeaderRow::new(self.render.top_row_height),
             ])
-            .auto_size_mode(self.auto_size_mode);
+            .auto_size_mode(self.render.auto_size_mode);
 
         if let Some(row) = scroll_to_row {
             table = table.scroll_to_row(row, None);
@@ -363,12 +367,7 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
             ..
         } = cell_inf;
 
-        // Map visible column index to actual column index
-        let actual_col_index = self
-            .visible_col_indices
-            .get(*group_index)
-            .copied()
-            .unwrap_or(*group_index);
+        let actual_col_index = self.actual_col(*group_index);
 
         let margin = 4;
 
@@ -441,15 +440,11 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
 
                                         header.sort = Some(new_sort);
 
-                                        if let Err(e) = self.sender.send(UiMessage::SortSheet(
+                                        self.sender.send_msg(UiMessage::SortSheet(
                                             self.filename.clone(),
                                             (actual_col_index, new_sort.clone()),
                                             self.tab_id,
-                                        )) {
-                                            println!("{:?}", e)
-                                        };
-
-                                        ()
+                                        ));
                                     } else {
                                         header.sort = None
                                     }
@@ -470,7 +465,7 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
 
         let cell_rect = ui.max_rect();
 
-        if *self.editing_cell == Some((row_nr, col_nr)) {
+        if *self.edit.editing_cell == Some((row_nr, col_nr)) {
             ui.painter().rect_filled(cell_rect, 0.0, Color32::WHITE);
         }
 
@@ -497,18 +492,14 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
         }
 
         if cell_response.double_clicked() {
-            let actual_col = self
-                .visible_col_indices
-                .get(col_nr)
-                .copied()
-                .unwrap_or(col_nr);
+            let actual_col = self.actual_col(col_nr);
             if let Some(content) = self
                 .data
                 .get(row_nr as usize)
                 .and_then(|(_, r)| r.get(actual_col))
             {
-                *self.editing_cell = Some((row_nr, col_nr));
-                *self.edit_buffer = content.to_string();
+                *self.edit.editing_cell = Some((row_nr, col_nr));
+                *self.edit.edit_buffer = content.to_string();
             }
         } else if cell_response.clicked() {
             let modifiers = ui.ctx().input(|i| i.modifiers);
@@ -536,6 +527,6 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
                 how_expanded * fully_expanded_row_height
             })
             .sum::<f32>()
-            + row_nr as f32 * self.row_height
+            + row_nr as f32 * self.render.row_height
     }
 }

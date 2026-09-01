@@ -5,12 +5,12 @@ use egui_dock::{NodeIndex, SurfaceIndex};
 
 use egui::Color32;
 
-use crate::types::{active_sheet_data, CsvTabViewer, FileHeader, SheetTab, UiMessage};
+use crate::types::{active_sheet_data, CsvTabViewer, FileHeader, SendUiMessage, SheetTab, UiMessage};
 use eframe::egui;
 
 use std::sync::mpsc::Sender;
 
-use crate::new_table::Table;
+use crate::new_table::{EditState, RenderConfig, Table};
 
 fn open_file_dialog(sender: &Sender<UiMessage>, tab: &usize) {
     if let Some(paths) = rfd::FileDialog::new()
@@ -18,10 +18,7 @@ fn open_file_dialog(sender: &Sender<UiMessage>, tab: &usize) {
         .pick_files()
     {
         for path in paths {
-            if let Err(e) = sender.send(UiMessage::OpenFile(path.display().to_string(), Some(*tab)))
-            {
-                eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-            }
+            sender.send_msg(UiMessage::OpenFile(path.display().to_string(), Some(*tab)));
         }
     }
 }
@@ -183,25 +180,21 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
                         egui::TextEdit::singleline(filter).id(filter_input_id),
                     );
                     if response.changed() {
-                        if let Err(e) = &self.sender.send(UiMessage::FilterSheet(
+                        self.sender.send_msg(UiMessage::FilterSheet(
                             chosen_file.to_string(),
                             filter.to_string(),
                             tab_id,
                             None,
-                        )) {
-                            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                        }
+                        ));
                     }
 
                     if ui.button("Clear (esc)").clicked() {
-                        if let Err(e) = &self.sender.send(UiMessage::FilterSheet(
+                        self.sender.send_msg(UiMessage::FilterSheet(
                             chosen_file.to_string(),
                             "".to_string(),
                             tab_id,
                             None,
-                        )) {
-                            eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                        }
+                        ));
                     }
                 });
             }
@@ -216,14 +209,12 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
 
                 if self.ctx.input(|i| i.key_pressed(Key::Escape)) {
                     self.ctx.memory_mut(|m| m.surrender_focus(filter_input_id));
-                    if let Err(e) = &self.sender.send(UiMessage::FilterSheet(
+                    self.sender.send_msg(UiMessage::FilterSheet(
                         chosen_file.to_string(),
                         "".to_string(),
                         tab_id,
                         None,
-                    )) {
-                        eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                    }
+                    ));
                 }
             }
         }
@@ -284,21 +275,25 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
                 columns: columns.as_mut(),
                 visible_col_indices,
                 num_rows: len as u64,
-                num_sticky_cols: if num_visible_columns > 0 { 1 } else { 0 },
-                default_column: egui_table::Column::new(30.0)
-                    .range(10.0..=500.0)
-                    .resizable(true),
-                auto_size_mode: egui_table::AutoSizeMode::default(),
-                top_row_height: 24.0,
-                row_height: 18.0,
+                render: RenderConfig {
+                    num_sticky_cols: if num_visible_columns > 0 { 1 } else { 0 },
+                    default_column: egui_table::Column::new(30.0)
+                        .range(10.0..=500.0)
+                        .resizable(true),
+                    auto_size_mode: egui_table::AutoSizeMode::default(),
+                    top_row_height: 24.0,
+                    row_height: 18.0,
+                },
                 is_row_expanded: Default::default(),
                 prefetched: vec![],
                 sender: self.sender,
                 tab_id: tab_id,
                 filename: chosen_file.clone(),
                 filter: &filter,
-                editing_cell: &mut tab.editing_cell,
-                edit_buffer: &mut tab.edit_buffer,
+                edit: EditState {
+                    editing_cell: &mut tab.editing_cell,
+                    edit_buffer: &mut tab.edit_buffer,
+                },
                 selection: &mut tab.selection,
                 last_visible_rows: &mut tab.last_visible_rows,
             };

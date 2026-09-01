@@ -6,7 +6,7 @@ use std::thread;
 use crate::data::{edit_record, filter_data, sort_data, write_csv};
 use crate::menu::OPEN_FILE_ID;
 use crate::read_csv::open_csv_file;
-use crate::types::{CsvTabViewer, MyApp, SheetTab, SortOrder, UiMessage, active_sheet_data};
+use crate::types::{CsvTabViewer, MyApp, SendUiMessage, SheetTab, SortOrder, UiMessage, active_sheet_data};
 use crate::ui::drop::preview_files_being_dropped;
 
 #[cfg(target_os = "macos")]
@@ -54,9 +54,7 @@ impl MyApp {
                 .enumerate()
                 .collect::<Vec<_>>();
 
-            if let Err(e) = chan.send(UiMessage::SetMaster(master_data, file_name.clone())) {
-                eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-            }
+            chan.send_msg(UiMessage::SetMaster(master_data, file_name.clone()));
 
             ctx.request_repaint();
         });
@@ -98,11 +96,7 @@ impl MyApp {
                     thread::spawn(move || {
                         let sorted = sort_data(master_clone, sort_order);
 
-                        if let Err(e) =
-                            chan.send(UiMessage::SetDisplayData(sorted, filename, tab_id, epoch))
-                        {
-                            eprintln!("Worker: Failed to send sorted data to UI thread: {:?}", e);
-                        }
+                        chan.send_msg(UiMessage::SetDisplayData(sorted, filename, tab_id, epoch));
 
                         ctx.request_repaint();
                     });
@@ -135,11 +129,7 @@ impl MyApp {
                     thread::spawn(move || {
                         let filtered = filter_data(master_clone, filter);
 
-                        if let Err(e) =
-                            chan.send(UiMessage::SetDisplayData(filtered, filename, tab_id, epoch))
-                        {
-                            eprintln!("Worker: Failed to send filtered data to UI thread: {:?}", e);
-                        }
+                        chan.send_msg(UiMessage::SetDisplayData(filtered, filename, tab_id, epoch));
 
                         ctx.request_repaint();
                     });
@@ -166,10 +156,9 @@ impl MyApp {
                     .pick_file()
                 {
                     if let Some(path_str) = path.to_str() {
-                        let _ = self
-                            .worker_chan
+                        self.worker_chan
                             .0
-                            .send(UiMessage::OpenFile(path_str.to_string(), None));
+                            .send_msg(UiMessage::OpenFile(path_str.to_string(), None));
                     }
                 }
             }
@@ -268,9 +257,7 @@ impl MyApp {
             .flatten();
 
         if let Some(filename) = save_file {
-            if let Err(e) = self.worker_chan.0.send(UiMessage::SaveFile(filename)) {
-                eprintln!("Worker: Failed to send SaveFile to UI thread: {:?}", e);
-            }
+            self.worker_chan.0.send_msg(UiMessage::SaveFile(filename));
         }
 
         crate::toast::render(ctx);
@@ -278,13 +265,9 @@ impl MyApp {
         egui::TopBottomPanel::top("top_panel").show(ctx, |_ui| {
             ctx.input(|input| {
                 if input.key_pressed(Key::X) {
-                    if let Err(e) = &self
-                        .worker_chan
+                    self.worker_chan
                         .0
-                        .send(UiMessage::FilterGlobal("".to_string()))
-                    {
-                        eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                    }
+                        .send_msg(UiMessage::FilterGlobal("".to_string()));
                 }
             });
         });
@@ -346,13 +329,9 @@ impl MyApp {
                         .to_str()
                         .unwrap_or("");
 
-                    if let Err(e) = self
-                        .worker_chan
+                    self.worker_chan
                         .0
-                        .send(UiMessage::OpenFile(path.to_string(), None))
-                    {
-                        eprintln!("Worker: Failed to send page data to UI thread: {:?}", e);
-                    }
+                        .send_msg(UiMessage::OpenFile(path.to_string(), None));
                 }
             }
         });

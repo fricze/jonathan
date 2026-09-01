@@ -150,6 +150,20 @@ pub struct SheetTab {
 
 pub type Chan<Msg> = (Sender<Msg>, Receiver<Msg>);
 
+/// Send a `UiMessage`, logging to stderr on failure instead of the caller
+/// having to repeat the same `if let Err(e) = ... { eprintln!(...) }` boilerplate.
+pub trait SendUiMessage {
+    fn send_msg(&self, msg: UiMessage);
+}
+
+impl SendUiMessage for Sender<UiMessage> {
+    fn send_msg(&self, msg: UiMessage) {
+        if let Err(e) = self.send(msg) {
+            eprintln!("Worker: Failed to send message to UI thread: {:?}", e);
+        }
+    }
+}
+
 pub type Filters = HashMap<(Filename, TabId), String>;
 
 /// Returns the sheet data to display for a given file+tab:
