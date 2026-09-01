@@ -14,6 +14,41 @@ use crate::ui::drop::preview_files_being_dropped;
 #[cfg(target_os = "macos")]
 use muda::MenuEvent;
 
+/// Outcome of a successful `apply_undo`/`apply_redo`, enough to describe the
+/// change in a toast: which column, what it had, what it's now.
+struct UndoRedoResult {
+    column: Option<String>,
+    overwritten: String,
+    restored: String,
+}
+
+/// Truncate a cell value for display in a toast, so a huge field doesn't blow it up.
+fn truncate_for_toast(value: &str) -> String {
+    const MAX: usize = 24;
+    if value.is_empty() {
+        "(empty)".to_string()
+    } else if value.chars().count() > MAX {
+        format!("{}…", value.chars().take(MAX).collect::<String>())
+    } else {
+        value.to_string()
+    }
+}
+
+/// Split an undo/redo outcome into a toast (title, body): title names the
+/// action and column, body shows the value change.
+fn undo_redo_toast(action: &str, result: &UndoRedoResult) -> (String, String) {
+    let title = match &result.column {
+        Some(name) => format!("{action} {name}"),
+        None => action.to_string(),
+    };
+    let body = format!(
+        "\"{}\" → \"{}\"",
+        truncate_for_toast(&result.overwritten),
+        truncate_for_toast(&result.restored)
+    );
+    (title, body)
+}
+
 /// Bump the request epoch for a (filename, tab_id) key and return the new value.
 fn bump_epoch(epochs: &mut std::collections::HashMap<(String, usize), u64>, key: (String, usize)) -> u64 {
     let entry = epochs.entry(key).or_insert(0);
@@ -31,6 +66,21 @@ impl MyApp {
             .map(|s| s.to_string())
     }
 
+    /// Look up a column's header name for a file from any tab that has it loaded.
+    fn column_name(&self, filename: &str, col: usize) -> Option<String> {
+        self.tree
+            .iter_all_tabs()
+            .find_map(|(_, tab)| tab.columns.get(filename))
+            .and_then(|headers| headers.get(col))
+            .map(|h| {
+                if h.name.is_empty() && col == 0 {
+                    "id".to_string()
+                } else {
+                    h.name.clone()
+                }
+            })
+    }
+
     /// Write `value` into a master cell (by stable row index) and every
     /// filtered/sorted view of that file, across all tabs.
     fn write_cell(&mut self, filename: &str, master_row: usize, col: usize, value: &str) {
@@ -45,43 +95,39 @@ impl MyApp {
     }
 
     /// Pop `undo_stack`, write its old value back, and push the value it
-    /// overwrote onto `redo_stack`. Returns `true` if an entry was applied
-    /// (stack non-empty and the target cell still exists).
-    fn apply_undo(&mut self) -> bool {
-        let Some(entry) = self.undo_stack.pop() else {
-            return false;
-        };
-        let Some(current) = self.read_cell(&entry.filename, entry.master_row, entry.col) else {
-            return false;
-        };
+    /// overwrote onto `redo_stack`. Returns `None` if the stack was empty or
+    /// the target cell no longer exists.
+    fn apply_undo(&mut self) -> Option<UndoRedoResult> {
+        let entry = self.undo_stack.pop()?;
+        let current = self.read_cell(&entry.filename, entry.master_row, entry.col)?;
         self.write_cell(&entry.filename, entry.master_row, entry.col, &entry.old_value);
         self.dirty_files.insert(entry.filename.clone());
+        let column = self.column_name(&entry.filename, entry.col);
+        let restored = entry.old_value.clone();
         self.redo_stack.push(UndoEntry {
             filename: entry.filename,
             master_row: entry.master_row,
             col: entry.col,
-            old_value: current,
+            old_value: current.clone(),
         });
-        true
+        Some(UndoRedoResult { column, restored, overwritten: current })
     }
 
     /// Mirror of `apply_undo` between `redo_stack` and `undo_stack`.
-    fn apply_redo(&mut self) -> bool {
-        let Some(entry) = self.redo_stack.pop() else {
-            return false;
-        };
-        let Some(current) = self.read_cell(&entry.filename, entry.master_row, entry.col) else {
-            return false;
-        };
+    fn apply_redo(&mut self) -> Option<UndoRedoResult> {
+        let entry = self.redo_stack.pop()?;
+        let current = self.read_cell(&entry.filename, entry.master_row, entry.col)?;
         self.write_cell(&entry.filename, entry.master_row, entry.col, &entry.old_value);
         self.dirty_files.insert(entry.filename.clone());
+        let column = self.column_name(&entry.filename, entry.col);
+        let restored = entry.old_value.clone();
         self.undo_stack.push(UndoEntry {
             filename: entry.filename,
             master_row: entry.master_row,
             col: entry.col,
-            old_value: current,
+            old_value: current.clone(),
         });
-        true
+        Some(UndoRedoResult { column, restored, overwritten: current })
     }
 }
 
@@ -291,13 +337,15 @@ impl MyApp {
                     self.dirty_files.insert(filename);
                 }
                 UiMessage::Undo => {
-                    if self.apply_undo() {
-                        crate::toast::show(ctx, "Undo");
+                    if let Some(result) = self.apply_undo() {
+                        let (title, body) = undo_redo_toast("Undo", &result);
+                        crate::toast::show_titled(ctx, title, body);
                     }
                 }
                 UiMessage::Redo => {
-                    if self.apply_redo() {
-                        crate::toast::show(ctx, "Redo");
+                    if let Some(result) = self.apply_redo() {
+                        let (title, body) = undo_redo_toast("Redo", &result);
+                        crate::toast::show_titled(ctx, title, body);
                     }
                 }
                 UiMessage::SaveFile(filename) => {
@@ -496,7 +544,9 @@ mod tests {
             old_value: "original".to_string(),
         });
 
-        assert!(app.apply_undo());
+        let result = app.apply_undo().expect("undo should apply");
+        assert_eq!(result.restored, "original");
+        assert_eq!(result.overwritten, "a");
         assert_eq!(app.read_cell("f.csv", 0, 0), Some("original".to_string()));
         assert_eq!(app.redo_stack.len(), 1);
         assert_eq!(app.redo_stack[0].old_value, "a");
@@ -542,23 +592,23 @@ mod tests {
             old_value: "v2".to_string(),
         });
 
-        assert!(app.apply_undo());
+        assert!(app.apply_undo().is_some());
         assert_eq!(app.read_cell("f.csv", 0, 0), Some("v2".to_string()));
-        assert!(app.apply_undo());
+        assert!(app.apply_undo().is_some());
         assert_eq!(app.read_cell("f.csv", 0, 0), Some("v1".to_string()));
     }
 
     #[test]
     fn undo_on_empty_stack_is_noop() {
         let mut app = test_app();
-        assert!(!app.apply_undo());
+        assert!(app.apply_undo().is_none());
         assert!(app.dirty_files.is_empty());
     }
 
     #[test]
     fn redo_on_empty_stack_is_noop() {
         let mut app = test_app();
-        assert!(!app.apply_redo());
+        assert!(app.apply_redo().is_none());
         assert!(app.dirty_files.is_empty());
     }
 
@@ -573,7 +623,7 @@ mod tests {
             old_value: "x".to_string(),
         });
 
-        assert!(!app.apply_undo());
+        assert!(app.apply_undo().is_none());
         assert!(app.undo_stack.is_empty());
         assert!(app.redo_stack.is_empty());
     }
