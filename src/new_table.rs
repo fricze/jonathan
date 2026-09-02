@@ -275,7 +275,11 @@ impl<'a> Table<'a> {
         if delete {
             self.sender.send_msg(UiMessage::DeleteRow(self.filename.clone(), self.tab_id, row_nr));
         } else if insert {
-            self.sender.send_msg(UiMessage::InsertRow(self.filename.clone(), self.tab_id, Some(row_nr)));
+            self.sender.send_msg(UiMessage::InsertRow(
+                self.filename.clone(),
+                self.tab_id,
+                Some((row_nr, crate::types::InsertPosition::After)),
+            ));
         }
     }
 
@@ -618,11 +622,20 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
         }
 
         cell_response.context_menu(|ui| {
-            // InsertRow's row_nr means "insert after" (None = append at the
-            // end) -- there's no "insert before" primitive, so only offer
-            // insert-below here; Cmd+Enter has the same below-only semantics.
+            if ui.button("Insert row above").clicked() {
+                self.sender.send_msg(UiMessage::InsertRow(
+                    self.filename.clone(),
+                    self.tab_id,
+                    Some((row_nr, crate::types::InsertPosition::Before)),
+                ));
+                ui.close();
+            }
             if ui.button("Insert row below").clicked() {
-                self.sender.send_msg(UiMessage::InsertRow(self.filename.clone(), self.tab_id, Some(row_nr)));
+                self.sender.send_msg(UiMessage::InsertRow(
+                    self.filename.clone(),
+                    self.tab_id,
+                    Some((row_nr, crate::types::InsertPosition::After)),
+                ));
                 ui.close();
             }
             if ui.button("Delete row").clicked() {

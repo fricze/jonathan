@@ -36,6 +36,13 @@ pub enum ReplaceScope {
     AllColumns,
 }
 
+/// Where to insert relative to an anchor row/column.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum InsertPosition {
+    Before,
+    After,
+}
+
 pub enum UiMessage {
     OpenFile(String, Option<TabId>),
     FilterSheet(Filename, Filter, TabId, Option<usize>),
@@ -59,8 +66,9 @@ pub enum UiMessage {
     ReplaceAll(Filename, TabId, String, String, ReplaceScope),
     /// filename, tab_id, row_nr (in displayed data) to delete
     DeleteRow(Filename, TabId, u64),
-    /// filename, tab_id, row_nr (in displayed data) to insert after (None = append)
-    InsertRow(Filename, TabId, Option<u64>),
+    /// filename, tab_id, (anchor row_nr in displayed data, Before/After) --
+    /// None = append at the end of master
+    InsertRow(Filename, TabId, Option<(u64, InsertPosition)>),
     /// filename, column_id to delete
     DeleteColumn(Filename, ColumnId),
     /// filename, column_id to insert after (None = append at the end), new column's name

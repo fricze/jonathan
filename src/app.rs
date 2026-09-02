@@ -8,8 +8,8 @@ use crate::data::{edit_record, filter_data, sort_data, write_csv};
 use crate::menu::OPEN_FILE_ID;
 use crate::read_csv::open_csv_file;
 use crate::types::{
-    ColumnId, CsvTabViewer, FileHeader, MyApp, ReplaceScope, SendUiMessage, SheetTab, SortOrder, TabId,
-    UiMessage, UndoEntry, active_sheet_data, column_position,
+    ColumnId, CsvTabViewer, FileHeader, InsertPosition, MyApp, ReplaceScope, SendUiMessage, SheetTab,
+    SortOrder, TabId, UiMessage, UndoEntry, active_sheet_data, column_position,
 };
 use crate::ui::drop::preview_files_being_dropped;
 
@@ -413,13 +413,20 @@ impl MyApp {
         true
     }
 
-    /// Insert a new empty row after `row_nr` in the currently displayed view
-    /// for (filename, tab_id) (None = append at the end of master). The new
-    /// row gets a fresh master_row id from next_row_id and is only added to
-    /// master -- filtered/sorted views naturally exclude it until refreshed,
-    /// same as any other master change. Pushes an UndoEntry::RowInsert.
-    /// Returns the new row's master_row id, or None if the file isn't loaded.
-    fn apply_insert_row(&mut self, filename: &str, tab_id: TabId, row_nr: Option<u64>) -> Option<usize> {
+    /// Insert a new empty row relative to `anchor` in the currently displayed
+    /// view for (filename, tab_id): Some((row_nr, Before|After)) inserts
+    /// immediately before/after that displayed row, None appends at the end
+    /// of master. The new row gets a fresh master_row id from next_row_id
+    /// and is only added to master -- filtered/sorted views naturally
+    /// exclude it until refreshed, same as any other master change. Pushes
+    /// an UndoEntry::RowInsert. Returns the new row's master_row id, or None
+    /// if the file isn't loaded.
+    fn apply_insert_row(
+        &mut self,
+        filename: &str,
+        tab_id: TabId,
+        anchor: Option<(u64, InsertPosition)>,
+    ) -> Option<usize> {
         let num_cols = self
             .tree
             .iter_all_tabs()
@@ -432,8 +439,8 @@ impl MyApp {
         let empty_record: StringRecord = std::iter::repeat("").take(num_cols).collect();
 
         let sheet = self.sheets_data.get_mut(filename)?;
-        let position = match row_nr {
-            Some(row_nr) => {
+        let position = match anchor {
+            Some((row_nr, insert_position)) => {
                 let key = (filename.to_string(), tab_id);
                 let anchor_master_row = self
                     .filtered_data
@@ -441,10 +448,12 @@ impl MyApp {
                     .and_then(|s| s.get(row_nr as usize))
                     .map(|(idx, _)| *idx)
                     .unwrap_or(row_nr as usize);
-                sheet
-                    .iter()
-                    .position(|(idx, _)| *idx == anchor_master_row)
-                    .map_or(sheet.len(), |p| p + 1)
+                let anchor_position = sheet.iter().position(|(idx, _)| *idx == anchor_master_row);
+                match (anchor_position, insert_position) {
+                    (Some(p), InsertPosition::Before) => p,
+                    (Some(p), InsertPosition::After) => p + 1,
+                    (None, _) => sheet.len(),
+                }
             }
             None => sheet.len(),
         };
@@ -1411,6 +1420,45 @@ mod tests {
         assert_eq!(app.read_cell("f.csv", 2, 0), Some("".to_string()));
         assert_eq!(app.next_row_id["f.csv"], 3);
         assert!(app.dirty_files.contains("f.csv"));
+    }
+
+    #[test]
+    fn insert_row_after_anchor_lands_immediately_below() {
+        let mut app = test_app();
+        app.sheets_data.insert(
+            "f.csv".to_string(),
+            vec![row(0, &["a"]), row(1, &["b"]), row(2, &["c"])],
+        );
+        app.next_row_id.insert("f.csv".to_string(), 3);
+        set_columns(&mut app, "f.csv", 1);
+
+        // Insert after displayed row 0 ("a") -- should land between "a" and "b".
+        let new_id = app
+            .apply_insert_row("f.csv", 1, Some((0, InsertPosition::After)))
+            .expect("insert should apply");
+
+        let order: Vec<usize> = app.sheets_data["f.csv"].iter().map(|(idx, _)| *idx).collect();
+        assert_eq!(order, vec![0, new_id, 1, 2]);
+    }
+
+    #[test]
+    fn insert_row_before_anchor_lands_immediately_above() {
+        let mut app = test_app();
+        app.sheets_data.insert(
+            "f.csv".to_string(),
+            vec![row(0, &["a"]), row(1, &["b"]), row(2, &["c"])],
+        );
+        app.next_row_id.insert("f.csv".to_string(), 3);
+        set_columns(&mut app, "f.csv", 1);
+
+        // Insert before displayed row 0 ("a") -- should land at the very top,
+        // the case that was previously unrepresentable.
+        let new_id = app
+            .apply_insert_row("f.csv", 1, Some((0, InsertPosition::Before)))
+            .expect("insert should apply");
+
+        let order: Vec<usize> = app.sheets_data["f.csv"].iter().map(|(idx, _)| *idx).collect();
+        assert_eq!(order, vec![new_id, 0, 1, 2]);
     }
 
     #[test]
