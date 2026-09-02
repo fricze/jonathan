@@ -16,7 +16,9 @@ pub fn open_csv_file(path: &str) -> (Reader<File>, Vec<FileHeader>) {
         Ok((csv_reader, headers)) => {
             let headers = headers
                 .into_iter()
-                .map(|name| FileHeader {
+                .enumerate()
+                .map(|(id, name)| FileHeader {
+                    id,
                     name: name.to_string(),
                     visible: true,
                     ..FileHeader::default()

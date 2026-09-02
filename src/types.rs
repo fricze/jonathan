@@ -7,6 +7,10 @@ use std::sync::mpsc::{Receiver, Sender};
 
 #[derive(Clone, Default)]
 pub struct FileHeader {
+    /// Stable identity for this column, assigned once when the file loads
+    /// and never reassigned -- unlike its position in the columns Vec, which
+    /// shifts on column insert/delete. Mirrors master_row's role for rows.
+    pub id: ColumnId,
     pub name: String,
     pub visible: bool,
     pub sort: Option<SortOrder>,
@@ -27,7 +31,7 @@ pub type SheetVec = Vec<SheetRow>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ReplaceScope {
-    /// Only the given actual column index.
+    /// Only the column with this stable id (not a position).
     CurrentColumn(ColumnId),
     AllColumns,
 }
@@ -43,17 +47,24 @@ pub enum UiMessage {
     /// latest one.
     SetDisplayData(SheetVec, String, TabId, u64),
     SetMaster(SheetVec, String),
-    /// filename, tab_id, row_nr (in displayed data), actual col index, new value
-    EditCell(Filename, TabId, u64, usize, String),
-    /// filename, tab_id, anchor_row (in displayed data), anchor visible col
-    /// index, pasted grid of values (row-major, grows right/down from anchor)
-    PasteCells(Filename, TabId, u64, usize, Vec<Vec<String>>),
+    /// filename, tab_id, row_nr (in displayed data), column_id, new value.
+    /// column_id (not a position) so a stored/replayed edit stays correct
+    /// even if a column insert/delete shifts positions in between.
+    EditCell(Filename, TabId, u64, ColumnId, String),
+    /// filename, tab_id, anchor_row (in displayed data), anchor column_id,
+    /// pasted grid of values (row-major, grows right/down from anchor -- each
+    /// subsequent column advances to the next column_id in display order)
+    PasteCells(Filename, TabId, u64, ColumnId, Vec<Vec<String>>),
     /// filename, tab_id, text to find, replacement text, scope
     ReplaceAll(Filename, TabId, String, String, ReplaceScope),
     /// filename, tab_id, row_nr (in displayed data) to delete
     DeleteRow(Filename, TabId, u64),
     /// filename, tab_id, row_nr (in displayed data) to insert after (None = append)
     InsertRow(Filename, TabId, Option<u64>),
+    /// filename, column_id to delete
+    DeleteColumn(Filename, ColumnId),
+    /// filename, column_id to insert after (None = append at the end), new column's name
+    InsertColumn(Filename, Option<ColumnId>, String),
     SaveFile(Filename),
     Undo,
     Redo,
@@ -211,6 +222,21 @@ pub fn active_sheet_data<'a>(
     }
 }
 
+/// Resolve a column_id to its current display position in `headers`, or
+/// `None` if no column with that id exists (e.g. it was deleted). Mirrors
+/// how visible_col_indices resolves a visible-position to an actual-position
+/// -- this resolver is the id-based counterpart, used wherever a stored
+/// column_id needs to become a position for indexing into a StringRecord.
+pub fn column_position(headers: &[FileHeader], column_id: ColumnId) -> Option<usize> {
+    headers.iter().position(|h| h.id == column_id)
+}
+
+/// Resolve a display position in `headers` to that column's stable id, or
+/// `None` if the position is out of range. Inverse of `column_position`.
+pub fn column_id_at(headers: &[FileHeader], position: usize) -> Option<ColumnId> {
+    headers.get(position).map(|h| h.id)
+}
+
 /// One undoable/redoable change. Applying the reverse of an entry (see
 /// MyApp::apply_undo/apply_redo) always produces another UndoEntry describing
 /// how to reverse *that* -- e.g. undoing a CellEdit produces a CellEdit
@@ -219,14 +245,28 @@ pub fn active_sheet_data<'a>(
 #[derive(Clone)]
 pub enum UndoEntry {
     /// Holds the value the cell had *before* the edit being recorded was
-    /// applied, so undoing means writing `old_value` back.
-    CellEdit { filename: Filename, master_row: usize, col: usize, old_value: String },
+    /// applied, so undoing means writing `old_value` back. Addressed by
+    /// column_id (not position) so a column insert/delete between recording
+    /// and replaying this entry can't make it write to the wrong column.
+    CellEdit { filename: Filename, master_row: usize, col_id: ColumnId, old_value: String },
     /// A row was removed at `position` (its index in the file's SheetVec at
     /// the time of deletion). Undoing re-inserts `record` there under the
     /// same `master_row` id it always had.
     RowDelete { filename: Filename, master_row: usize, position: usize, record: SheetRow },
     /// A row with `master_row` was inserted. Undoing removes it again.
     RowInsert { filename: Filename, master_row: usize },
+    /// A column was removed at `position` (its index among headers at the
+    /// time of deletion). Undoing re-inserts `header` there and restores
+    /// `values_by_row`, keyed by master_row, into every row's record at that
+    /// position.
+    ColumnDelete {
+        filename: Filename,
+        position: usize,
+        header: FileHeader,
+        values_by_row: Vec<(usize, String)>,
+    },
+    /// A column with `column_id` was inserted. Undoing removes it again.
+    ColumnInsert { filename: Filename, column_id: ColumnId },
 }
 
 pub struct MyApp {
@@ -253,6 +293,9 @@ pub struct MyApp {
     /// Next master_row id to assign when inserting a row into a file. Seeded
     /// from max(existing master_row) + 1 when the file loads.
     pub next_row_id: HashMap<Filename, usize>,
+    /// Next column_id to assign when inserting a column into a file. Seeded
+    /// from max(existing FileHeader.id) + 1 when the file loads.
+    pub next_col_id: HashMap<Filename, ColumnId>,
 }
 
 pub struct CsvTabViewer<'a> {
@@ -353,5 +396,41 @@ mod tests {
 
         let data = active_sheet_data(&master, &filtered, "f.csv", 1, true);
         assert!(data.is_empty());
+    }
+
+    fn header(id: ColumnId, name: &str) -> FileHeader {
+        FileHeader { id, name: name.to_string(), visible: true, sort: None }
+    }
+
+    #[test]
+    fn column_position_finds_by_id_not_index() {
+        let headers = vec![header(5, "a"), header(2, "b"), header(9, "c")];
+        assert_eq!(column_position(&headers, 2), Some(1));
+        assert_eq!(column_position(&headers, 9), Some(2));
+    }
+
+    #[test]
+    fn column_position_missing_id_returns_none() {
+        let headers = vec![header(0, "a")];
+        assert_eq!(column_position(&headers, 99), None);
+    }
+
+    #[test]
+    fn column_id_at_resolves_position_to_stable_id() {
+        let headers = vec![header(5, "a"), header(2, "b")];
+        assert_eq!(column_id_at(&headers, 0), Some(5));
+        assert_eq!(column_id_at(&headers, 1), Some(2));
+        assert_eq!(column_id_at(&headers, 2), None);
+    }
+
+    #[test]
+    fn column_position_survives_reordering() {
+        // Simulates a column delete shifting positions: id 9 moves from
+        // position 2 to position 1, but column_position still finds it by id.
+        let before = vec![header(5, "a"), header(2, "b"), header(9, "c")];
+        assert_eq!(column_position(&before, 9), Some(2));
+
+        let after_delete = vec![header(5, "a"), header(9, "c")];
+        assert_eq!(column_position(&after_delete, 9), Some(1));
     }
 }

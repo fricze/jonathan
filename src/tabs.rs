@@ -246,6 +246,8 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
                         tab.selection
                             .anchor_cell
                             .and_then(|(_, c)| visible_col_indices.get(c).copied())
+                            .and_then(|position| columns.get(position))
+                            .map(|header| header.id)
                     });
 
                 ui.checkbox(&mut tab.replace_all_columns, "All columns");

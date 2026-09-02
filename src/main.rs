@@ -73,6 +73,7 @@ fn main() -> eframe::Result {
                     undo_stack: vec![],
                     redo_stack: vec![],
                     next_row_id: HashMap::new(),
+                    next_col_id: HashMap::new(),
                 }))
             }),
         )

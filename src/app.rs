@@ -8,8 +8,8 @@ use crate::data::{edit_record, filter_data, sort_data, write_csv};
 use crate::menu::OPEN_FILE_ID;
 use crate::read_csv::open_csv_file;
 use crate::types::{
-    CsvTabViewer, MyApp, ReplaceScope, SendUiMessage, SheetTab, SortOrder, TabId, UiMessage, UndoEntry,
-    active_sheet_data,
+    ColumnId, CsvTabViewer, FileHeader, MyApp, ReplaceScope, SendUiMessage, SheetTab, SortOrder, TabId,
+    UiMessage, UndoEntry, active_sheet_data, column_position,
 };
 use crate::ui::drop::preview_files_being_dropped;
 
@@ -17,9 +17,10 @@ use crate::ui::drop::preview_files_being_dropped;
 use muda::MenuEvent;
 
 /// Outcome of a successful `apply_undo`/`apply_redo`, enough to describe the
-/// change in a toast: which row/column, what it had, what it's now.
+/// change in a toast: which row/column, what it had, what it's now. `row` is
+/// None for a column-level change (no single row involved).
 struct UndoRedoResult {
-    row: usize,
+    row: Option<usize>,
     column: Option<String>,
     overwritten: String,
     restored: String,
@@ -40,9 +41,11 @@ fn truncate_for_toast(value: &str) -> String {
 /// Split an undo/redo outcome into a toast (title, body): title names the
 /// action and column, body shows the value change.
 fn undo_redo_toast(action: &str, result: &UndoRedoResult) -> (String, String) {
-    let title = match &result.column {
-        Some(name) => format!("{action} row {} · {name}", result.row),
-        None => format!("{action} row {}", result.row),
+    let title = match (result.row, &result.column) {
+        (Some(row), Some(name)) => format!("{action} row {row} · {name}"),
+        (Some(row), None) => format!("{action} row {row}"),
+        (None, Some(name)) => format!("{action} column {name}"),
+        (None, None) => action.to_string(),
     };
     let body = format!(
         "\"{}\" → \"{}\"",
@@ -60,39 +63,56 @@ fn bump_epoch(epochs: &mut std::collections::HashMap<(String, usize), u64>, key:
 }
 
 impl MyApp {
-    /// Read the current value of a master cell, addressed by stable row index.
-    fn read_cell(&self, filename: &str, master_row: usize, col: usize) -> Option<String> {
+    /// Read the current value of a master cell, addressed by stable row index
+    /// and column_id (resolved to a live position internally, so it stays
+    /// correct even if a column insert/delete happened since col_id was
+    /// recorded).
+    fn read_cell(&self, filename: &str, master_row: usize, col_id: ColumnId) -> Option<String> {
+        let position = self.column_position(filename, col_id)?;
         self.sheets_data
             .get(filename)
             .and_then(|sheet| sheet.iter().find(|(idx, _)| *idx == master_row))
-            .and_then(|(_, record)| record.get(col))
+            .and_then(|(_, record)| record.get(position))
             .map(|s| s.to_string())
     }
 
-    /// Look up a column's header name for a file from any tab that has it loaded.
-    fn column_name(&self, filename: &str, col: usize) -> Option<String> {
-        self.tree
-            .iter_all_tabs()
-            .find_map(|(_, tab)| tab.columns.get(filename))
-            .and_then(|headers| headers.get(col))
-            .map(|h| {
-                if h.name.is_empty() && col == 0 {
-                    "id".to_string()
-                } else {
-                    h.name.clone()
-                }
-            })
+    /// Resolve a column_id to its current display position in `filename`'s
+    /// headers, from any tab that has the file loaded. `None` if the column
+    /// no longer exists (e.g. deleted since an UndoEntry referencing it was
+    /// recorded).
+    fn column_position(&self, filename: &str, col_id: ColumnId) -> Option<usize> {
+        let headers = self.tree.iter_all_tabs().find_map(|(_, tab)| tab.columns.get(filename))?;
+        column_position(headers, col_id)
     }
 
-    /// Write `value` into a master cell (by stable row index) and every
-    /// filtered/sorted view of that file, across all tabs.
-    fn write_cell(&mut self, filename: &str, master_row: usize, col: usize, value: &str) {
+    /// Look up a column's header name for a file from any tab that has it
+    /// loaded, by stable column_id.
+    fn column_name(&self, filename: &str, col_id: ColumnId) -> Option<String> {
+        let headers = self.tree.iter_all_tabs().find_map(|(_, tab)| tab.columns.get(filename))?;
+        let position = column_position(headers, col_id)?;
+        headers.get(position).map(|h| {
+            if h.name.is_empty() && position == 0 {
+                "id".to_string()
+            } else {
+                h.name.clone()
+            }
+        })
+    }
+
+    /// Write `value` into a master cell (by stable row index and column_id,
+    /// resolved to a live position internally) and every filtered/sorted
+    /// view of that file, across all tabs. No-op if the column no longer
+    /// exists.
+    fn write_cell(&mut self, filename: &str, master_row: usize, col_id: ColumnId, value: &str) {
+        let Some(position) = self.column_position(filename, col_id) else {
+            return;
+        };
         if let Some(sheet) = self.sheets_data.get_mut(filename) {
-            edit_record(sheet, master_row, col, value);
+            edit_record(sheet, master_row, position, value);
         }
         for ((fname, _), display_sheet) in self.filtered_data.iter_mut() {
             if fname == filename {
-                edit_record(display_sheet, master_row, col, value);
+                edit_record(display_sheet, master_row, position, value);
             }
         }
     }
@@ -120,19 +140,19 @@ impl MyApp {
     /// since reversing a reversal is symmetric for every UndoEntry variant.
     fn reverse_entry(&mut self, entry: UndoEntry) -> Option<(UndoEntry, UndoRedoResult)> {
         match entry {
-            UndoEntry::CellEdit { filename, master_row, col, old_value } => {
-                let current = self.read_cell(&filename, master_row, col)?;
-                self.write_cell(&filename, master_row, col, &old_value);
+            UndoEntry::CellEdit { filename, master_row, col_id, old_value } => {
+                let current = self.read_cell(&filename, master_row, col_id)?;
+                self.write_cell(&filename, master_row, col_id, &old_value);
                 self.dirty_files.insert(filename.clone());
-                let column = self.column_name(&filename, col);
+                let column = self.column_name(&filename, col_id);
                 let reverse = UndoEntry::CellEdit {
                     filename,
                     master_row,
-                    col,
+                    col_id,
                     old_value: current.clone(),
                 };
                 let result = UndoRedoResult {
-                    row: master_row,
+                    row: Some(master_row),
                     column,
                     restored: old_value,
                     overwritten: current,
@@ -146,7 +166,7 @@ impl MyApp {
                 self.dirty_files.insert(filename.clone());
                 let reverse = UndoEntry::RowInsert { filename, master_row };
                 let result = UndoRedoResult {
-                    row: master_row,
+                    row: Some(master_row),
                     column: None,
                     restored: "(row restored)".to_string(),
                     overwritten: "(deleted)".to_string(),
@@ -160,37 +180,74 @@ impl MyApp {
                 self.dirty_files.insert(filename.clone());
                 let reverse = UndoEntry::RowDelete { filename, master_row, position, record };
                 let result = UndoRedoResult {
-                    row: master_row,
+                    row: Some(master_row),
                     column: None,
                     restored: "(deleted)".to_string(),
                     overwritten: "(row removed)".to_string(),
                 };
                 Some((reverse, result))
             }
+            UndoEntry::ColumnDelete { filename, position, header, values_by_row } => {
+                let column_id = header.id;
+                let name = header.name.clone();
+                self.insert_column_at(&filename, position, header, &values_by_row);
+                self.dirty_files.insert(filename.clone());
+                let reverse = UndoEntry::ColumnInsert { filename, column_id };
+                let result = UndoRedoResult {
+                    row: None,
+                    column: Some(name),
+                    restored: "(column restored)".to_string(),
+                    overwritten: "(deleted)".to_string(),
+                };
+                Some((reverse, result))
+            }
+            UndoEntry::ColumnInsert { filename, column_id } => {
+                let headers = self.tree.iter_all_tabs().find_map(|(_, tab)| tab.columns.get(&filename).cloned())?;
+                let position = column_position(&headers, column_id)?;
+                let header = headers[position].clone();
+                let name = header.name.clone();
+
+                let values_by_row = self.remove_column_at(&filename, position, column_id);
+                self.dirty_files.insert(filename.clone());
+                let reverse = UndoEntry::ColumnDelete { filename, position, header, values_by_row };
+                let result = UndoRedoResult {
+                    row: None,
+                    column: Some(name),
+                    restored: "(deleted)".to_string(),
+                    overwritten: "(column removed)".to_string(),
+                };
+                Some((reverse, result))
+            }
         }
     }
 
-    /// Write a pasted grid into master starting at (anchor_row, anchor_col) in
-    /// the currently displayed view for (filename, tab_id), growing right/down.
-    /// Rows/cols beyond the sheet's current bounds are skipped -- no row or
-    /// column insertion happens here. Pushes one UndoEntry per cell written
-    /// and clears redo_stack if anything was written. Returns the count of
-    /// cells actually written.
+    /// Write a pasted grid into master starting at (anchor_row, anchor_col_id)
+    /// in the currently displayed view for (filename, tab_id), growing
+    /// right/down through display *positions* from the anchor's current
+    /// position (each subsequent column resolved to its own column_id before
+    /// writing, so a paste spanning multiple columns still lands correctly
+    /// even though only the anchor is identified). Rows/cols beyond the
+    /// sheet's current bounds are skipped -- no row or column insertion
+    /// happens here. Pushes one UndoEntry per cell written and clears
+    /// redo_stack if anything was written. Returns the count of cells
+    /// actually written.
     fn apply_paste(
         &mut self,
         filename: &str,
         tab_id: TabId,
         anchor_row: u64,
-        anchor_col: usize,
+        anchor_col_id: ColumnId,
         rows: &[Vec<String>],
     ) -> usize {
         let key = (filename.to_string(), tab_id);
         let num_master_rows = self.sheets_data.get(filename).map_or(0, |s| s.len());
-        let num_cols = self
-            .tree
-            .iter_all_tabs()
-            .find_map(|(_, tab)| tab.columns.get(filename))
-            .map_or(0, |headers| headers.len());
+        let headers = self.tree.iter_all_tabs().find_map(|(_, tab)| tab.columns.get(filename).cloned());
+        let Some(headers) = headers else {
+            return 0;
+        };
+        let Some(anchor_position) = column_position(&headers, anchor_col_id) else {
+            return 0;
+        };
 
         let mut pasted_count = 0usize;
 
@@ -214,19 +271,20 @@ impl MyApp {
             }
 
             for (col_offset, value) in row_values.iter().enumerate() {
-                let col = anchor_col + col_offset;
-                if col >= num_cols {
+                let position = anchor_position + col_offset;
+                let Some(header) = headers.get(position) else {
                     break;
-                }
+                };
+                let col_id = header.id;
 
-                if let Some(old_value) = self.read_cell(filename, master_row, col) {
+                if let Some(old_value) = self.read_cell(filename, master_row, col_id) {
                     self.undo_stack.push(UndoEntry::CellEdit {
                         filename: filename.to_string(),
                         master_row,
-                        col,
+                        col_id,
                         old_value,
                     });
-                    self.write_cell(filename, master_row, col, value);
+                    self.write_cell(filename, master_row, col_id, value);
                     pasted_count += 1;
                 }
             }
@@ -267,22 +325,22 @@ impl MyApp {
                 .unwrap_or_default(),
         };
 
-        let num_cols = self
+        let all_col_ids: Vec<ColumnId> = self
             .tree
             .iter_all_tabs()
             .find_map(|(_, tab)| tab.columns.get(filename))
-            .map_or(0, |headers| headers.len());
+            .map_or(vec![], |headers| headers.iter().map(|h| h.id).collect());
 
-        let cols: Vec<usize> = match scope {
-            ReplaceScope::CurrentColumn(col) => vec![col],
-            ReplaceScope::AllColumns => (0..num_cols).collect(),
+        let col_ids: Vec<ColumnId> = match scope {
+            ReplaceScope::CurrentColumn(col_id) => vec![col_id],
+            ReplaceScope::AllColumns => all_col_ids,
         };
 
         let mut changed_count = 0usize;
 
         for master_row in master_rows {
-            for &col in &cols {
-                let Some(old_value) = self.read_cell(filename, master_row, col) else {
+            for &col_id in &col_ids {
+                let Some(old_value) = self.read_cell(filename, master_row, col_id) else {
                     continue;
                 };
                 if !old_value.contains(find) {
@@ -296,10 +354,10 @@ impl MyApp {
                 self.undo_stack.push(UndoEntry::CellEdit {
                     filename: filename.to_string(),
                     master_row,
-                    col,
+                    col_id,
                     old_value,
                 });
-                self.write_cell(filename, master_row, col, &new_value);
+                self.write_cell(filename, master_row, col_id, &new_value);
                 changed_count += 1;
             }
         }
@@ -398,6 +456,143 @@ impl MyApp {
         self.dirty_files.insert(filename.to_string());
         Some(master_row)
     }
+
+    /// Remove the field at `position` from every row's StringRecord in
+    /// master and every filtered/sorted view of `filename` (O(rows)), and
+    /// remove `header_id`'s FileHeader from every open tab's columns Vec for
+    /// that file. Returns each row's value at that position before removal
+    /// (keyed by master_row), for undo to restore.
+    fn remove_column_at(&mut self, filename: &str, position: usize, header_id: ColumnId) -> Vec<(usize, String)> {
+        let values_by_row: Vec<(usize, String)> = self
+            .sheets_data
+            .get(filename)
+            .map(|sheet| {
+                sheet
+                    .iter()
+                    .filter_map(|(idx, record)| record.get(position).map(|v| (*idx, v.to_string())))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if let Some(sheet) = self.sheets_data.get_mut(filename) {
+            for (_, record) in sheet.iter_mut() {
+                *record = record.iter().enumerate().filter(|(i, _)| *i != position).map(|(_, f)| f).collect();
+            }
+        }
+        for ((fname, _), display_sheet) in self.filtered_data.iter_mut() {
+            if fname == filename {
+                for (_, record) in display_sheet.iter_mut() {
+                    *record = record.iter().enumerate().filter(|(i, _)| *i != position).map(|(_, f)| f).collect();
+                }
+            }
+        }
+        for tab in self.tree.iter_all_tabs_mut() {
+            if let Some(headers) = tab.1.columns.get_mut(filename) {
+                headers.retain(|h| h.id != header_id);
+            }
+        }
+
+        values_by_row
+    }
+
+    /// Insert `header` at `position` into every open tab's columns Vec for
+    /// `filename`, and insert a field into every row's StringRecord in
+    /// master and every filtered/sorted view at that position -- taken from
+    /// `values_by_row` where a value exists (keyed by master_row), empty
+    /// otherwise. Inverse of `remove_column_at`.
+    fn insert_column_at(
+        &mut self,
+        filename: &str,
+        position: usize,
+        header: FileHeader,
+        values_by_row: &[(usize, String)],
+    ) {
+        let values: std::collections::HashMap<usize, &str> =
+            values_by_row.iter().map(|(idx, v)| (*idx, v.as_str())).collect();
+
+        if let Some(sheet) = self.sheets_data.get_mut(filename) {
+            for (idx, record) in sheet.iter_mut() {
+                let mut fields: Vec<&str> = record.iter().collect();
+                fields.insert(position.min(fields.len()), values.get(idx).copied().unwrap_or(""));
+                *record = fields.into_iter().collect();
+            }
+        }
+        for ((fname, _), display_sheet) in self.filtered_data.iter_mut() {
+            if fname == filename {
+                for (idx, record) in display_sheet.iter_mut() {
+                    let mut fields: Vec<&str> = record.iter().collect();
+                    fields.insert(position.min(fields.len()), values.get(idx).copied().unwrap_or(""));
+                    *record = fields.into_iter().collect();
+                }
+            }
+        }
+        for tab in self.tree.iter_all_tabs_mut() {
+            if let Some(headers) = tab.1.columns.get_mut(filename) {
+                let insert_at = position.min(headers.len());
+                headers.insert(insert_at, header.clone());
+            }
+        }
+    }
+
+    /// Delete the column with `column_id` from `filename`. Unlike row
+    /// delete, this touches every row's StringRecord (O(rows)) via
+    /// `remove_column_at`. Pushes an UndoEntry::ColumnDelete capturing
+    /// enough to restore it. Returns `true` if the column was found and
+    /// removed.
+    fn apply_delete_column(&mut self, filename: &str, column_id: ColumnId) -> bool {
+        let Some(headers) = self
+            .tree
+            .iter_all_tabs()
+            .find_map(|(_, tab)| tab.columns.get(filename).cloned())
+        else {
+            return false;
+        };
+        let Some(position) = column_position(&headers, column_id) else {
+            return false;
+        };
+        let header = headers[position].clone();
+
+        let values_by_row = self.remove_column_at(filename, position, column_id);
+
+        self.undo_stack.push(UndoEntry::ColumnDelete {
+            filename: filename.to_string(),
+            position,
+            header,
+            values_by_row,
+        });
+        self.redo_stack.clear();
+        self.dirty_files.insert(filename.to_string());
+        true
+    }
+
+    /// Insert a new empty column after `after_column_id` (None = append at
+    /// the end) into `filename`, named `name`. Mirrors apply_delete_column
+    /// via `insert_column_at`. Returns the new column's id, or None if the
+    /// file isn't loaded.
+    fn apply_insert_column(
+        &mut self,
+        filename: &str,
+        after_column_id: Option<ColumnId>,
+        name: &str,
+    ) -> Option<ColumnId> {
+        let headers = self.tree.iter_all_tabs().find_map(|(_, tab)| tab.columns.get(filename).cloned())?;
+
+        let position = match after_column_id {
+            Some(after) => column_position(&headers, after).map_or(headers.len(), |p| p + 1),
+            None => headers.len(),
+        };
+
+        let column_id = *self.next_col_id.get(filename).unwrap_or(&0);
+        self.next_col_id.insert(filename.to_string(), column_id + 1);
+
+        let header = FileHeader { id: column_id, name: name.to_string(), visible: true, sort: None };
+        self.insert_column_at(filename, position, header, &[]);
+
+        self.undo_stack.push(UndoEntry::ColumnInsert { filename: filename.to_string(), column_id });
+        self.redo_stack.clear();
+        self.dirty_files.insert(filename.to_string());
+        Some(column_id)
+    }
 }
 
 impl MyApp {
@@ -407,6 +602,9 @@ impl MyApp {
         self.files_list.push(file_name.clone());
 
         let (mut reader, headers) = open_csv_file(&file_name);
+
+        let next_col_id = headers.iter().map(|h| h.id).max().map_or(0, |m| m + 1);
+        self.next_col_id.insert(file_name.clone(), next_col_id);
 
         for tab in self.tree.iter_all_tabs_mut() {
             let sheet_tab = tab.1;
@@ -579,7 +777,7 @@ impl MyApp {
                     self.sort_current_sheet(ctx, filename, sort_order, tab_id);
                 }
                 UiMessage::OpenFile(file, tab) => self.load_file(ctx, file, tab),
-                UiMessage::EditCell(filename, tab_id, row_nr, actual_col, new_value) => {
+                UiMessage::EditCell(filename, tab_id, row_nr, col_id, new_value) => {
                     // row_nr is an index into the currently displayed (filtered/sorted)
                     // view. Resolve it to a stable master row index first, then always
                     // write through to master -- the filtered view is just a cache.
@@ -592,17 +790,17 @@ impl MyApp {
                         .or(Some(row_nr as usize));
 
                     if let Some(master_row) = master_row {
-                        if let Some(old_value) = self.read_cell(&filename, master_row, actual_col) {
+                        if let Some(old_value) = self.read_cell(&filename, master_row, col_id) {
                             self.undo_stack.push(UndoEntry::CellEdit {
                                 filename: filename.clone(),
                                 master_row,
-                                col: actual_col,
+                                col_id,
                                 old_value,
                             });
                             self.redo_stack.clear();
                         }
 
-                        self.write_cell(&filename, master_row, actual_col, &new_value);
+                        self.write_cell(&filename, master_row, col_id, &new_value);
                     }
 
                     self.dirty_files.insert(filename);
@@ -627,6 +825,16 @@ impl MyApp {
                 UiMessage::InsertRow(filename, tab_id, row_nr) => {
                     if self.apply_insert_row(&filename, tab_id, row_nr).is_some() {
                         crate::toast::show(ctx, "Row inserted");
+                    }
+                }
+                UiMessage::DeleteColumn(filename, column_id) => {
+                    if self.apply_delete_column(&filename, column_id) {
+                        crate::toast::show(ctx, "Column deleted");
+                    }
+                }
+                UiMessage::InsertColumn(filename, after_column_id, name) => {
+                    if self.apply_insert_column(&filename, after_column_id, &name).is_some() {
+                        crate::toast::show(ctx, "Column inserted");
                     }
                 }
                 UiMessage::Undo => {
@@ -817,6 +1025,7 @@ mod tests {
             undo_stack: vec![],
             redo_stack: vec![],
             next_row_id: HashMap::new(),
+            next_col_id: HashMap::new(),
         }
     }
 
@@ -827,6 +1036,7 @@ mod tests {
     fn set_columns(app: &mut MyApp, filename: &str, count: usize) {
         let headers = (0..count)
             .map(|i| crate::types::FileHeader {
+                id: i,
                 name: format!("col{i}"),
                 visible: true,
                 sort: None,
@@ -845,10 +1055,11 @@ mod tests {
             "f.csv".to_string(),
             vec![row(0, &["a"]), row(1, &["b"])],
         );
+        set_columns(&mut app, "f.csv", 1);
         app.undo_stack.push(UndoEntry::CellEdit {
             filename: "f.csv".to_string(),
             master_row: 0,
-            col: 0,
+            col_id: 0,
             old_value: "original".to_string(),
         });
 
@@ -868,10 +1079,11 @@ mod tests {
     fn undo_then_redo_round_trips() {
         let mut app = test_app();
         app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["current"])]);
+        set_columns(&mut app, "f.csv", 1);
         app.undo_stack.push(UndoEntry::CellEdit {
             filename: "f.csv".to_string(),
             master_row: 0,
-            col: 0,
+            col_id: 0,
             old_value: "before".to_string(),
         });
 
@@ -889,17 +1101,18 @@ mod tests {
     fn multiple_undos_restore_in_reverse_order() {
         let mut app = test_app();
         app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["v3"])]);
+        set_columns(&mut app, "f.csv", 1);
         // Simulate two edits: v1 -> v2 -> v3, each push recording the prior value.
         app.undo_stack.push(UndoEntry::CellEdit {
             filename: "f.csv".to_string(),
             master_row: 0,
-            col: 0,
+            col_id: 0,
             old_value: "v1".to_string(),
         });
         app.undo_stack.push(UndoEntry::CellEdit {
             filename: "f.csv".to_string(),
             master_row: 0,
-            col: 0,
+            col_id: 0,
             old_value: "v2".to_string(),
         });
 
@@ -930,7 +1143,7 @@ mod tests {
         app.undo_stack.push(UndoEntry::CellEdit {
             filename: "gone.csv".to_string(),
             master_row: 0,
-            col: 0,
+            col_id: 0,
             old_value: "x".to_string(),
         });
 
@@ -943,10 +1156,11 @@ mod tests {
     fn new_edit_clears_redo_stack() {
         let mut app = test_app();
         app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["b"])]);
+        set_columns(&mut app, "f.csv", 1);
         app.redo_stack.push(UndoEntry::CellEdit {
             filename: "f.csv".to_string(),
             master_row: 0,
-            col: 0,
+            col_id: 0,
             old_value: "stale".to_string(),
         });
 
@@ -954,7 +1168,7 @@ mod tests {
             app.undo_stack.push(UndoEntry::CellEdit {
                 filename: "f.csv".to_string(),
                 master_row: 0,
-                col: 0,
+                col_id: 0,
                 old_value,
             });
             app.redo_stack.clear();
@@ -1206,12 +1420,13 @@ mod tests {
             "f.csv".to_string(),
             vec![row(0, &["a"]), row(1, &["b"]), row(2, &["c"])],
         );
+        set_columns(&mut app, "f.csv", 1);
 
         app.apply_delete_row("f.csv", 1, 1);
         assert_eq!(app.sheets_data["f.csv"].len(), 2);
 
         let result = app.apply_undo().expect("undo should restore the row");
-        assert_eq!(result.row, 1);
+        assert_eq!(result.row, Some(1));
         assert_eq!(app.sheets_data["f.csv"].len(), 3);
         let restored: Vec<usize> = app.sheets_data["f.csv"].iter().map(|(idx, _)| *idx).collect();
         assert_eq!(restored, vec![0, 1, 2]);
@@ -1248,5 +1463,196 @@ mod tests {
         assert_eq!(app.sheets_data["f.csv"].len(), 1);
         let remaining: Vec<usize> = app.sheets_data["f.csv"].iter().map(|(idx, _)| *idx).collect();
         assert_eq!(remaining, vec![0]);
+    }
+
+    /// Regression test for the bug jon-42i's design identified and jon-r7f
+    /// fixes: an UndoEntry recorded for a column, followed by a column
+    /// shift (simulating what a future column delete would do), must still
+    /// undo to the SAME column -- not whatever column now sits at the old
+    /// position.
+    #[test]
+    fn undo_survives_a_column_position_shift() {
+        let mut app = test_app();
+        // Three columns: id 0 "name", id 1 "dupa", id 2 "age".
+        app.sheets_data.insert(
+            "f.csv".to_string(),
+            vec![row(0, &["alice", "x", "30"])],
+        );
+        let headers = vec![
+            crate::types::FileHeader { id: 0, name: "name".to_string(), visible: true, sort: None },
+            crate::types::FileHeader { id: 1, name: "dupa".to_string(), visible: true, sort: None },
+            crate::types::FileHeader { id: 2, name: "age".to_string(), visible: true, sort: None },
+        ];
+        for tab in app.tree.iter_all_tabs_mut() {
+            tab.1.columns.insert("f.csv".to_string(), headers);
+            break;
+        }
+
+        // Edit column id 1 ("dupa"): "x" -> "y". Records an UndoEntry with
+        // col_id: 1, old_value: "x".
+        app.undo_stack.push(UndoEntry::CellEdit {
+            filename: "f.csv".to_string(),
+            master_row: 0,
+            col_id: 1,
+            old_value: "x".to_string(),
+        });
+        app.write_cell("f.csv", 0, 1, "y");
+        assert_eq!(app.read_cell("f.csv", 0, 1), Some("y".to_string()));
+
+        // Simulate a column delete: "name" (id 0) is removed, shifting
+        // "dupa" from position 1 to position 0 and "age" from 2 to 1.
+        for tab in app.tree.iter_all_tabs_mut() {
+            if let Some(headers) = tab.1.columns.get_mut("f.csv") {
+                headers.retain(|h| h.id != 0);
+            }
+        }
+        for (_, record) in app.sheets_data.get_mut("f.csv").unwrap() {
+            *record = record.iter().skip(1).collect();
+        }
+
+        // "dupa" (id 1) is now at position 0, "age" (id 2) at position 1.
+        assert_eq!(app.read_cell("f.csv", 0, 1), Some("y".to_string())); // still id 1
+        assert_eq!(app.read_cell("f.csv", 0, 2), Some("30".to_string())); // age untouched
+
+        // Undo the edit made before the shift. It must restore "dupa" (id 1,
+        // now at position 0) back to "x" -- NOT write into whatever is now
+        // at the old position-1 slot (which would be "age").
+        let result = app.apply_undo().expect("undo should apply");
+        assert_eq!(result.column, Some("dupa".to_string()));
+        assert_eq!(app.read_cell("f.csv", 0, 1), Some("x".to_string()));
+        // "age" (id 2) must be untouched by the undo.
+        assert_eq!(app.read_cell("f.csv", 0, 2), Some("30".to_string()));
+    }
+
+    #[test]
+    fn delete_column_removes_field_and_header_by_id() {
+        let mut app = test_app();
+        app.sheets_data.insert(
+            "f.csv".to_string(),
+            vec![row(0, &["a", "b", "c"]), row(1, &["d", "e", "f"])],
+        );
+        set_columns(&mut app, "f.csv", 3); // ids 0, 1, 2
+
+        assert!(app.apply_delete_column("f.csv", 1));
+
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("a".to_string()));
+        assert_eq!(app.read_cell("f.csv", 1, 0), Some("d".to_string()));
+        // Column 2 ("c"/"f") is now at position 1 after the delete.
+        assert_eq!(app.read_cell("f.csv", 0, 2), Some("c".to_string()));
+        assert_eq!(app.read_cell("f.csv", 1, 2), Some("f".to_string()));
+
+        for tab in app.tree.iter_all_tabs() {
+            let headers = tab.1.columns.get("f.csv").unwrap();
+            assert_eq!(headers.len(), 2);
+            assert!(headers.iter().all(|h| h.id != 1));
+        }
+        assert!(app.dirty_files.contains("f.csv"));
+    }
+
+    #[test]
+    fn delete_column_missing_id_is_noop() {
+        let mut app = test_app();
+        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        set_columns(&mut app, "f.csv", 1);
+
+        assert!(!app.apply_delete_column("f.csv", 99));
+        assert!(app.dirty_files.is_empty());
+    }
+
+    #[test]
+    fn insert_column_appends_empty_field_with_fresh_id() {
+        let mut app = test_app();
+        app.sheets_data.insert(
+            "f.csv".to_string(),
+            vec![row(0, &["a", "b"])],
+        );
+        set_columns(&mut app, "f.csv", 2); // ids 0, 1
+        app.next_col_id.insert("f.csv".to_string(), 2);
+
+        let new_id = app.apply_insert_column("f.csv", None, "new").expect("insert should apply");
+
+        assert_eq!(new_id, 2);
+        assert_eq!(app.read_cell("f.csv", 0, 2), Some("".to_string()));
+        assert_eq!(app.next_col_id["f.csv"], 3);
+
+        let headers = app.tree.iter_all_tabs().next().unwrap().1.columns.get("f.csv").unwrap();
+        assert_eq!(headers.len(), 3);
+        assert_eq!(headers[2].name, "new");
+    }
+
+    #[test]
+    fn insert_column_after_specific_id_lands_in_position() {
+        let mut app = test_app();
+        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a", "b"])]);
+        set_columns(&mut app, "f.csv", 2); // ids 0, 1
+        app.next_col_id.insert("f.csv".to_string(), 2);
+
+        app.apply_insert_column("f.csv", Some(0), "mid");
+
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("a".to_string()));
+        assert_eq!(app.read_cell("f.csv", 0, 2), Some("".to_string())); // new col, id 2
+        assert_eq!(app.read_cell("f.csv", 0, 1), Some("b".to_string())); // untouched, id 1
+
+        let headers = app.tree.iter_all_tabs().next().unwrap().1.columns.get("f.csv").unwrap();
+        assert_eq!(headers[1].name, "mid");
+    }
+
+    #[test]
+    fn delete_column_then_undo_restores_header_position_and_values() {
+        let mut app = test_app();
+        app.sheets_data.insert(
+            "f.csv".to_string(),
+            vec![row(0, &["a", "b", "c"]), row(1, &["d", "e", "f"])],
+        );
+        set_columns(&mut app, "f.csv", 3);
+
+        app.apply_delete_column("f.csv", 1);
+        let result = app.apply_undo().expect("undo should restore the column");
+        assert_eq!(result.column, Some("col1".to_string()));
+
+        assert_eq!(app.read_cell("f.csv", 0, 1), Some("b".to_string()));
+        assert_eq!(app.read_cell("f.csv", 1, 1), Some("e".to_string()));
+
+        let headers = app.tree.iter_all_tabs().next().unwrap().1.columns.get("f.csv").unwrap();
+        assert_eq!(headers.len(), 3);
+        assert_eq!(headers[1].id, 1);
+    }
+
+    #[test]
+    fn insert_column_then_undo_removes_it() {
+        let mut app = test_app();
+        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        set_columns(&mut app, "f.csv", 1);
+        app.next_col_id.insert("f.csv".to_string(), 1);
+
+        app.apply_insert_column("f.csv", None, "new");
+        assert_eq!(app.sheets_data["f.csv"][0].1.len(), 2);
+
+        app.apply_undo();
+        assert_eq!(app.sheets_data["f.csv"][0].1.len(), 1);
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("a".to_string()));
+
+        let headers = app.tree.iter_all_tabs().next().unwrap().1.columns.get("f.csv").unwrap();
+        assert_eq!(headers.len(), 1);
+    }
+
+    #[test]
+    fn delete_column_undo_redo_round_trips() {
+        let mut app = test_app();
+        app.sheets_data.insert(
+            "f.csv".to_string(),
+            vec![row(0, &["a", "b"])],
+        );
+        set_columns(&mut app, "f.csv", 2);
+
+        app.apply_delete_column("f.csv", 0);
+        app.apply_undo();
+        app.apply_redo();
+
+        assert_eq!(app.sheets_data["f.csv"][0].1.len(), 1);
+        assert_eq!(app.read_cell("f.csv", 0, 1), Some("b".to_string()));
+        let headers = app.tree.iter_all_tabs().next().unwrap().1.columns.get("f.csv").unwrap();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].id, 1);
     }
 }

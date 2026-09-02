@@ -3,7 +3,9 @@ use std::{collections::BTreeMap, sync::mpsc::Sender};
 use egui::{Align2, Color32, Context, Id, Margin, NumExt as _, Sense, TextFormat};
 
 use crate::data::csv_quote;
-use crate::types::{FileHeader, Filename, SelectionState, SendUiMessage, SheetVec, SortOrder, TabId, UiMessage};
+use crate::types::{
+    ColumnId, FileHeader, Filename, SelectionState, SendUiMessage, SheetVec, SortOrder, TabId, UiMessage,
+};
 
 /// Sizing/rendering knobs for a `Table`. All owned, cheap to copy/construct,
 /// grouped separately from data/state so adding a render tweak doesn't widen
@@ -47,6 +49,14 @@ impl<'a> Table<'a> {
         self.visible_col_indices.get(col_nr).copied().unwrap_or(col_nr)
     }
 
+    /// Resolves a visible column index to that column's stable id, for
+    /// messages that will be replayed later (EditCell, PasteCells) -- their
+    /// UndoEntry must survive a column insert/delete happening in between,
+    /// so they carry an id instead of a position that could go stale.
+    fn actual_col_id(&self, col_nr: usize) -> Option<ColumnId> {
+        crate::types::column_id_at(self.columns, self.actual_col(col_nr))
+    }
+
     fn cell_content_ui(&mut self, row_nr: u64, col_nr: usize, ui: &mut egui::Ui) {
         let actual_col = self.actual_col(col_nr);
 
@@ -64,13 +74,15 @@ impl<'a> Table<'a> {
                 *self.edit.editing_cell = None;
             } else if output.lost_focus() {
                 // Enter or click-away → commit
-                self.sender.send_msg(UiMessage::EditCell(
-                    self.filename.clone(),
-                    self.tab_id,
-                    row_nr,
-                    actual_col,
-                    self.edit.edit_buffer.clone(),
-                ));
+                if let Some(col_id) = self.actual_col_id(col_nr) {
+                    self.sender.send_msg(UiMessage::EditCell(
+                        self.filename.clone(),
+                        self.tab_id,
+                        row_nr,
+                        col_id,
+                        self.edit.edit_buffer.clone(),
+                    ));
+                }
                 *self.edit.editing_cell = None;
             } else {
                 output.request_focus();
@@ -226,11 +238,15 @@ impl<'a> Table<'a> {
             return;
         }
 
+        let Some(anchor_col_id) = self.actual_col_id(anchor_col) else {
+            return;
+        };
+
         self.sender.send_msg(UiMessage::PasteCells(
             self.filename.clone(),
             self.tab_id,
             anchor_row,
-            anchor_col,
+            anchor_col_id,
             rows,
         ));
     }
