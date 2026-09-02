@@ -160,6 +160,12 @@ pub struct SheetTab {
     pub selection: SelectionState,
     /// Last known visible row range (from previous frame's prepare())
     pub last_visible_rows: Option<std::ops::Range<u64>>,
+    /// Replacement text for the find-and-replace panel; find text reuses
+    /// this tab's filter text.
+    pub replace_text: String,
+    /// Whether replace-all applies to every column instead of just the one
+    /// last sorted/clicked (see CsvTabViewer::ui replace scope handling).
+    pub replace_all_columns: bool,
 }
 
 pub type Chan<Msg> = (Sender<Msg>, Receiver<Msg>);

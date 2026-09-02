@@ -219,6 +219,55 @@ impl egui_dock::TabViewer for CsvTabViewer<'_> {
             }
         }
 
+        // Replace-all uses the filter text field's current value as the find
+        // term -- filter already surfaces which cells match.
+        let find_text = self
+            .filters
+            .get(&(chosen_file.clone(), tab_id))
+            .cloned()
+            .unwrap_or_default();
+
+        if !chosen_file.is_empty() && !find_text.is_empty() {
+            let chosen_file = chosen_file.clone();
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Replace:");
+                ui.add(egui::TextEdit::singleline(&mut tab.replace_text).desired_width(120.0));
+
+                let current_col = tab
+                    .columns
+                    .get(&chosen_file)
+                    .and_then(|columns| {
+                        let visible_col_indices: Vec<usize> = columns
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, h)| h.visible)
+                            .map(|(i, _)| i)
+                            .collect();
+                        tab.selection
+                            .anchor_cell
+                            .and_then(|(_, c)| visible_col_indices.get(c).copied())
+                    });
+
+                ui.checkbox(&mut tab.replace_all_columns, "All columns");
+
+                let can_replace = tab.replace_all_columns || current_col.is_some();
+                if ui.add_enabled(can_replace, egui::Button::new("Replace All")).clicked() {
+                    let scope = if tab.replace_all_columns {
+                        crate::types::ReplaceScope::AllColumns
+                    } else {
+                        crate::types::ReplaceScope::CurrentColumn(current_col.unwrap_or(0))
+                    };
+                    self.sender.send_msg(UiMessage::ReplaceAll(
+                        chosen_file.clone(),
+                        tab_id,
+                        find_text.clone(),
+                        tab.replace_text.clone(),
+                        scope,
+                    ));
+                }
+            });
+        }
+
         if let Some(sheet) = self.promised_data.get(chosen_file) {
             if sheet.is_empty() {
                 let painter = self
