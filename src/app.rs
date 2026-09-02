@@ -47,11 +47,17 @@ fn undo_redo_toast(action: &str, result: &UndoRedoResult) -> (String, String) {
         (None, Some(name)) => format!("{action} column {name}"),
         (None, None) => action.to_string(),
     };
-    let body = format!(
-        "\"{}\" → \"{}\"",
-        truncate_for_toast(&result.overwritten),
-        truncate_for_toast(&result.restored)
-    );
+    // A batch result has no single before/after value -- `restored` is
+    // already a plain summary (e.g. "3 cells") and `overwritten` is empty.
+    let body = if result.overwritten.is_empty() {
+        result.restored.clone()
+    } else {
+        format!(
+            "\"{}\" → \"{}\"",
+            truncate_for_toast(&result.overwritten),
+            truncate_for_toast(&result.restored)
+        )
+    };
     (title, body)
 }
 
@@ -218,6 +224,27 @@ impl MyApp {
                 };
                 Some((reverse, result))
             }
+            UndoEntry::Batch(entries) => {
+                let count = entries.len();
+                // Reverse in reverse order: if entry B in the batch somehow
+                // depended on entry A already being applied (not currently
+                // possible for CellEdit-only batches, but keeps this correct
+                // if a future batch mixes entry types), unwinding must undo
+                // B before A.
+                let mut reversed = Vec::with_capacity(count);
+                for entry in entries.into_iter().rev() {
+                    let (reverse, _) = self.reverse_entry(entry)?;
+                    reversed.push(reverse);
+                }
+                let reverse = UndoEntry::Batch(reversed);
+                let result = UndoRedoResult {
+                    row: None,
+                    column: None,
+                    restored: format!("{count} cell{}", if count == 1 { "" } else { "s" }),
+                    overwritten: "".to_string(),
+                };
+                Some((reverse, result))
+            }
         }
     }
 
@@ -228,7 +255,8 @@ impl MyApp {
     /// writing, so a paste spanning multiple columns still lands correctly
     /// even though only the anchor is identified). Rows/cols beyond the
     /// sheet's current bounds are skipped -- no row or column insertion
-    /// happens here. Pushes one UndoEntry per cell written and clears
+    /// happens here. Pushes one UndoEntry::Batch covering every cell written,
+    /// so the whole paste undoes/redoes as a single action, and clears
     /// redo_stack if anything was written. Returns the count of cells
     /// actually written.
     fn apply_paste(
@@ -249,7 +277,7 @@ impl MyApp {
             return 0;
         };
 
-        let mut pasted_count = 0usize;
+        let mut batch: Vec<UndoEntry> = Vec::new();
 
         for (row_offset, row_values) in rows.iter().enumerate() {
             let display_row = anchor_row + row_offset as u64;
@@ -278,19 +306,20 @@ impl MyApp {
                 let col_id = header.id;
 
                 if let Some(old_value) = self.read_cell(filename, master_row, col_id) {
-                    self.undo_stack.push(UndoEntry::CellEdit {
+                    batch.push(UndoEntry::CellEdit {
                         filename: filename.to_string(),
                         master_row,
                         col_id,
                         old_value,
                     });
                     self.write_cell(filename, master_row, col_id, value);
-                    pasted_count += 1;
                 }
             }
         }
 
+        let pasted_count = batch.len();
         if pasted_count > 0 {
+            self.undo_stack.push(UndoEntry::Batch(batch));
             self.redo_stack.clear();
             self.dirty_files.insert(filename.to_string());
         }
@@ -301,8 +330,9 @@ impl MyApp {
     /// Replace every occurrence of `find` with `replace` across the rows
     /// currently displayed for (filename, tab_id) -- the filtered/sorted view
     /// if one exists, otherwise all of master -- within `scope`. Empty `find`
-    /// matches nothing (avoids replacing every cell boundary). Each changed
-    /// cell becomes one UndoEntry. Returns the count of cells changed.
+    /// matches nothing (avoids replacing every cell boundary). Pushes one
+    /// UndoEntry::Batch covering every changed cell, so the whole replace
+    /// undoes/redoes as a single action. Returns the count of cells changed.
     fn apply_replace_all(
         &mut self,
         filename: &str,
@@ -336,7 +366,7 @@ impl MyApp {
             ReplaceScope::AllColumns => all_col_ids,
         };
 
-        let mut changed_count = 0usize;
+        let mut batch: Vec<UndoEntry> = Vec::new();
 
         for master_row in master_rows {
             for &col_id in &col_ids {
@@ -351,18 +381,19 @@ impl MyApp {
                     continue;
                 }
 
-                self.undo_stack.push(UndoEntry::CellEdit {
+                batch.push(UndoEntry::CellEdit {
                     filename: filename.to_string(),
                     master_row,
                     col_id,
                     old_value,
                 });
                 self.write_cell(filename, master_row, col_id, &new_value);
-                changed_count += 1;
             }
         }
 
+        let changed_count = batch.len();
         if changed_count > 0 {
+            self.undo_stack.push(UndoEntry::Batch(batch));
             self.redo_stack.clear();
             self.dirty_files.insert(filename.to_string());
         }
@@ -1209,7 +1240,12 @@ mod tests {
         assert_eq!(app.read_cell("f.csv", 1, 0), Some("z".to_string()));
         assert_eq!(app.read_cell("f.csv", 1, 1), Some("w".to_string()));
         assert!(app.dirty_files.contains("f.csv"));
-        assert_eq!(app.undo_stack.len(), 4);
+        // The whole paste is one undoable action, not four separate entries.
+        assert_eq!(app.undo_stack.len(), 1);
+        match &app.undo_stack[0] {
+            UndoEntry::Batch(entries) => assert_eq!(entries.len(), 4),
+            other => panic!("expected a Batch, got {:?}", std::mem::discriminant(other)),
+        }
     }
 
     #[test]
@@ -1291,7 +1327,12 @@ mod tests {
         assert_eq!(app.read_cell("f.csv", 0, 1), Some("bar".to_string()));
         assert_eq!(app.read_cell("f.csv", 1, 0), Some("Xbar".to_string()));
         assert_eq!(app.read_cell("f.csv", 1, 1), Some("baz".to_string()));
-        assert_eq!(app.undo_stack.len(), 2);
+        // The whole replace-all is one undoable action.
+        assert_eq!(app.undo_stack.len(), 1);
+        match &app.undo_stack[0] {
+            UndoEntry::Batch(entries) => assert_eq!(entries.len(), 2),
+            other => panic!("expected a Batch, got {:?}", std::mem::discriminant(other)),
+        }
     }
 
     #[test]
@@ -1702,5 +1743,45 @@ mod tests {
         let headers = app.tree.iter_all_tabs().next().unwrap().1.columns.get("f.csv").unwrap();
         assert_eq!(headers.len(), 1);
         assert_eq!(headers[0].id, 1);
+    }
+
+    /// Regression test: pasting a multi-cell block must undo/redo as ONE
+    /// action, not one Cmd+Z per cell.
+    #[test]
+    fn paste_undo_restores_all_cells_in_one_action() {
+        let mut app = test_app();
+        app.sheets_data.insert(
+            "f.csv".to_string(),
+            vec![row(0, &["a", "b"]), row(1, &["c", "d"])],
+        );
+        set_columns(&mut app, "f.csv", 2);
+
+        let rows = vec![
+            vec!["x".to_string(), "y".to_string()],
+            vec!["z".to_string(), "w".to_string()],
+        ];
+        app.apply_paste("f.csv", 1, 0, 0, &rows);
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("x".to_string()));
+        assert_eq!(app.read_cell("f.csv", 1, 1), Some("w".to_string()));
+
+        // A single undo must restore every pasted cell.
+        assert!(app.apply_undo().is_some());
+        assert_eq!(app.undo_stack.len(), 0);
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("a".to_string()));
+        assert_eq!(app.read_cell("f.csv", 0, 1), Some("b".to_string()));
+        assert_eq!(app.read_cell("f.csv", 1, 0), Some("c".to_string()));
+        assert_eq!(app.read_cell("f.csv", 1, 1), Some("d".to_string()));
+
+        // A second undo must be a no-op (nothing left to undo) -- proves the
+        // whole paste was ONE undo item, not four.
+        assert!(app.apply_undo().is_none());
+
+        // A single redo must re-apply every pasted cell.
+        assert!(app.apply_redo().is_some());
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("x".to_string()));
+        assert_eq!(app.read_cell("f.csv", 0, 1), Some("y".to_string()));
+        assert_eq!(app.read_cell("f.csv", 1, 0), Some("z".to_string()));
+        assert_eq!(app.read_cell("f.csv", 1, 1), Some("w".to_string()));
+        assert!(app.apply_redo().is_none());
     }
 }

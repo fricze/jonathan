@@ -275,6 +275,12 @@ pub enum UndoEntry {
     },
     /// A column with `column_id` was inserted. Undoing removes it again.
     ColumnInsert { filename: Filename, column_id: ColumnId },
+    /// Multiple entries that should undo/redo as one action (e.g. every
+    /// cell changed by a single paste or replace-all). Reversing a batch
+    /// reverses each entry in reverse order (so entries that depend on
+    /// earlier ones in the batch unwind correctly) and produces a Batch of
+    /// their reverses.
+    Batch(Vec<UndoEntry>),
 }
 
 pub struct MyApp {
