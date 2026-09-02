@@ -235,6 +235,34 @@ impl<'a> Table<'a> {
         ));
     }
 
+    /// Cmd+Backspace deletes the currently selected row; Cmd+Enter inserts a
+    /// new row after it. Both require an active selection so they can't fire
+    /// on a stray keypress with nothing selected, and are ignored while a
+    /// cell is being edited (same guard as undo/redo).
+    fn handle_row_ops(&self, ui: &egui::Ui) {
+        if self.edit.editing_cell.is_some() {
+            return;
+        }
+
+        let Some((row_nr, _)) = self.selection.cursor().or(self.selection.anchor_cell) else {
+            return;
+        };
+
+        let (delete, insert) = ui.input(|i| {
+            let cmd = i.modifiers.command;
+            (
+                cmd && i.key_pressed(egui::Key::Backspace),
+                cmd && i.key_pressed(egui::Key::Enter),
+            )
+        });
+
+        if delete {
+            self.sender.send_msg(UiMessage::DeleteRow(self.filename.clone(), self.tab_id, row_nr));
+        } else if insert {
+            self.sender.send_msg(UiMessage::InsertRow(self.filename.clone(), self.tab_id, Some(row_nr)));
+        }
+    }
+
     fn handle_keyboard_navigation(&mut self, ui: &egui::Ui) -> Option<u64> {
         if self.edit.editing_cell.is_some() {
             return None;
@@ -355,6 +383,7 @@ impl<'a> Table<'a> {
 
         self.handle_clipboard_copy(ui);
         self.handle_clipboard_paste(ui);
+        self.handle_row_ops(ui);
 
         if self.edit.editing_cell.is_none() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             if let Some((row_nr, col_nr)) = self.selection.cursor().or(self.selection.anchor_cell) {
@@ -571,6 +600,20 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
         if self.selection.contains(row_nr, col_nr) {
             self.draw_selection_border(ui, row_nr, col_nr, cell_rect);
         }
+
+        cell_response.context_menu(|ui| {
+            // InsertRow's row_nr means "insert after" (None = append at the
+            // end) -- there's no "insert before" primitive, so only offer
+            // insert-below here; Cmd+Enter has the same below-only semantics.
+            if ui.button("Insert row below").clicked() {
+                self.sender.send_msg(UiMessage::InsertRow(self.filename.clone(), self.tab_id, Some(row_nr)));
+                ui.close();
+            }
+            if ui.button("Delete row").clicked() {
+                self.sender.send_msg(UiMessage::DeleteRow(self.filename.clone(), self.tab_id, row_nr));
+                ui.close();
+            }
+        });
     }
 
     fn row_top_offset(&self, ctx: &Context, _table_id: Id, row_nr: u64) -> f32 {

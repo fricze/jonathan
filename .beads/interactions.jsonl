@@ -41,3 +41,5 @@
 {"id":"int-8813e05d269c877c31b35aa9230b22b3","kind":"field_change","created_at":"2026-09-02T09:36:37.006463Z","actor":"Andrzej Fricze","issue_id":"jon-42i","extra":{"field":"status","new_value":"closed","old_value":"in_progress"}}
 {"id":"int-83e8d3cb944b2ddea9fbcbc3ab0fd795","kind":"field_change","created_at":"2026-09-02T10:00:20.899958Z","actor":"Andrzej Fricze","issue_id":"jon-djx","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
 {"id":"int-c8a803cf51244dffd137c7562df0abb5","kind":"field_change","created_at":"2026-09-02T10:04:10.861657Z","actor":"Andrzej Fricze","issue_id":"jon-djx","extra":{"field":"status","new_value":"closed","old_value":"in_progress"}}
+{"id":"int-08cca2754205d14554106b472e4c4a03","kind":"field_change","created_at":"2026-09-02T10:23:42.613635Z","actor":"Andrzej Fricze","issue_id":"jon-c6a","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
+{"id":"int-7b6efda8ce5982a901769cf33fc405e1","kind":"field_change","created_at":"2026-09-02T10:25:37.549924Z","actor":"Andrzej Fricze","issue_id":"jon-c6a","extra":{"field":"status","new_value":"closed","old_value":"in_progress"}}
