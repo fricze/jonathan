@@ -7,7 +7,8 @@ use crate::data::{edit_record, filter_data, sort_data, write_csv};
 use crate::menu::OPEN_FILE_ID;
 use crate::read_csv::open_csv_file;
 use crate::types::{
-    CsvTabViewer, MyApp, SendUiMessage, SheetTab, SortOrder, TabId, UiMessage, UndoEntry, active_sheet_data,
+    CsvTabViewer, MyApp, ReplaceScope, SendUiMessage, SheetTab, SortOrder, TabId, UiMessage, UndoEntry,
+    active_sheet_data,
 };
 use crate::ui::drop::preview_files_being_dropped;
 
@@ -201,6 +202,78 @@ impl MyApp {
         }
 
         pasted_count
+    }
+
+    /// Replace every occurrence of `find` with `replace` across the rows
+    /// currently displayed for (filename, tab_id) -- the filtered/sorted view
+    /// if one exists, otherwise all of master -- within `scope`. Empty `find`
+    /// matches nothing (avoids replacing every cell boundary). Each changed
+    /// cell becomes one UndoEntry. Returns the count of cells changed.
+    fn apply_replace_all(
+        &mut self,
+        filename: &str,
+        tab_id: TabId,
+        find: &str,
+        replace: &str,
+        scope: ReplaceScope,
+    ) -> usize {
+        if find.is_empty() {
+            return 0;
+        }
+
+        let key = (filename.to_string(), tab_id);
+        let master_rows: Vec<usize> = match self.filtered_data.get(&key) {
+            Some(display) => display.iter().map(|(idx, _)| *idx).collect(),
+            None => self
+                .sheets_data
+                .get(filename)
+                .map(|sheet| sheet.iter().map(|(idx, _)| *idx).collect())
+                .unwrap_or_default(),
+        };
+
+        let num_cols = self
+            .tree
+            .iter_all_tabs()
+            .find_map(|(_, tab)| tab.columns.get(filename))
+            .map_or(0, |headers| headers.len());
+
+        let cols: Vec<usize> = match scope {
+            ReplaceScope::CurrentColumn(col) => vec![col],
+            ReplaceScope::AllColumns => (0..num_cols).collect(),
+        };
+
+        let mut changed_count = 0usize;
+
+        for master_row in master_rows {
+            for &col in &cols {
+                let Some(old_value) = self.read_cell(filename, master_row, col) else {
+                    continue;
+                };
+                if !old_value.contains(find) {
+                    continue;
+                }
+                let new_value = old_value.replace(find, replace);
+                if new_value == old_value {
+                    continue;
+                }
+
+                self.undo_stack.push(UndoEntry {
+                    filename: filename.to_string(),
+                    master_row,
+                    col,
+                    old_value,
+                });
+                self.write_cell(filename, master_row, col, &new_value);
+                changed_count += 1;
+            }
+        }
+
+        if changed_count > 0 {
+            self.redo_stack.clear();
+            self.dirty_files.insert(filename.to_string());
+        }
+
+        changed_count
     }
 }
 
@@ -415,6 +488,11 @@ impl MyApp {
                         let plural = if pasted_count == 1 { "" } else { "s" };
                         crate::toast::show(ctx, format!("Pasted {pasted_count} cell{plural}"));
                     }
+                }
+                UiMessage::ReplaceAll(filename, tab_id, find, replace, scope) => {
+                    let changed = self.apply_replace_all(&filename, tab_id, &find, &replace, scope);
+                    let plural = if changed == 1 { "" } else { "s" };
+                    crate::toast::show(ctx, format!("Replaced in {changed} cell{plural}"));
                 }
                 UiMessage::Undo => {
                     if let Some(result) = self.apply_undo() {
@@ -833,5 +911,87 @@ mod tests {
 
         assert_eq!(count, 0);
         assert!(app.dirty_files.is_empty());
+    }
+
+    #[test]
+    fn replace_all_columns_across_all_rows_when_no_filter() {
+        let mut app = test_app();
+        app.sheets_data.insert(
+            "f.csv".to_string(),
+            vec![row(0, &["foo", "bar"]), row(1, &["foobar", "baz"])],
+        );
+        set_columns(&mut app, "f.csv", 2);
+
+        let count = app.apply_replace_all("f.csv", 1, "foo", "X", ReplaceScope::AllColumns);
+
+        assert_eq!(count, 2);
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("X".to_string()));
+        assert_eq!(app.read_cell("f.csv", 0, 1), Some("bar".to_string()));
+        assert_eq!(app.read_cell("f.csv", 1, 0), Some("Xbar".to_string()));
+        assert_eq!(app.read_cell("f.csv", 1, 1), Some("baz".to_string()));
+        assert_eq!(app.undo_stack.len(), 2);
+    }
+
+    #[test]
+    fn replace_current_column_only() {
+        let mut app = test_app();
+        app.sheets_data.insert(
+            "f.csv".to_string(),
+            vec![row(0, &["foo", "foo"])],
+        );
+        set_columns(&mut app, "f.csv", 2);
+
+        let count = app.apply_replace_all("f.csv", 1, "foo", "X", ReplaceScope::CurrentColumn(1));
+
+        assert_eq!(count, 1);
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("foo".to_string()));
+        assert_eq!(app.read_cell("f.csv", 0, 1), Some("X".to_string()));
+    }
+
+    #[test]
+    fn replace_all_only_touches_filtered_rows_when_filter_active() {
+        let mut app = test_app();
+        app.sheets_data.insert(
+            "f.csv".to_string(),
+            vec![row(0, &["foo"]), row(1, &["foo"]), row(2, &["foo"])],
+        );
+        set_columns(&mut app, "f.csv", 1);
+        // Simulate an active filter that only surfaced row 1 (master index 1).
+        app.filtered_data.insert(
+            ("f.csv".to_string(), 1),
+            vec![row(1, &["foo"])],
+        );
+
+        let count = app.apply_replace_all("f.csv", 1, "foo", "X", ReplaceScope::AllColumns);
+
+        assert_eq!(count, 1);
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("foo".to_string()));
+        assert_eq!(app.read_cell("f.csv", 1, 0), Some("X".to_string()));
+        assert_eq!(app.read_cell("f.csv", 2, 0), Some("foo".to_string()));
+    }
+
+    #[test]
+    fn replace_all_no_match_changes_nothing() {
+        let mut app = test_app();
+        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["bar"])]);
+        set_columns(&mut app, "f.csv", 1);
+
+        let count = app.apply_replace_all("f.csv", 1, "foo", "X", ReplaceScope::AllColumns);
+
+        assert_eq!(count, 0);
+        assert!(app.dirty_files.is_empty());
+        assert!(app.undo_stack.is_empty());
+    }
+
+    #[test]
+    fn replace_all_empty_find_is_noop() {
+        let mut app = test_app();
+        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["bar"])]);
+        set_columns(&mut app, "f.csv", 1);
+
+        let count = app.apply_replace_all("f.csv", 1, "", "X", ReplaceScope::AllColumns);
+
+        assert_eq!(count, 0);
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("bar".to_string()));
     }
 }

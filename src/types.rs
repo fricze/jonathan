@@ -25,6 +25,13 @@ pub type Ping = bool;
 pub type SheetRow = (usize, StringRecord);
 pub type SheetVec = Vec<SheetRow>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum ReplaceScope {
+    /// Only the given actual column index.
+    CurrentColumn(ColumnId),
+    AllColumns,
+}
+
 pub enum UiMessage {
     OpenFile(String, Option<TabId>),
     FilterSheet(Filename, Filter, TabId, Option<usize>),
@@ -41,6 +48,8 @@ pub enum UiMessage {
     /// filename, tab_id, anchor_row (in displayed data), anchor visible col
     /// index, pasted grid of values (row-major, grows right/down from anchor)
     PasteCells(Filename, TabId, u64, usize, Vec<Vec<String>>),
+    /// filename, tab_id, text to find, replacement text, scope
+    ReplaceAll(Filename, TabId, String, String, ReplaceScope),
     SaveFile(Filename),
     Undo,
     Redo,
