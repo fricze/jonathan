@@ -38,6 +38,9 @@ pub enum UiMessage {
     SetMaster(SheetVec, String),
     /// filename, tab_id, row_nr (in displayed data), actual col index, new value
     EditCell(Filename, TabId, u64, usize, String),
+    /// filename, tab_id, anchor_row (in displayed data), anchor visible col
+    /// index, pasted grid of values (row-major, grows right/down from anchor)
+    PasteCells(Filename, TabId, u64, usize, Vec<Vec<String>>),
     SaveFile(Filename),
     Undo,
     Redo,

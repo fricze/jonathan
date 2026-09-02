@@ -7,7 +7,7 @@ use crate::data::{edit_record, filter_data, sort_data, write_csv};
 use crate::menu::OPEN_FILE_ID;
 use crate::read_csv::open_csv_file;
 use crate::types::{
-    CsvTabViewer, MyApp, SendUiMessage, SheetTab, SortOrder, UiMessage, UndoEntry, active_sheet_data,
+    CsvTabViewer, MyApp, SendUiMessage, SheetTab, SortOrder, TabId, UiMessage, UndoEntry, active_sheet_data,
 };
 use crate::ui::drop::preview_files_being_dropped;
 
@@ -131,6 +131,76 @@ impl MyApp {
             old_value: current.clone(),
         });
         Some(UndoRedoResult { row, column, restored, overwritten: current })
+    }
+
+    /// Write a pasted grid into master starting at (anchor_row, anchor_col) in
+    /// the currently displayed view for (filename, tab_id), growing right/down.
+    /// Rows/cols beyond the sheet's current bounds are skipped -- no row or
+    /// column insertion happens here. Pushes one UndoEntry per cell written
+    /// and clears redo_stack if anything was written. Returns the count of
+    /// cells actually written.
+    fn apply_paste(
+        &mut self,
+        filename: &str,
+        tab_id: TabId,
+        anchor_row: u64,
+        anchor_col: usize,
+        rows: &[Vec<String>],
+    ) -> usize {
+        let key = (filename.to_string(), tab_id);
+        let num_master_rows = self.sheets_data.get(filename).map_or(0, |s| s.len());
+        let num_cols = self
+            .tree
+            .iter_all_tabs()
+            .find_map(|(_, tab)| tab.columns.get(filename))
+            .map_or(0, |headers| headers.len());
+
+        let mut pasted_count = 0usize;
+
+        for (row_offset, row_values) in rows.iter().enumerate() {
+            let display_row = anchor_row + row_offset as u64;
+
+            // Resolve the displayed row to a stable master row index, same
+            // fallback EditCell uses.
+            let master_row = self
+                .filtered_data
+                .get(&key)
+                .and_then(|sheet| sheet.get(display_row as usize))
+                .map(|(idx, _)| *idx)
+                .or(Some(display_row as usize));
+
+            let Some(master_row) = master_row else {
+                break;
+            };
+            if master_row >= num_master_rows {
+                break;
+            }
+
+            for (col_offset, value) in row_values.iter().enumerate() {
+                let col = anchor_col + col_offset;
+                if col >= num_cols {
+                    break;
+                }
+
+                if let Some(old_value) = self.read_cell(filename, master_row, col) {
+                    self.undo_stack.push(UndoEntry {
+                        filename: filename.to_string(),
+                        master_row,
+                        col,
+                        old_value,
+                    });
+                    self.write_cell(filename, master_row, col, value);
+                    pasted_count += 1;
+                }
+            }
+        }
+
+        if pasted_count > 0 {
+            self.redo_stack.clear();
+            self.dirty_files.insert(filename.to_string());
+        }
+
+        pasted_count
     }
 }
 
@@ -339,6 +409,13 @@ impl MyApp {
 
                     self.dirty_files.insert(filename);
                 }
+                UiMessage::PasteCells(filename, tab_id, anchor_row, anchor_col, rows) => {
+                    let pasted_count = self.apply_paste(&filename, tab_id, anchor_row, anchor_col, &rows);
+                    if pasted_count > 0 {
+                        let plural = if pasted_count == 1 { "" } else { "s" };
+                        crate::toast::show(ctx, format!("Pasted {pasted_count} cell{plural}"));
+                    }
+                }
                 UiMessage::Undo => {
                     if let Some(result) = self.apply_undo() {
                         let (title, body) = undo_redo_toast("Undo", &result);
@@ -533,6 +610,20 @@ mod tests {
         (idx, StringRecord::from(fields.to_vec()))
     }
 
+    fn set_columns(app: &mut MyApp, filename: &str, count: usize) {
+        let headers = (0..count)
+            .map(|i| crate::types::FileHeader {
+                name: format!("col{i}"),
+                visible: true,
+                sort: None,
+            })
+            .collect();
+        for tab in app.tree.iter_all_tabs_mut() {
+            tab.1.columns.insert(filename.to_string(), headers);
+            return;
+        }
+    }
+
     #[test]
     fn undo_restores_previous_value_and_pushes_redo() {
         let mut app = test_app();
@@ -655,5 +746,92 @@ mod tests {
 
         assert!(app.redo_stack.is_empty());
         assert_eq!(app.read_cell("f.csv", 0, 0), Some("c".to_string()));
+    }
+
+    #[test]
+    fn paste_writes_grid_starting_at_anchor() {
+        let mut app = test_app();
+        app.sheets_data.insert(
+            "f.csv".to_string(),
+            vec![row(0, &["a", "b"]), row(1, &["c", "d"])],
+        );
+        set_columns(&mut app, "f.csv", 2);
+
+        let rows = vec![
+            vec!["x".to_string(), "y".to_string()],
+            vec!["z".to_string(), "w".to_string()],
+        ];
+        let count = app.apply_paste("f.csv", 1, 0, 0, &rows);
+
+        assert_eq!(count, 4);
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("x".to_string()));
+        assert_eq!(app.read_cell("f.csv", 0, 1), Some("y".to_string()));
+        assert_eq!(app.read_cell("f.csv", 1, 0), Some("z".to_string()));
+        assert_eq!(app.read_cell("f.csv", 1, 1), Some("w".to_string()));
+        assert!(app.dirty_files.contains("f.csv"));
+        assert_eq!(app.undo_stack.len(), 4);
+    }
+
+    #[test]
+    fn paste_skips_rows_beyond_sheet_bounds() {
+        let mut app = test_app();
+        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        set_columns(&mut app, "f.csv", 1);
+
+        // Anchor at row 0 with 3 pasted rows, but only 1 row exists.
+        let rows = vec![
+            vec!["x".to_string()],
+            vec!["y".to_string()],
+            vec!["z".to_string()],
+        ];
+        let count = app.apply_paste("f.csv", 1, 0, 0, &rows);
+
+        assert_eq!(count, 1);
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("x".to_string()));
+    }
+
+    #[test]
+    fn paste_skips_columns_beyond_header_bounds() {
+        let mut app = test_app();
+        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a", "b"])]);
+        set_columns(&mut app, "f.csv", 2);
+
+        // Pasted row has 3 values but only 2 columns exist.
+        let rows = vec![vec!["x".to_string(), "y".to_string(), "z".to_string()]];
+        let count = app.apply_paste("f.csv", 1, 0, 0, &rows);
+
+        assert_eq!(count, 2);
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("x".to_string()));
+        assert_eq!(app.read_cell("f.csv", 0, 1), Some("y".to_string()));
+    }
+
+    #[test]
+    fn paste_at_nonzero_anchor_offsets_correctly() {
+        let mut app = test_app();
+        app.sheets_data.insert(
+            "f.csv".to_string(),
+            vec![row(0, &["a", "b", "c"]), row(1, &["d", "e", "f"])],
+        );
+        set_columns(&mut app, "f.csv", 3);
+
+        let rows = vec![vec!["x".to_string()]];
+        let count = app.apply_paste("f.csv", 1, 1, 2, &rows);
+
+        assert_eq!(count, 1);
+        assert_eq!(app.read_cell("f.csv", 1, 2), Some("x".to_string()));
+        // Untouched cells stay as they were.
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("a".to_string()));
+    }
+
+    #[test]
+    fn paste_empty_rows_is_noop() {
+        let mut app = test_app();
+        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        set_columns(&mut app, "f.csv", 1);
+
+        let count = app.apply_paste("f.csv", 1, 0, 0, &[]);
+
+        assert_eq!(count, 0);
+        assert!(app.dirty_files.is_empty());
     }
 }

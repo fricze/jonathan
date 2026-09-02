@@ -181,6 +181,60 @@ impl<'a> Table<'a> {
         crate::toast::show(ui.ctx(), "Copied to clipboard");
     }
 
+    /// Anchor cell for a paste: the top-left of the current selection, or
+    /// the cursor cell if nothing is selected.
+    fn paste_anchor(&self) -> Option<(u64, usize)> {
+        if !self.selection.selected_cells.is_empty() {
+            let min_row = self.selection.selected_cells.iter().map(|&(r, _)| r).min()?;
+            let min_col = self.selection.selected_cells.iter().map(|&(_, c)| c).min()?;
+            Some((min_row, min_col))
+        } else {
+            self.selection.cursor().or(self.selection.anchor_cell)
+        }
+    }
+
+    fn handle_clipboard_paste(&self, ui: &egui::Ui) {
+        if self.edit.editing_cell.is_some() {
+            return;
+        }
+
+        let pasted = ui.input(|i| {
+            i.events.iter().find_map(|e| match e {
+                egui::Event::Paste(s) => Some(s.clone()),
+                _ => None,
+            })
+        });
+        let Some(pasted) = pasted else {
+            return;
+        };
+
+        let Some((anchor_row, anchor_col)) = self.paste_anchor() else {
+            return;
+        };
+
+        let mut reader = csv::ReaderBuilder::new()
+            .has_headers(false)
+            .from_reader(pasted.as_bytes());
+
+        let rows: Vec<Vec<String>> = reader
+            .records()
+            .filter_map(|r| r.ok())
+            .map(|record| record.iter().map(|f| f.to_string()).collect())
+            .collect();
+
+        if rows.is_empty() {
+            return;
+        }
+
+        self.sender.send_msg(UiMessage::PasteCells(
+            self.filename.clone(),
+            self.tab_id,
+            anchor_row,
+            anchor_col,
+            rows,
+        ));
+    }
+
     fn handle_keyboard_navigation(&mut self, ui: &egui::Ui) -> Option<u64> {
         if self.edit.editing_cell.is_some() {
             return None;
@@ -300,6 +354,7 @@ impl<'a> Table<'a> {
         }
 
         self.handle_clipboard_copy(ui);
+        self.handle_clipboard_paste(ui);
 
         if self.edit.editing_cell.is_none() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             if let Some((row_nr, col_nr)) = self.selection.cursor().or(self.selection.anchor_cell) {
