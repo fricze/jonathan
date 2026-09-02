@@ -50,6 +50,10 @@ pub enum UiMessage {
     PasteCells(Filename, TabId, u64, usize, Vec<Vec<String>>),
     /// filename, tab_id, text to find, replacement text, scope
     ReplaceAll(Filename, TabId, String, String, ReplaceScope),
+    /// filename, tab_id, row_nr (in displayed data) to delete
+    DeleteRow(Filename, TabId, u64),
+    /// filename, tab_id, row_nr (in displayed data) to insert after (None = append)
+    InsertRow(Filename, TabId, Option<u64>),
     SaveFile(Filename),
     Undo,
     Redo,
@@ -207,16 +211,22 @@ pub fn active_sheet_data<'a>(
     }
 }
 
-/// A single-cell edit that can be undone/redone. Holds the value the cell
-/// had *before* the edit being recorded was applied, so undoing means
-/// writing `old_value` back and redoing means re-applying whatever was
-/// overwritten.
+/// One undoable/redoable change. Applying the reverse of an entry (see
+/// MyApp::apply_undo/apply_redo) always produces another UndoEntry describing
+/// how to reverse *that* -- e.g. undoing a CellEdit produces a CellEdit
+/// carrying the value it just overwrote; undoing a RowDelete produces a
+/// RowInsert carrying the row that was restored.
 #[derive(Clone)]
-pub struct UndoEntry {
-    pub filename: Filename,
-    pub master_row: usize,
-    pub col: usize,
-    pub old_value: String,
+pub enum UndoEntry {
+    /// Holds the value the cell had *before* the edit being recorded was
+    /// applied, so undoing means writing `old_value` back.
+    CellEdit { filename: Filename, master_row: usize, col: usize, old_value: String },
+    /// A row was removed at `position` (its index in the file's SheetVec at
+    /// the time of deletion). Undoing re-inserts `record` there under the
+    /// same `master_row` id it always had.
+    RowDelete { filename: Filename, master_row: usize, position: usize, record: SheetRow },
+    /// A row with `master_row` was inserted. Undoing removes it again.
+    RowInsert { filename: Filename, master_row: usize },
 }
 
 pub struct MyApp {
@@ -240,6 +250,9 @@ pub struct MyApp {
     /// Global undo/redo history for cell edits. A new edit clears redo_stack.
     pub undo_stack: Vec<UndoEntry>,
     pub redo_stack: Vec<UndoEntry>,
+    /// Next master_row id to assign when inserting a row into a file. Seeded
+    /// from max(existing master_row) + 1 when the file loads.
+    pub next_row_id: HashMap<Filename, usize>,
 }
 
 pub struct CsvTabViewer<'a> {

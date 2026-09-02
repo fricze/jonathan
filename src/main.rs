@@ -72,6 +72,7 @@ fn main() -> eframe::Result {
                     request_epoch: HashMap::new(),
                     undo_stack: vec![],
                     redo_stack: vec![],
+                    next_row_id: HashMap::new(),
                 }))
             }),
         )
