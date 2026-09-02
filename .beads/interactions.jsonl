@@ -52,3 +52,4 @@
 {"id":"int-3dd1217af7e401498ac6e000347a82e7","kind":"field_change","created_at":"2026-09-02T16:00:47.828747Z","actor":"Andrzej Fricze","issue_id":"jon-v0p","extra":{"field":"status","new_value":"in_progress","old_value":"open"}}
 {"id":"int-1fe368444d1cacba673af21a4c4ece79","kind":"field_change","created_at":"2026-09-02T16:02:42.623415Z","actor":"Andrzej Fricze","issue_id":"jon-v0p","extra":{"field":"status","new_value":"closed","old_value":"in_progress"}}
 {"id":"int-54200d2078f323072ae840583438192b","kind":"field_change","created_at":"2026-09-02T16:26:19.776943Z","actor":"Andrzej Fricze","issue_id":"jon-16m","extra":{"field":"status","new_value":"closed","old_value":"open"}}
+{"id":"int-5f28b2a8c5fb7cba0b789cab449f0d6d","kind":"field_change","created_at":"2026-09-02T16:40:40.022552Z","actor":"Andrzej Fricze","issue_id":"jon-pg1","extra":{"field":"status","new_value":"closed","old_value":"open"}}

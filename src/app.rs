@@ -105,6 +105,33 @@ impl MyApp {
         })
     }
 
+    /// Recompute whether `filename` is dirty: true iff its current undo
+    /// stack length differs from clean_marker (the length recorded at last
+    /// save, or 0 if never saved since loading). This is correct through any
+    /// sequence of edits/undo/redo -- undo pops one entry off undo_stack,
+    /// redo pushes one back, so the length returns to exactly what it was
+    /// when the file was last clean.
+    fn refresh_dirty(&mut self, filename: &str) {
+        let current_len = self.undo_stack.get(filename).map_or(0, |s| s.len());
+        let clean_len = self.clean_marker.get(filename).copied().unwrap_or(0);
+        if current_len == clean_len {
+            self.dirty_files.remove(filename);
+        } else {
+            self.dirty_files.insert(filename.to_string());
+        }
+    }
+
+    /// Push a new UndoEntry onto `filename`'s undo_stack, clear that same
+    /// file's redo_stack (a new edit invalidates its redo branch, but never
+    /// another file's), and refresh its dirty status. Every mutation that
+    /// records history goes through this so those three steps can't drift
+    /// apart.
+    fn push_undo(&mut self, filename: &str, entry: UndoEntry) {
+        self.undo_stack.entry(filename.to_string()).or_default().push(entry);
+        self.redo_stack.remove(filename);
+        self.refresh_dirty(filename);
+    }
+
     /// Write `value` into a master cell (by stable row index and column_id,
     /// resolved to a live position internally) and every filtered/sorted
     /// view of that file, across all tabs. No-op if the column no longer
@@ -123,21 +150,24 @@ impl MyApp {
         }
     }
 
-    /// Pop `undo_stack`, apply its reverse, and push an entry describing how
-    /// to reverse *that* onto `redo_stack`. Returns `None` if the stack was
-    /// empty or the entry's target no longer exists.
-    fn apply_undo(&mut self) -> Option<UndoRedoResult> {
-        let entry = self.undo_stack.pop()?;
+    /// Pop `filename`'s undo_stack, apply its reverse, and push an entry
+    /// describing how to reverse *that* onto `filename`'s redo_stack.
+    /// Returns `None` if that file's stack was empty or the entry's target
+    /// no longer exists. Undo/redo never touches another file's history.
+    fn apply_undo(&mut self, filename: &str) -> Option<UndoRedoResult> {
+        let entry = self.undo_stack.get_mut(filename)?.pop()?;
         let (redo_entry, result) = self.reverse_entry(entry)?;
-        self.redo_stack.push(redo_entry);
+        self.redo_stack.entry(filename.to_string()).or_default().push(redo_entry);
+        self.refresh_dirty(filename);
         Some(result)
     }
 
     /// Mirror of `apply_undo` between `redo_stack` and `undo_stack`.
-    fn apply_redo(&mut self) -> Option<UndoRedoResult> {
-        let entry = self.redo_stack.pop()?;
+    fn apply_redo(&mut self, filename: &str) -> Option<UndoRedoResult> {
+        let entry = self.redo_stack.get_mut(filename)?.pop()?;
         let (undo_entry, result) = self.reverse_entry(entry)?;
-        self.undo_stack.push(undo_entry);
+        self.undo_stack.entry(filename.to_string()).or_default().push(undo_entry);
+        self.refresh_dirty(filename);
         Some(result)
     }
 
@@ -149,7 +179,6 @@ impl MyApp {
             UndoEntry::CellEdit { filename, master_row, col_id, old_value } => {
                 let current = self.read_cell(&filename, master_row, col_id)?;
                 self.write_cell(&filename, master_row, col_id, &old_value);
-                self.dirty_files.insert(filename.clone());
                 let column = self.column_name(&filename, col_id);
                 let reverse = UndoEntry::CellEdit {
                     filename,
@@ -169,7 +198,6 @@ impl MyApp {
                 let sheet = self.sheets_data.get_mut(&filename)?;
                 let position = position.min(sheet.len());
                 sheet.insert(position, record);
-                self.dirty_files.insert(filename.clone());
                 let reverse = UndoEntry::RowInsert { filename, master_row };
                 let result = UndoRedoResult {
                     row: Some(master_row),
@@ -183,7 +211,6 @@ impl MyApp {
                 let sheet = self.sheets_data.get_mut(&filename)?;
                 let position = sheet.iter().position(|(idx, _)| *idx == master_row)?;
                 let record = sheet.remove(position);
-                self.dirty_files.insert(filename.clone());
                 let reverse = UndoEntry::RowDelete { filename, master_row, position, record };
                 let result = UndoRedoResult {
                     row: Some(master_row),
@@ -197,7 +224,6 @@ impl MyApp {
                 let column_id = header.id;
                 let name = header.name.clone();
                 self.insert_column_at(&filename, position, header, &values_by_row);
-                self.dirty_files.insert(filename.clone());
                 let reverse = UndoEntry::ColumnInsert { filename, column_id };
                 let result = UndoRedoResult {
                     row: None,
@@ -214,7 +240,6 @@ impl MyApp {
                 let name = header.name.clone();
 
                 let values_by_row = self.remove_column_at(&filename, position, column_id);
-                self.dirty_files.insert(filename.clone());
                 let reverse = UndoEntry::ColumnDelete { filename, position, header, values_by_row };
                 let result = UndoRedoResult {
                     row: None,
@@ -319,9 +344,7 @@ impl MyApp {
 
         let pasted_count = batch.len();
         if pasted_count > 0 {
-            self.undo_stack.push(UndoEntry::Batch(batch));
-            self.redo_stack.clear();
-            self.dirty_files.insert(filename.to_string());
+            self.push_undo(filename, UndoEntry::Batch(batch));
         }
 
         pasted_count
@@ -393,9 +416,7 @@ impl MyApp {
 
         let changed_count = batch.len();
         if changed_count > 0 {
-            self.undo_stack.push(UndoEntry::Batch(batch));
-            self.redo_stack.clear();
-            self.dirty_files.insert(filename.to_string());
+            self.push_undo(filename, UndoEntry::Batch(batch));
         }
 
         changed_count
@@ -433,14 +454,10 @@ impl MyApp {
             }
         }
 
-        self.undo_stack.push(UndoEntry::RowDelete {
-            filename: filename.to_string(),
-            master_row,
-            position,
-            record,
-        });
-        self.redo_stack.clear();
-        self.dirty_files.insert(filename.to_string());
+        self.push_undo(
+            filename,
+            UndoEntry::RowDelete { filename: filename.to_string(), master_row, position, record },
+        );
         true
     }
 
@@ -491,9 +508,7 @@ impl MyApp {
         let sheet = self.sheets_data.get_mut(filename)?;
         sheet.insert(position.min(sheet.len()), (master_row, empty_record));
 
-        self.undo_stack.push(UndoEntry::RowInsert { filename: filename.to_string(), master_row });
-        self.redo_stack.clear();
-        self.dirty_files.insert(filename.to_string());
+        self.push_undo(filename, UndoEntry::RowInsert { filename: filename.to_string(), master_row });
         Some(master_row)
     }
 
@@ -594,14 +609,10 @@ impl MyApp {
 
         let values_by_row = self.remove_column_at(filename, position, column_id);
 
-        self.undo_stack.push(UndoEntry::ColumnDelete {
-            filename: filename.to_string(),
-            position,
-            header,
-            values_by_row,
-        });
-        self.redo_stack.clear();
-        self.dirty_files.insert(filename.to_string());
+        self.push_undo(
+            filename,
+            UndoEntry::ColumnDelete { filename: filename.to_string(), position, header, values_by_row },
+        );
         true
     }
 
@@ -628,9 +639,7 @@ impl MyApp {
         let header = FileHeader { id: column_id, name: name.to_string(), visible: true, sort: None };
         self.insert_column_at(filename, position, header, &[]);
 
-        self.undo_stack.push(UndoEntry::ColumnInsert { filename: filename.to_string(), column_id });
-        self.redo_stack.clear();
-        self.dirty_files.insert(filename.to_string());
+        self.push_undo(filename, UndoEntry::ColumnInsert { filename: filename.to_string(), column_id });
         Some(column_id)
     }
 }
@@ -831,19 +840,13 @@ impl MyApp {
 
                     if let Some(master_row) = master_row {
                         if let Some(old_value) = self.read_cell(&filename, master_row, col_id) {
-                            self.undo_stack.push(UndoEntry::CellEdit {
-                                filename: filename.clone(),
-                                master_row,
-                                col_id,
-                                old_value,
-                            });
-                            self.redo_stack.clear();
+                            self.write_cell(&filename, master_row, col_id, &new_value);
+                            self.push_undo(
+                                &filename,
+                                UndoEntry::CellEdit { filename: filename.clone(), master_row, col_id, old_value },
+                            );
                         }
-
-                        self.write_cell(&filename, master_row, col_id, &new_value);
                     }
-
-                    self.dirty_files.insert(filename);
                 }
                 UiMessage::PasteCells(filename, tab_id, anchor_row, anchor_col, rows) => {
                     let pasted_count = self.apply_paste(&filename, tab_id, anchor_row, anchor_col, &rows);
@@ -877,14 +880,14 @@ impl MyApp {
                         crate::toast::show(ctx, "Column inserted");
                     }
                 }
-                UiMessage::Undo => {
-                    if let Some(result) = self.apply_undo() {
+                UiMessage::Undo(filename) => {
+                    if let Some(result) = self.apply_undo(&filename) {
                         let (title, body) = undo_redo_toast("Undo", &result);
                         crate::toast::show_titled(ctx, title, body);
                     }
                 }
-                UiMessage::Redo => {
-                    if let Some(result) = self.apply_redo() {
+                UiMessage::Redo(filename) => {
+                    if let Some(result) = self.apply_redo(&filename) {
                         let (title, body) = undo_redo_toast("Redo", &result);
                         crate::toast::show_titled(ctx, title, body);
                     }
@@ -900,7 +903,9 @@ impl MyApp {
                         if let Err(e) = write_csv(&filename, &headers, data) {
                             eprintln!("Failed to save {}: {:?}", filename, e);
                         } else {
-                            self.dirty_files.remove(&filename);
+                            let stack_len = self.undo_stack.get(&filename).map_or(0, |s| s.len());
+                            self.clean_marker.insert(filename.clone(), stack_len);
+                            self.refresh_dirty(&filename);
                             let short_name =
                                 filename.split('/').last().unwrap_or(&filename).to_string();
                             crate::toast::show(ctx, format!("Saved: {short_name}"));
@@ -942,10 +947,22 @@ impl MyApp {
                 (cmd_z && !i.modifiers.shift, cmd_z && i.modifiers.shift)
             });
 
-            if undo {
-                self.worker_chan.0.send_msg(UiMessage::Undo);
-            } else if redo {
-                self.worker_chan.0.send_msg(UiMessage::Redo);
+            if undo || redo {
+                let focused_file = self
+                    .tree
+                    .find_active_focused()
+                    .and_then(|(_, tab)| {
+                        let f = tab.chosen_file.clone();
+                        if f.is_empty() { None } else { Some(f) }
+                    });
+
+                if let Some(filename) = focused_file {
+                    if undo {
+                        self.worker_chan.0.send_msg(UiMessage::Undo(filename));
+                    } else {
+                        self.worker_chan.0.send_msg(UiMessage::Redo(filename));
+                    }
+                }
             }
         }
 
@@ -1062,8 +1079,9 @@ mod tests {
             filters: HashMap::new(),
             dirty_files: HashSet::new(),
             request_epoch: HashMap::new(),
-            undo_stack: vec![],
-            redo_stack: vec![],
+            undo_stack: HashMap::new(),
+            redo_stack: HashMap::new(),
+            clean_marker: HashMap::new(),
             next_row_id: HashMap::new(),
             next_col_id: HashMap::new(),
         }
@@ -1088,6 +1106,22 @@ mod tests {
         }
     }
 
+    fn push_undo_entry(app: &mut MyApp, filename: &str, entry: UndoEntry) {
+        app.undo_stack.entry(filename.to_string()).or_default().push(entry);
+    }
+
+    fn push_redo_entry(app: &mut MyApp, filename: &str, entry: UndoEntry) {
+        app.redo_stack.entry(filename.to_string()).or_default().push(entry);
+    }
+
+    fn undo_len(app: &MyApp, filename: &str) -> usize {
+        app.undo_stack.get(filename).map_or(0, |s| s.len())
+    }
+
+    fn redo_len(app: &MyApp, filename: &str) -> usize {
+        app.redo_stack.get(filename).map_or(0, |s| s.len())
+    }
+
     #[test]
     fn undo_restores_previous_value_and_pushes_redo() {
         let mut app = test_app();
@@ -1096,22 +1130,93 @@ mod tests {
             vec![row(0, &["a"]), row(1, &["b"])],
         );
         set_columns(&mut app, "f.csv", 1);
-        app.undo_stack.push(UndoEntry::CellEdit {
+        push_undo_entry(&mut app, "f.csv", UndoEntry::CellEdit {
             filename: "f.csv".to_string(),
             master_row: 0,
             col_id: 0,
             old_value: "original".to_string(),
         });
 
-        let result = app.apply_undo().expect("undo should apply");
+        let result = app.apply_undo("f.csv").expect("undo should apply");
         assert_eq!(result.restored, "original");
         assert_eq!(result.overwritten, "a");
         assert_eq!(app.read_cell("f.csv", 0, 0), Some("original".to_string()));
-        assert_eq!(app.redo_stack.len(), 1);
-        match &app.redo_stack[0] {
+        assert_eq!(redo_len(&app, "f.csv"), 1);
+        match &app.redo_stack["f.csv"][0] {
             UndoEntry::CellEdit { old_value, .. } => assert_eq!(old_value, "a"),
             other => panic!("expected CellEdit, got a different UndoEntry variant: {:?}", std::mem::discriminant(other)),
         }
+        // The undo_stack entry pushed directly above (simulating a prior
+        // edit) is back to empty after this undo, matching clean_marker's
+        // default of 0 -- so the file reads as clean, not dirty. See
+        // undo_back_to_clean_marker_is_not_dirty for the full edit-then-undo
+        // scenario via write_cell + push_undo.
+        assert!(!app.dirty_files.contains("f.csv"));
+    }
+
+    /// Regression test for the reported bug: editing a cell then undoing
+    /// back to the original value must NOT leave the file marked modified.
+    #[test]
+    fn undo_back_to_clean_marker_is_not_dirty() {
+        let mut app = test_app();
+        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        set_columns(&mut app, "f.csv", 1);
+        // File just loaded: clean_marker defaults to 0, undo_stack is empty.
+        assert!(!app.dirty_files.contains("f.csv"));
+
+        // Simulate a real edit: write the new value, then push_undo (the
+        // same path UiMessage::EditCell takes).
+        app.write_cell("f.csv", 0, 0, "b");
+        app.push_undo(
+            "f.csv",
+            UndoEntry::CellEdit {
+                filename: "f.csv".to_string(),
+                master_row: 0,
+                col_id: 0,
+                old_value: "a".to_string(),
+            },
+        );
+        assert!(app.dirty_files.contains("f.csv"));
+
+        // Undo back to the original value: stack length returns to 0,
+        // matching clean_marker, so the file must read as clean again.
+        app.apply_undo("f.csv");
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("a".to_string()));
+        assert!(!app.dirty_files.contains("f.csv"));
+
+        // Redo re-applies the edit: dirty again.
+        app.apply_redo("f.csv");
+        assert!(app.dirty_files.contains("f.csv"));
+    }
+
+    /// A file can be dirty even at undo_stack.len() == 0 relative to a
+    /// nonzero baseline: save while dirty, edit again, undo back past the
+    /// point where it was saved -- it's dirty relative to what's on disk
+    /// even though the stack is shorter than it was mid-edit.
+    #[test]
+    fn dirty_tracked_relative_to_save_point_not_zero() {
+        let mut app = test_app();
+        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        set_columns(&mut app, "f.csv", 1);
+
+        app.write_cell("f.csv", 0, 0, "b");
+        app.push_undo(
+            "f.csv",
+            UndoEntry::CellEdit {
+                filename: "f.csv".to_string(),
+                master_row: 0,
+                col_id: 0,
+                old_value: "a".to_string(),
+            },
+        );
+        // Simulate a save: mark this stack depth (1) as the new clean point.
+        app.clean_marker.insert("f.csv".to_string(), undo_len(&app, "f.csv"));
+        app.refresh_dirty("f.csv");
+        assert!(!app.dirty_files.contains("f.csv"));
+
+        // Undo below the save point: now dirty relative to what's on disk,
+        // even though the stack is shorter than its mid-edit peak.
+        app.apply_undo("f.csv");
         assert!(app.dirty_files.contains("f.csv"));
     }
 
@@ -1120,21 +1225,21 @@ mod tests {
         let mut app = test_app();
         app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["current"])]);
         set_columns(&mut app, "f.csv", 1);
-        app.undo_stack.push(UndoEntry::CellEdit {
+        push_undo_entry(&mut app, "f.csv", UndoEntry::CellEdit {
             filename: "f.csv".to_string(),
             master_row: 0,
             col_id: 0,
             old_value: "before".to_string(),
         });
 
-        app.apply_undo();
+        app.apply_undo("f.csv");
         assert_eq!(app.read_cell("f.csv", 0, 0), Some("before".to_string()));
 
-        app.apply_redo();
+        app.apply_redo("f.csv");
         assert_eq!(app.read_cell("f.csv", 0, 0), Some("current".to_string()));
         // redo is itself undoable, so it lands back on undo_stack.
-        assert_eq!(app.undo_stack.len(), 1);
-        assert!(app.redo_stack.is_empty());
+        assert_eq!(undo_len(&app, "f.csv"), 1);
+        assert_eq!(redo_len(&app, "f.csv"), 0);
     }
 
     #[test]
@@ -1143,36 +1248,36 @@ mod tests {
         app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["v3"])]);
         set_columns(&mut app, "f.csv", 1);
         // Simulate two edits: v1 -> v2 -> v3, each push recording the prior value.
-        app.undo_stack.push(UndoEntry::CellEdit {
+        push_undo_entry(&mut app, "f.csv", UndoEntry::CellEdit {
             filename: "f.csv".to_string(),
             master_row: 0,
             col_id: 0,
             old_value: "v1".to_string(),
         });
-        app.undo_stack.push(UndoEntry::CellEdit {
+        push_undo_entry(&mut app, "f.csv", UndoEntry::CellEdit {
             filename: "f.csv".to_string(),
             master_row: 0,
             col_id: 0,
             old_value: "v2".to_string(),
         });
 
-        assert!(app.apply_undo().is_some());
+        assert!(app.apply_undo("f.csv").is_some());
         assert_eq!(app.read_cell("f.csv", 0, 0), Some("v2".to_string()));
-        assert!(app.apply_undo().is_some());
+        assert!(app.apply_undo("f.csv").is_some());
         assert_eq!(app.read_cell("f.csv", 0, 0), Some("v1".to_string()));
     }
 
     #[test]
     fn undo_on_empty_stack_is_noop() {
         let mut app = test_app();
-        assert!(app.apply_undo().is_none());
+        assert!(app.apply_undo("f.csv").is_none());
         assert!(app.dirty_files.is_empty());
     }
 
     #[test]
     fn redo_on_empty_stack_is_noop() {
         let mut app = test_app();
-        assert!(app.apply_redo().is_none());
+        assert!(app.apply_redo("f.csv").is_none());
         assert!(app.dirty_files.is_empty());
     }
 
@@ -1180,16 +1285,16 @@ mod tests {
     fn undo_missing_target_cell_is_noop_and_drops_entry() {
         let mut app = test_app();
         // File was closed/removed since the edit was made.
-        app.undo_stack.push(UndoEntry::CellEdit {
+        push_undo_entry(&mut app, "gone.csv", UndoEntry::CellEdit {
             filename: "gone.csv".to_string(),
             master_row: 0,
             col_id: 0,
             old_value: "x".to_string(),
         });
 
-        assert!(app.apply_undo().is_none());
-        assert!(app.undo_stack.is_empty());
-        assert!(app.redo_stack.is_empty());
+        assert!(app.apply_undo("gone.csv").is_none());
+        assert_eq!(undo_len(&app, "gone.csv"), 0);
+        assert_eq!(redo_len(&app, "gone.csv"), 0);
     }
 
     #[test]
@@ -1197,7 +1302,7 @@ mod tests {
         let mut app = test_app();
         app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["b"])]);
         set_columns(&mut app, "f.csv", 1);
-        app.redo_stack.push(UndoEntry::CellEdit {
+        push_redo_entry(&mut app, "f.csv", UndoEntry::CellEdit {
             filename: "f.csv".to_string(),
             master_row: 0,
             col_id: 0,
@@ -1205,17 +1310,17 @@ mod tests {
         });
 
         if let Some(old_value) = app.read_cell("f.csv", 0, 0) {
-            app.undo_stack.push(UndoEntry::CellEdit {
+            push_undo_entry(&mut app, "f.csv", UndoEntry::CellEdit {
                 filename: "f.csv".to_string(),
                 master_row: 0,
                 col_id: 0,
                 old_value,
             });
-            app.redo_stack.clear();
+            app.redo_stack.remove("f.csv");
         }
         app.write_cell("f.csv", 0, 0, "c");
 
-        assert!(app.redo_stack.is_empty());
+        assert_eq!(redo_len(&app, "f.csv"), 0);
         assert_eq!(app.read_cell("f.csv", 0, 0), Some("c".to_string()));
     }
 
@@ -1241,8 +1346,8 @@ mod tests {
         assert_eq!(app.read_cell("f.csv", 1, 1), Some("w".to_string()));
         assert!(app.dirty_files.contains("f.csv"));
         // The whole paste is one undoable action, not four separate entries.
-        assert_eq!(app.undo_stack.len(), 1);
-        match &app.undo_stack[0] {
+        assert_eq!(undo_len(&app, "f.csv"), 1);
+        match &app.undo_stack["f.csv"][0] {
             UndoEntry::Batch(entries) => assert_eq!(entries.len(), 4),
             other => panic!("expected a Batch, got {:?}", std::mem::discriminant(other)),
         }
@@ -1328,8 +1433,8 @@ mod tests {
         assert_eq!(app.read_cell("f.csv", 1, 0), Some("Xbar".to_string()));
         assert_eq!(app.read_cell("f.csv", 1, 1), Some("baz".to_string()));
         // The whole replace-all is one undoable action.
-        assert_eq!(app.undo_stack.len(), 1);
-        match &app.undo_stack[0] {
+        assert_eq!(undo_len(&app, "f.csv"), 1);
+        match &app.undo_stack["f.csv"][0] {
             UndoEntry::Batch(entries) => assert_eq!(entries.len(), 2),
             other => panic!("expected a Batch, got {:?}", std::mem::discriminant(other)),
         }
@@ -1383,7 +1488,7 @@ mod tests {
 
         assert_eq!(count, 0);
         assert!(app.dirty_files.is_empty());
-        assert!(app.undo_stack.is_empty());
+        assert_eq!(undo_len(&app, "f.csv"), 0);
     }
 
     #[test]
@@ -1411,7 +1516,7 @@ mod tests {
         let remaining: Vec<usize> = app.sheets_data["f.csv"].iter().map(|(idx, _)| *idx).collect();
         assert_eq!(remaining, vec![0, 2]);
         assert!(app.dirty_files.contains("f.csv"));
-        assert_eq!(app.undo_stack.len(), 1);
+        assert_eq!(undo_len(&app, "f.csv"), 1);
     }
 
     #[test]
@@ -1514,7 +1619,7 @@ mod tests {
         app.apply_delete_row("f.csv", 1, 1);
         assert_eq!(app.sheets_data["f.csv"].len(), 2);
 
-        let result = app.apply_undo().expect("undo should restore the row");
+        let result = app.apply_undo("f.csv").expect("undo should restore the row");
         assert_eq!(result.row, Some(1));
         assert_eq!(app.sheets_data["f.csv"].len(), 3);
         let restored: Vec<usize> = app.sheets_data["f.csv"].iter().map(|(idx, _)| *idx).collect();
@@ -1532,7 +1637,7 @@ mod tests {
         app.apply_insert_row("f.csv", 1, None);
         assert_eq!(app.sheets_data["f.csv"].len(), 2);
 
-        app.apply_undo();
+        app.apply_undo("f.csv");
         assert_eq!(app.sheets_data["f.csv"].len(), 1);
         assert_eq!(app.read_cell("f.csv", 0, 0), Some("a".to_string()));
     }
@@ -1546,8 +1651,8 @@ mod tests {
         );
 
         app.apply_delete_row("f.csv", 1, 1);
-        app.apply_undo();
-        app.apply_redo();
+        app.apply_undo("f.csv");
+        app.apply_redo("f.csv");
 
         assert_eq!(app.sheets_data["f.csv"].len(), 1);
         let remaining: Vec<usize> = app.sheets_data["f.csv"].iter().map(|(idx, _)| *idx).collect();
@@ -1579,7 +1684,7 @@ mod tests {
 
         // Edit column id 1 ("dupa"): "x" -> "y". Records an UndoEntry with
         // col_id: 1, old_value: "x".
-        app.undo_stack.push(UndoEntry::CellEdit {
+        push_undo_entry(&mut app, "f.csv", UndoEntry::CellEdit {
             filename: "f.csv".to_string(),
             master_row: 0,
             col_id: 1,
@@ -1606,7 +1711,7 @@ mod tests {
         // Undo the edit made before the shift. It must restore "dupa" (id 1,
         // now at position 0) back to "x" -- NOT write into whatever is now
         // at the old position-1 slot (which would be "age").
-        let result = app.apply_undo().expect("undo should apply");
+        let result = app.apply_undo("f.csv").expect("undo should apply");
         assert_eq!(result.column, Some("dupa".to_string()));
         assert_eq!(app.read_cell("f.csv", 0, 1), Some("x".to_string()));
         // "age" (id 2) must be untouched by the undo.
@@ -1696,7 +1801,7 @@ mod tests {
         set_columns(&mut app, "f.csv", 3);
 
         app.apply_delete_column("f.csv", 1);
-        let result = app.apply_undo().expect("undo should restore the column");
+        let result = app.apply_undo("f.csv").expect("undo should restore the column");
         assert_eq!(result.column, Some("col1".to_string()));
 
         assert_eq!(app.read_cell("f.csv", 0, 1), Some("b".to_string()));
@@ -1717,7 +1822,7 @@ mod tests {
         app.apply_insert_column("f.csv", None, "new");
         assert_eq!(app.sheets_data["f.csv"][0].1.len(), 2);
 
-        app.apply_undo();
+        app.apply_undo("f.csv");
         assert_eq!(app.sheets_data["f.csv"][0].1.len(), 1);
         assert_eq!(app.read_cell("f.csv", 0, 0), Some("a".to_string()));
 
@@ -1735,8 +1840,8 @@ mod tests {
         set_columns(&mut app, "f.csv", 2);
 
         app.apply_delete_column("f.csv", 0);
-        app.apply_undo();
-        app.apply_redo();
+        app.apply_undo("f.csv");
+        app.apply_redo("f.csv");
 
         assert_eq!(app.sheets_data["f.csv"][0].1.len(), 1);
         assert_eq!(app.read_cell("f.csv", 0, 1), Some("b".to_string()));
@@ -1765,8 +1870,8 @@ mod tests {
         assert_eq!(app.read_cell("f.csv", 1, 1), Some("w".to_string()));
 
         // A single undo must restore every pasted cell.
-        assert!(app.apply_undo().is_some());
-        assert_eq!(app.undo_stack.len(), 0);
+        assert!(app.apply_undo("f.csv").is_some());
+        assert_eq!(undo_len(&app, "f.csv"), 0);
         assert_eq!(app.read_cell("f.csv", 0, 0), Some("a".to_string()));
         assert_eq!(app.read_cell("f.csv", 0, 1), Some("b".to_string()));
         assert_eq!(app.read_cell("f.csv", 1, 0), Some("c".to_string()));
@@ -1774,14 +1879,14 @@ mod tests {
 
         // A second undo must be a no-op (nothing left to undo) -- proves the
         // whole paste was ONE undo item, not four.
-        assert!(app.apply_undo().is_none());
+        assert!(app.apply_undo("f.csv").is_none());
 
         // A single redo must re-apply every pasted cell.
-        assert!(app.apply_redo().is_some());
+        assert!(app.apply_redo("f.csv").is_some());
         assert_eq!(app.read_cell("f.csv", 0, 0), Some("x".to_string()));
         assert_eq!(app.read_cell("f.csv", 0, 1), Some("y".to_string()));
         assert_eq!(app.read_cell("f.csv", 1, 0), Some("z".to_string()));
         assert_eq!(app.read_cell("f.csv", 1, 1), Some("w".to_string()));
-        assert!(app.apply_redo().is_none());
+        assert!(app.apply_redo("f.csv").is_none());
     }
 }

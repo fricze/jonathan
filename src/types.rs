@@ -74,8 +74,10 @@ pub enum UiMessage {
     /// filename, column_id to insert after (None = append at the end), new column's name
     InsertColumn(Filename, Option<ColumnId>, String),
     SaveFile(Filename),
-    Undo,
-    Redo,
+    /// Undo the last change to this file's own undo stack (stacks are
+    /// per-file, so undoing in one tab never touches another file's edits).
+    Undo(Filename),
+    Redo(Filename),
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -297,13 +299,23 @@ pub struct MyApp {
     pub files_list: Vec<String>,
     pub global_filter: String,
     pub filters: Filters,
+    /// Derived from undo_stack.len() vs. clean_marker for each file -- see
+    /// MyApp::refresh_dirty. Not written to directly outside that function.
     pub dirty_files: HashSet<Filename>,
     /// Bumped each time a sort/filter is requested for a (filename, tab_id);
     /// used to drop results from superseded background requests.
     pub request_epoch: HashMap<(Filename, TabId), u64>,
-    /// Global undo/redo history for cell edits. A new edit clears redo_stack.
-    pub undo_stack: Vec<UndoEntry>,
-    pub redo_stack: Vec<UndoEntry>,
+    /// Per-file undo/redo history for cell/row/column edits. A new edit
+    /// clears that file's redo_stack. Undo/redo only ever affects the file
+    /// they're invoked for -- editing one file never disturbs another's
+    /// history.
+    pub undo_stack: HashMap<Filename, Vec<UndoEntry>>,
+    pub redo_stack: HashMap<Filename, Vec<UndoEntry>>,
+    /// undo_stack[file].len() at the point each file was last saved (or 0 if
+    /// never saved since loading). A file is dirty iff its current stack
+    /// length differs from this -- correct through any sequence of
+    /// edit/undo/redo, since undo/redo change stack length symmetrically.
+    pub clean_marker: HashMap<Filename, usize>,
     /// Next master_row id to assign when inserting a row into a file. Seeded
     /// from max(existing master_row) + 1 when the file loads.
     pub next_row_id: HashMap<Filename, usize>,
