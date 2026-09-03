@@ -15,12 +15,21 @@ mod toast;
 mod types;
 mod ui;
 
+use clap::Parser;
 use eframe::egui;
 use std::collections::HashSet;
 use std::sync::Arc;
 use types::{MyApp, Ping, SheetTab, UiMessage};
 
+/// A CSV viewer.
+#[derive(Parser)]
+struct Args {
+    /// CSV file to open on startup.
+    file: Option<String>,
+}
+
 fn main() -> eframe::Result {
+    let args = Args::parse();
     dioxus_devtools::connect_subsecond();
 
     subsecond::call(|| {
@@ -52,6 +61,16 @@ fn main() -> eframe::Result {
                     let menu = menu::build_menu();
                     menu.init_for_nsapp();
                     Box::leak(Box::new(menu));
+                }
+
+                if let Some(file) = args.file.clone() {
+                    // tab id 1 is the sole tab created below -- pass it
+                    // explicitly (not None) so the file actually displays
+                    // instead of just being registered in files_list. See
+                    // load_file: a None tab_id never sets any tab's
+                    // chosen_file, which turns out to be true of the
+                    // existing menu/drag-drop OpenFile paths too.
+                    let _ = worker_chan.0.send(UiMessage::OpenFile(file, Some(1)));
                 }
 
                 Ok(Box::new(MyApp {

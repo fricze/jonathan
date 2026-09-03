@@ -104,7 +104,21 @@ claude mcp add egui-screenshot -s project -- "$(pwd)/.venv-mcp/bin/python" "$(pw
 
 ## Usage
 
-With the app running (`cargo run`), the agent can loop: screenshot →
+**Load a file first.** The bridge can only see/control this app's own
+frame — it can't reach a native OS file-picker dialog. Clicking "Open
+file…" through the bridge would open a dialog the bridge can't dismiss or
+interact with, stalling the session. Instead, launch the app with a file
+path as its one CLI argument, which loads it directly into the first tab
+with no dialog involved:
+
+```bash
+cargo run --bin jonathan -- heroes.csv
+```
+
+(The in-app "Open file…" button and drag-and-drop still work normally for
+interactive use — just avoid triggering them through the bridge.)
+
+With the app running and a file loaded, the agent can loop: screenshot →
 decide → click/type/paste → screenshot again, all scoped to that one
 window. A typical sequence: `take_app_screenshot`, `mouse_click(x, y)` on
 a cell seen in the screenshot, `key_press("z", command=True)` to test
