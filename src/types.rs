@@ -322,6 +322,10 @@ pub struct MyApp {
     /// Next column_id to assign when inserting a column into a file. Seeded
     /// from max(existing FileHeader.id) + 1 when the file loads.
     pub next_col_id: HashMap<Filename, ColumnId>,
+    /// Lets an external MCP-driven agent screenshot and control this app for
+    /// testing -- see src/screenshot_bridge.rs. Polled once per frame; a
+    /// no-op unless something writes to its request directory.
+    pub agent_bridge: crate::screenshot_bridge::AgentBridge,
 }
 
 pub struct CsvTabViewer<'a> {

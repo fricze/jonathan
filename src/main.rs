@@ -9,6 +9,7 @@ mod data;
 mod menu;
 mod new_table;
 mod read_csv;
+mod screenshot_bridge;
 mod tabs;
 mod toast;
 mod types;
@@ -75,6 +76,7 @@ fn main() -> eframe::Result {
                     clean_marker: HashMap::new(),
                     next_row_id: HashMap::new(),
                     next_col_id: HashMap::new(),
+                    agent_bridge: screenshot_bridge::AgentBridge::new(),
                 }))
             }),
         )

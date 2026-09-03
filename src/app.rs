@@ -775,6 +775,8 @@ impl MyApp {
     }
 
     fn update_inner(&mut self, ctx: &egui::Context) {
+        self.agent_bridge.poll(ctx);
+
         // Handle macOS menu events
         #[cfg(target_os = "macos")]
         if let Ok(event) = MenuEvent::receiver().try_recv() {
@@ -1084,6 +1086,7 @@ mod tests {
             clean_marker: HashMap::new(),
             next_row_id: HashMap::new(),
             next_col_id: HashMap::new(),
+            agent_bridge: crate::screenshot_bridge::AgentBridge::new(),
         }
     }
 
