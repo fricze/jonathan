@@ -56,18 +56,31 @@ the target first so egui gives it focus.
 ## Setup
 
 Already wired into this repo — `src/screenshot_bridge.rs` is a module,
-`MyApp.agent_bridge` is polled every frame in `app.rs::update_inner`, and
+`MyApp.agent_bridge` is polled every frame in `app.rs::update_inner`,
 `Cargo.toml` has the `image`/`serde`(derive)/`serde_json` dependencies it
-needs. Nothing to change to use it locally.
+needs, and `.mcp.json` registers the server at project scope (so it's
+available to anyone who clones the repo, once they've approved it and
+created the venv below).
+
+`mcp` needs Python **3.10+** — macOS's system `python3` is commonly older
+than that (3.9 on this machine), so this uses a dedicated venv rather than
+a system-wide install:
 
 ```bash
-pip install "mcp>=2"
+python3.12 -m venv .venv-mcp   # any Python >=3.10 works; adjust the binary name
+.venv-mcp/bin/pip install --upgrade pip
+.venv-mcp/bin/pip install "mcp>=2"
 ```
+
+`.venv-mcp/` is gitignored — each clone creates its own. `.mcp.json` points
+at `${CLAUDE_PROJECT_DIR}/.venv-mcp/bin/python`, a path Claude Code expands
+to the project root at launch, so no machine-specific absolute paths are
+committed.
 
 Quick smoke test (run `cargo run` first, in another terminal):
 
 ```bash
-python3 egui_screenshot_mcp_server.py
+.venv-mcp/bin/python egui_screenshot_mcp_server.py
 ```
 
 This starts the server on stdio, which is how MCP clients talk to it — you
@@ -75,13 +88,18 @@ won't see obvious output, that's expected. Use the MCP inspector if you
 want to poke it interactively:
 
 ```bash
-npx @modelcontextprotocol/inspector python3 egui_screenshot_mcp_server.py
+npx @modelcontextprotocol/inspector .venv-mcp/bin/python egui_screenshot_mcp_server.py
 ```
 
-### Register it with Claude Code
+### Registering with Claude Code
+
+Already done for this repo via `.mcp.json` — restart your Claude Code
+session and approve the server when prompted (project-scoped servers
+require one-time approval per clone). To register it yourself elsewhere,
+or re-create the entry:
 
 ```bash
-claude mcp add egui-screenshot -- python3 /absolute/path/to/jonathan/egui_screenshot_mcp_server.py
+claude mcp add egui-screenshot -s project -- "$(pwd)/.venv-mcp/bin/python" "$(pwd)/egui_screenshot_mcp_server.py"
 ```
 
 ## Usage

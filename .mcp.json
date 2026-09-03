@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "egui-screenshot": {
+      "type": "stdio",
+      "command": "${CLAUDE_PROJECT_DIR}/.venv-mcp/bin/python",
+      "args": [
+        "${CLAUDE_PROJECT_DIR}/egui_screenshot_mcp_server.py"
+      ],
+      "env": {}
+    }
+  }
+}
