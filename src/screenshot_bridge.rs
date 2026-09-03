@@ -87,9 +87,14 @@ impl AgentBridge {
 
         // Keep the app ticking even if it's otherwise idle (egui normally
         // only repaints in response to input), so requests dropped while
-        // idle still get picked up promptly. Drain queued actions quickly;
-        // otherwise fall back to a slower idle poll.
-        let interval = if self.action_queue.is_empty() {
+        // idle still get picked up promptly. Drain queued actions quickly and
+        // finish a pending screenshot capture quickly too -- a screenshot
+        // needs at least one more frame after the ViewportCommand is sent
+        // before the rendered image comes back as an Event::Screenshot, and
+        // at the slow idle interval that round trip can take over a second
+        // (worse if the window isn't focused and the OS throttles it
+        // further). Otherwise fall back to a slower idle poll.
+        let interval = if self.action_queue.is_empty() && !self.screenshot_pending {
             Duration::from_millis(100)
         } else {
             Duration::from_millis(8)
@@ -126,14 +131,27 @@ impl AgentBridge {
     }
 
     fn write_screenshot(&self, color_image: &egui::ColorImage) {
+        // Write to a temp file first, then rename into place. A direct
+        // save_buffer to output_path would let a reader on the other side
+        // see the file exist (and read 0 bytes / a partial PNG) for however
+        // long the encoder takes to stream its output -- rename is atomic
+        // on the filesystems this runs on, so the reader only ever sees
+        // output_path either absent or fully written.
+        // save_buffer_with_format (not save_buffer) so the format is
+        // explicit -- save_buffer infers it from the path's final
+        // extension, and a ".tmp" suffix on the temp path would otherwise
+        // be read as the format and rejected.
+        let tmp_path = self.output_path.with_extension("tmp");
         let pixels = color_image.as_raw();
-        let result = image::save_buffer(
-            &self.output_path,
+        let result = image::save_buffer_with_format(
+            &tmp_path,
             pixels,
             color_image.width() as u32,
             color_image.height() as u32,
             image::ColorType::Rgba8,
-        );
+            image::ImageFormat::Png,
+        )
+        .and_then(|()| fs::rename(&tmp_path, &self.output_path).map_err(image::ImageError::IoError));
 
         if let Err(e) = result {
             eprintln!("agent_bridge: failed to save PNG: {e}");
