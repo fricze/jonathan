@@ -119,6 +119,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "512761e0bb2578dd7380c6baaa0f4ce03e84f95e960231d1dec8bf4d7d6e2627"
 
 [[package]]
+name = "agent_bridge"
+version = "0.1.0"
+dependencies = [
+ "egui 0.33.0",
+ "image",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "ahash"
 version = "0.8.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -999,6 +1009,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7d02f3b0da4c6504f86e9cd789d8dbafab48c2321be74e9987593de5a894d93d"
 dependencies = [
  "memchr",
+]
+
+[[package]]
+name = "csv_model"
+version = "0.1.0"
+dependencies = [
+ "csv",
 ]
 
 [[package]]
@@ -2420,10 +2437,12 @@ dependencies = [
 name = "jonathan"
 version = "0.1.0"
 dependencies = [
+ "agent_bridge",
  "arboard",
  "chrono",
  "clap",
  "csv",
+ "csv_model",
  "dioxus-devtools",
  "eframe",
  "egui 0.33.0",
@@ -2438,10 +2457,12 @@ dependencies = [
  "muda",
  "rand 0.9.1",
  "rfd",
+ "selection",
  "serde",
  "serde_json",
  "sha2",
  "subsecond",
+ "undo_history",
  "unicode-width 0.2.0",
 ]
 
@@ -3627,6 +3648,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "94143f37725109f92c262ed2cf5e59bce7498c01bcc1502d7b9afe439a4e9f49"
 
 [[package]]
+name = "selection"
+version = "0.1.0"
+
+[[package]]
 name = "semver"
 version = "1.0.27"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4170,6 +4195,10 @@ dependencies = [
  "tempfile",
  "winapi",
 ]
+
+[[package]]
+name = "undo_history"
+version = "0.1.0"
 
 [[package]]
 name = "unicase"

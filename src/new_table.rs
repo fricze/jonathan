@@ -2,9 +2,9 @@ use std::{collections::BTreeMap, sync::mpsc::Sender};
 
 use egui::{Align2, Color32, Context, Id, Margin, NumExt as _, Sense, TextFormat};
 
-use crate::data::csv_quote;
+use csv_model::csv_quote;
 use crate::types::{
-    ColumnId, FileHeader, Filename, SelectionState, SendUiMessage, SheetVec, SortOrder, TabId, UiMessage,
+    ColumnId, FileHeader, Filename, SelectionState, SendUiMessage, Rows, SortOrder, TabId, UiMessage,
 };
 
 /// Sizing/rendering knobs for a `Table`. All owned, cheap to copy/construct,
@@ -25,7 +25,7 @@ pub struct EditState<'a> {
 }
 
 pub struct Table<'a> {
-    pub data: &'a SheetVec,
+    pub data: Rows<'a>,
     pub num_columns: usize,
     pub columns: &'a mut Vec<FileHeader>,
     /// Maps visible column index to actual data column index

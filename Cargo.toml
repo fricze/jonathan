@@ -4,7 +4,14 @@ version = "0.1.0"
 edition = "2024"
 
 
+[workspace]
+members = ["crates/*"]
+
 [dependencies]
+csv_model = { path = "crates/csv_model" }
+undo_history = { path = "crates/undo_history" }
+selection = { path = "crates/selection" }
+agent_bridge = { path = "crates/agent_bridge" }
 egui_file = "0.22.1"
 muda = "0.17"
 csv = "1.3"

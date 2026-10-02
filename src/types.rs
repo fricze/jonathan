@@ -1,33 +1,20 @@
+pub use csv_model::{ColumnId, FileHeader, SheetRow, SheetVec, SortOrder, View};
+pub use selection::SelectionState;
+pub use undo_history::UndoHistory;
+#[cfg(test)]
 use csv::StringRecord;
 use egui::Context;
 use egui_dock::{DockState, NodeIndex, SurfaceIndex};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use std::sync::mpsc::{Receiver, Sender};
 
-#[derive(Clone, Default)]
-pub struct FileHeader {
-    /// Stable identity for this column, assigned once when the file loads
-    /// and never reassigned -- unlike its position in the columns Vec, which
-    /// shifts on column insert/delete. Mirrors master_row's role for rows.
-    pub id: ColumnId,
-    pub name: String,
-    pub visible: bool,
-    pub sort: Option<SortOrder>,
-}
-
 pub type TabId = usize;
-pub type ColumnId = usize;
+
 pub type Filter = String;
 pub type Filename = String;
 
 pub type Ping = bool;
-
-/// (master row index, record). The master index is assigned once when a file
-/// is loaded and carried through sort/filter so edits to a filtered or sorted
-/// view can always be written back to the correct row in master data.
-pub type SheetRow = (usize, StringRecord);
-pub type SheetVec = Vec<SheetRow>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum ReplaceScope {
@@ -52,7 +39,7 @@ pub enum UiMessage {
     /// computed for so a stale result (superseded by a newer request for the
     /// same file+tab) can be dropped instead of racing to overwrite the
     /// latest one.
-    SetDisplayData(SheetVec, String, TabId, u64),
+    SetDisplayData(View, String, TabId, u64),
     SetMaster(SheetVec, String),
     /// filename, tab_id, row_nr (in displayed data), column_id, new value.
     /// column_id (not a position) so a stored/replayed edit stays correct
@@ -78,100 +65,6 @@ pub enum UiMessage {
     /// per-file, so undoing in one tab never touches another file's edits).
     Undo(Filename),
     Redo(Filename),
-}
-
-#[derive(Debug, PartialEq, Eq, Clone, Copy)]
-pub enum SortOrder {
-    Asc,
-    Dsc,
-}
-
-#[derive(Default)]
-pub struct SelectionState {
-    pub selected_cells: HashSet<(u64, usize)>,
-    /// Fixed corner for range operations (keyboard nav, shift+click, drag)
-    pub anchor_cell: Option<(u64, usize)>,
-    /// Movable corner of the selection rectangle
-    pub selection_end: Option<(u64, usize)>,
-    /// Cell where a drag-select started
-    pub drag_origin: Option<(u64, usize)>,
-}
-
-impl SelectionState {
-    /// The current movable corner: `selection_end` if set, otherwise `anchor_cell`.
-    pub fn cursor(&self) -> Option<(u64, usize)> {
-        self.selection_end.or(self.anchor_cell)
-    }
-
-    pub fn contains(&self, row: u64, col: usize) -> bool {
-        self.selected_cells.contains(&(row, col))
-    }
-
-    pub fn is_dragging(&self) -> bool {
-        self.drag_origin.is_some()
-    }
-
-    /// Clear everything and select a single cell, resetting the anchor.
-    pub fn select_single(&mut self, row: u64, col: usize) {
-        self.selected_cells.clear();
-        self.selected_cells.insert((row, col));
-        self.anchor_cell = Some((row, col));
-        self.selection_end = None;
-    }
-
-    /// Toggle a cell in/out of the selection; updates anchor but keeps other cells.
-    pub fn toggle(&mut self, row: u64, col: usize) {
-        if self.selected_cells.contains(&(row, col)) {
-            self.selected_cells.remove(&(row, col));
-        } else {
-            self.selected_cells.insert((row, col));
-        }
-        self.anchor_cell = Some((row, col));
-    }
-
-    /// Fill the rectangle from `anchor_cell` to `(row, col)` and update `selection_end`.
-    /// Falls back to `select_single` if there is no anchor yet.
-    pub fn extend_to(&mut self, row: u64, col: usize) {
-        if let Some((anchor_row, anchor_col)) = self.anchor_cell {
-            self.fill_rect(anchor_row, anchor_col, row, col);
-            self.selection_end = Some((row, col));
-        } else {
-            self.select_single(row, col);
-        }
-    }
-
-    pub fn start_drag(&mut self, row: u64, col: usize) {
-        self.drag_origin = Some((row, col));
-        self.anchor_cell = Some((row, col));
-        self.selection_end = None;
-        self.selected_cells.clear();
-        self.selected_cells.insert((row, col));
-    }
-
-    /// Extend the drag rectangle from `drag_origin` to `(row, col)`.
-    pub fn update_drag(&mut self, row: u64, col: usize) {
-        if let Some((origin_row, origin_col)) = self.drag_origin {
-            self.fill_rect(origin_row, origin_col, row, col);
-            self.selection_end = Some((row, col));
-        }
-    }
-
-    pub fn end_drag(&mut self) {
-        self.drag_origin = None;
-    }
-
-    fn fill_rect(&mut self, r1: u64, c1: usize, r2: u64, c2: usize) {
-        let row_min = r1.min(r2);
-        let row_max = r1.max(r2);
-        let col_min = c1.min(c2);
-        let col_max = c1.max(c2);
-        self.selected_cells.clear();
-        for r in row_min..=row_max {
-            for c in col_min..=col_max {
-                self.selected_cells.insert((r, c));
-            }
-        }
-    }
 }
 
 #[derive(Default)]
@@ -211,24 +104,44 @@ impl SendUiMessage for Sender<UiMessage> {
 
 pub type Filters = HashMap<(Filename, TabId), String>;
 
-/// Returns the sheet data to display for a given file+tab:
+/// The rows a tab displays: master, optionally seen through a `View`.
+#[derive(Clone, Copy)]
+pub struct Rows<'a> {
+    master: &'a SheetVec,
+    view: Option<&'a [u32]>,
+}
+
+impl<'a> Rows<'a> {
+    pub fn len(&self) -> usize {
+        self.view.map_or(self.master.len(), |v| v.len())
+    }
+
+    pub fn get(&self, row_nr: usize) -> Option<&'a SheetRow> {
+        match self.view {
+            Some(v) => self.master.get(*v.get(row_nr)? as usize),
+            None => self.master.get(row_nr),
+        }
+    }
+}
+
+/// Returns the rows to display for a given file+tab:
 /// - the filtered/sorted view if one exists
 /// - master data if no filter is active
-/// - an empty slice if a filter is pending but results haven't arrived yet
+/// - nothing if a filter is pending but results haven't arrived yet
 pub fn active_sheet_data<'a>(
     master: &'a HashMap<Filename, SheetVec>,
-    filtered: &'a HashMap<(Filename, TabId), SheetVec>,
+    filtered: &'a HashMap<(Filename, TabId), View>,
     filename: &str,
     tab_id: TabId,
     filter_active: bool,
-) -> &'a SheetVec {
+) -> Rows<'a> {
     use std::sync::LazyLock;
     static EMPTY: LazyLock<SheetVec> = LazyLock::new(Vec::new);
     match (master.get(filename), filtered.get(&(filename.to_string(), tab_id))) {
-        (Some(_), None) if filter_active => &EMPTY,
-        (Some(data), None) => data,
-        (Some(_), Some(data)) => data,
-        _ => &EMPTY,
+        (Some(m), None) if filter_active => Rows { master: m, view: Some(&[]) },
+        (Some(m), None) => Rows { master: m, view: None },
+        (Some(m), Some(v)) => Rows { master: m, view: Some(v) },
+        _ => Rows { master: &EMPTY, view: None },
     }
 }
 
@@ -293,29 +206,19 @@ pub struct MyApp {
     pub sheets_data: HashMap<String, SheetVec>,
     // Filtered/sorted views keyed by (filename, tab_id). Each tab can show
     // the same master file filtered or sorted differently.
-    pub filtered_data: HashMap<(Filename, TabId), SheetVec>,
+    pub filtered_data: HashMap<(Filename, TabId), View>,
     pub tree: DockState<SheetTab>,
     pub counter: usize,
     pub files_list: Vec<String>,
     pub global_filter: String,
     pub filters: Filters,
-    /// Derived from undo_stack.len() vs. clean_marker for each file -- see
-    /// MyApp::refresh_dirty. Not written to directly outside that function.
-    pub dirty_files: HashSet<Filename>,
+    /// Per-file undo/redo stacks plus dirty tracking (dirty = stack length
+    /// differs from the length at last save). A new edit clears that file's
+    /// redo branch; editing one file never disturbs another's history.
+    pub history: UndoHistory<Filename, UndoEntry>,
     /// Bumped each time a sort/filter is requested for a (filename, tab_id);
     /// used to drop results from superseded background requests.
     pub request_epoch: HashMap<(Filename, TabId), u64>,
-    /// Per-file undo/redo history for cell/row/column edits. A new edit
-    /// clears that file's redo_stack. Undo/redo only ever affects the file
-    /// they're invoked for -- editing one file never disturbs another's
-    /// history.
-    pub undo_stack: HashMap<Filename, Vec<UndoEntry>>,
-    pub redo_stack: HashMap<Filename, Vec<UndoEntry>>,
-    /// undo_stack[file].len() at the point each file was last saved (or 0 if
-    /// never saved since loading). A file is dirty iff its current stack
-    /// length differs from this -- correct through any sequence of
-    /// edit/undo/redo, since undo/redo change stack length symmetrically.
-    pub clean_marker: HashMap<Filename, usize>,
     /// Next master_row id to assign when inserting a row into a file. Seeded
     /// from max(existing master_row) + 1 when the file loads.
     pub next_row_id: HashMap<Filename, usize>,
@@ -323,15 +226,15 @@ pub struct MyApp {
     /// from max(existing FileHeader.id) + 1 when the file loads.
     pub next_col_id: HashMap<Filename, ColumnId>,
     /// Lets an external MCP-driven agent screenshot and control this app for
-    /// testing -- see src/screenshot_bridge.rs. Polled once per frame; a
+    /// testing -- see crates/agent_bridge. Polled once per frame; a
     /// no-op unless something writes to its request directory.
-    pub agent_bridge: crate::screenshot_bridge::AgentBridge,
+    pub agent_bridge: agent_bridge::AgentBridge,
 }
 
 pub struct CsvTabViewer<'a> {
     pub added_nodes: &'a mut Vec<(SurfaceIndex, NodeIndex, Filename)>,
     pub promised_data: &'a HashMap<Filename, SheetVec>,
-    pub filtered_data: &'a HashMap<(Filename, TabId), SheetVec>,
+    pub filtered_data: &'a HashMap<(Filename, TabId), View>,
     pub ctx: &'a Context,
     pub sender: &'a Sender<UiMessage>,
     pub files_list: &'a Vec<String>,
@@ -339,7 +242,7 @@ pub struct CsvTabViewer<'a> {
     pub focused_tab: Option<usize>,
     pub global_filter: &'a String,
     pub filters: &'a mut Filters,
-    pub dirty_files: &'a HashSet<Filename>,
+    pub history: &'a UndoHistory<Filename, UndoEntry>,
 }
 
 #[cfg(test)]
@@ -347,65 +250,16 @@ mod tests {
     use super::*;
 
     #[test]
-    fn select_single_clears_previous_selection() {
-        let mut s = SelectionState::default();
-        s.extend_to(0, 0);
-        s.select_single(3, 3);
-        assert!(s.selected_cells.contains(&(3, 3)));
-        assert_eq!(s.selected_cells.len(), 1);
-        assert_eq!(s.anchor_cell, Some((3, 3)));
-        assert_eq!(s.selection_end, None);
-    }
-
-    #[test]
-    fn extend_to_fills_rectangle_from_anchor() {
-        let mut s = SelectionState::default();
-        s.select_single(1, 1);
-        s.extend_to(3, 2);
-        for r in 1..=3 {
-            for c in 1..=2 {
-                assert!(s.contains(r, c), "expected ({r},{c}) selected");
-            }
-        }
-        assert_eq!(s.selected_cells.len(), 6);
-        assert_eq!(s.cursor(), Some((3, 2)));
-    }
-
-    #[test]
-    fn toggle_adds_and_removes_without_clearing_others() {
-        let mut s = SelectionState::default();
-        s.select_single(0, 0);
-        s.toggle(1, 1);
-        assert!(s.contains(0, 0));
-        assert!(s.contains(1, 1));
-        s.toggle(1, 1);
-        assert!(!s.contains(1, 1));
-        assert!(s.contains(0, 0));
-    }
-
-    #[test]
-    fn drag_updates_rectangle_and_ends_cleanly() {
-        let mut s = SelectionState::default();
-        s.start_drag(0, 0);
-        s.update_drag(2, 2);
-        assert_eq!(s.selected_cells.len(), 9);
-        assert!(s.is_dragging());
-        s.end_drag();
-        assert!(!s.is_dragging());
-    }
-
-    #[test]
     fn active_sheet_data_prefers_filtered_view_when_present() {
         let mut master = HashMap::new();
         master.insert("f.csv".to_string(), vec![(0usize, StringRecord::from(vec!["m"]))]);
-        let mut filtered = HashMap::new();
-        filtered.insert(
-            ("f.csv".to_string(), 1usize),
-            vec![(0usize, StringRecord::from(vec!["filtered"]))],
-        );
+        let mut filtered: HashMap<(Filename, TabId), View> = HashMap::new();
+        master.get_mut("f.csv").unwrap().push((1, StringRecord::from(vec!["n"])));
+        filtered.insert(("f.csv".to_string(), 1usize), vec![1u32]);
 
         let data = active_sheet_data(&master, &filtered, "f.csv", 1, true);
-        assert_eq!(data[0].1.get(0), Some("filtered"));
+        assert_eq!(data.len(), 1);
+        assert_eq!(data.get(0).unwrap().1.get(0), Some("n"));
     }
 
     #[test]
@@ -415,7 +269,7 @@ mod tests {
         let filtered = HashMap::new();
 
         let data = active_sheet_data(&master, &filtered, "f.csv", 1, false);
-        assert_eq!(data[0].1.get(0), Some("m"));
+        assert_eq!(data.get(0).unwrap().1.get(0), Some("m"));
     }
 
     #[test]
@@ -425,7 +279,7 @@ mod tests {
         let filtered = HashMap::new();
 
         let data = active_sheet_data(&master, &filtered, "f.csv", 1, true);
-        assert!(data.is_empty());
+        assert_eq!(data.len(), 0);
     }
 
     fn header(id: ColumnId, name: &str) -> FileHeader {

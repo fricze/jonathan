@@ -4,12 +4,11 @@ use egui_dock::{DockArea, Style};
 use std::path::PathBuf;
 use std::thread;
 
-use crate::data::{edit_record, filter_data, sort_data, write_csv};
+use csv_model::{edit_record, filter_indices, open_csv_file, sort_indices, write_csv};
 use crate::menu::OPEN_FILE_ID;
-use crate::read_csv::open_csv_file;
 use crate::types::{
     ColumnId, CsvTabViewer, FileHeader, InsertPosition, MyApp, ReplaceScope, SendUiMessage, SheetTab,
-    SortOrder, TabId, UiMessage, UndoEntry, active_sheet_data, column_position,
+    SortOrder, TabId, UiMessage, UndoEntry, View, SheetRow, active_sheet_data, column_position,
 };
 use crate::ui::drop::preview_files_being_dropped;
 
@@ -105,31 +104,10 @@ impl MyApp {
         })
     }
 
-    /// Recompute whether `filename` is dirty: true iff its current undo
-    /// stack length differs from clean_marker (the length recorded at last
-    /// save, or 0 if never saved since loading). This is correct through any
-    /// sequence of edits/undo/redo -- undo pops one entry off undo_stack,
-    /// redo pushes one back, so the length returns to exactly what it was
-    /// when the file was last clean.
-    fn refresh_dirty(&mut self, filename: &str) {
-        let current_len = self.undo_stack.get(filename).map_or(0, |s| s.len());
-        let clean_len = self.clean_marker.get(filename).copied().unwrap_or(0);
-        if current_len == clean_len {
-            self.dirty_files.remove(filename);
-        } else {
-            self.dirty_files.insert(filename.to_string());
-        }
-    }
-
-    /// Push a new UndoEntry onto `filename`'s undo_stack, clear that same
-    /// file's redo_stack (a new edit invalidates its redo branch, but never
-    /// another file's), and refresh its dirty status. Every mutation that
-    /// records history goes through this so those three steps can't drift
-    /// apart.
+    /// Record a new edit in `filename`'s history (clears its redo branch,
+    /// refreshes dirty).
     fn push_undo(&mut self, filename: &str, entry: UndoEntry) {
-        self.undo_stack.entry(filename.to_string()).or_default().push(entry);
-        self.redo_stack.remove(filename);
-        self.refresh_dirty(filename);
+        self.history.push(&filename.to_string(), entry);
     }
 
     /// Write `value` into a master cell (by stable row index and column_id,
@@ -143,31 +121,83 @@ impl MyApp {
         if let Some(sheet) = self.sheets_data.get_mut(filename) {
             edit_record(sheet, master_row, position, value);
         }
-        for ((fname, _), display_sheet) in self.filtered_data.iter_mut() {
+    }
+
+    /// Master row id shown at display row `row_nr` of (filename, tab_id),
+    /// resolving through that tab's filtered/sorted view if it has one.
+    fn master_row_at(&self, filename: &str, tab_id: TabId, row_nr: u64) -> Option<usize> {
+        let master = self.sheets_data.get(filename)?;
+        let position = match self.filtered_data.get(&(filename.to_string(), tab_id)) {
+            Some(view) => *view.get(row_nr as usize)? as usize,
+            None => row_nr as usize,
+        };
+        master.get(position).map(|(id, _)| *id)
+    }
+
+    /// Drop in-flight sort/filter results for `filename`: they were computed
+    /// against master positions that a row insert/remove just shifted.
+    fn invalidate_pending_views(&mut self, filename: &str) {
+        for ((fname, _), epoch) in self.request_epoch.iter_mut() {
             if fname == filename {
-                edit_record(display_sheet, master_row, position, value);
+                *epoch += 1;
             }
         }
     }
 
-    /// Pop `filename`'s undo_stack, apply its reverse, and push an entry
-    /// describing how to reverse *that* onto `filename`'s redo_stack.
-    /// Returns `None` if that file's stack was empty or the entry's target
-    /// no longer exists. Undo/redo never touches another file's history.
+    /// Remove master row `position`, shifting every view of `filename` to
+    /// match (views hold master positions).
+    fn remove_master_row(&mut self, filename: &str, position: usize) -> Option<SheetRow> {
+        let row = {
+            let sheet = self.sheets_data.get_mut(filename)?;
+            if position >= sheet.len() {
+                return None;
+            }
+            sheet.remove(position)
+        };
+        self.invalidate_pending_views(filename);
+        let p = position as u32;
+        for ((fname, _), view) in self.filtered_data.iter_mut() {
+            if fname == filename {
+                view.retain(|&x| x != p);
+                view.iter_mut().filter(|x| **x > p).for_each(|x| *x -= 1);
+            }
+        }
+        Some(row)
+    }
+
+    /// Insert `row` at master `position` (clamped), shifting every view of
+    /// `filename` to match. The new row is in no view until it is refreshed.
+    fn insert_master_row(&mut self, filename: &str, position: usize, row: SheetRow) -> Option<()> {
+        let sheet = self.sheets_data.get_mut(filename)?;
+        let position = position.min(sheet.len());
+        sheet.insert(position, row);
+        self.invalidate_pending_views(filename);
+        let p = position as u32;
+        for ((fname, _), view) in self.filtered_data.iter_mut() {
+            if fname == filename {
+                view.iter_mut().filter(|x| **x >= p).for_each(|x| *x += 1);
+            }
+        }
+        Some(())
+    }
+
+    /// Pop `filename`'s newest undo entry, apply its reverse, and record the
+    /// reversal as a redo entry. `None` if the stack was empty or the
+    /// entry's target no longer exists. Never touches another file's history.
     fn apply_undo(&mut self, filename: &str) -> Option<UndoRedoResult> {
-        let entry = self.undo_stack.get_mut(filename)?.pop()?;
+        let key = filename.to_string();
+        let entry = self.history.pop_undo(&key)?;
         let (redo_entry, result) = self.reverse_entry(entry)?;
-        self.redo_stack.entry(filename.to_string()).or_default().push(redo_entry);
-        self.refresh_dirty(filename);
+        self.history.push_redo_entry(&key, redo_entry);
         Some(result)
     }
 
-    /// Mirror of `apply_undo` between `redo_stack` and `undo_stack`.
+    /// Mirror of `apply_undo` between redo and undo.
     fn apply_redo(&mut self, filename: &str) -> Option<UndoRedoResult> {
-        let entry = self.redo_stack.get_mut(filename)?.pop()?;
+        let key = filename.to_string();
+        let entry = self.history.pop_redo(&key)?;
         let (undo_entry, result) = self.reverse_entry(entry)?;
-        self.undo_stack.entry(filename.to_string()).or_default().push(undo_entry);
-        self.refresh_dirty(filename);
+        self.history.push_undo_entry(&key, undo_entry);
         Some(result)
     }
 
@@ -195,9 +225,7 @@ impl MyApp {
                 Some((reverse, result))
             }
             UndoEntry::RowDelete { filename, master_row, position, record } => {
-                let sheet = self.sheets_data.get_mut(&filename)?;
-                let position = position.min(sheet.len());
-                sheet.insert(position, record);
+                self.insert_master_row(&filename, position, record)?;
                 let reverse = UndoEntry::RowInsert { filename, master_row };
                 let result = UndoRedoResult {
                     row: Some(master_row),
@@ -208,9 +236,8 @@ impl MyApp {
                 Some((reverse, result))
             }
             UndoEntry::RowInsert { filename, master_row } => {
-                let sheet = self.sheets_data.get_mut(&filename)?;
-                let position = sheet.iter().position(|(idx, _)| *idx == master_row)?;
-                let record = sheet.remove(position);
+                let position = self.sheets_data.get(&filename)?.iter().position(|(idx, _)| *idx == master_row)?;
+                let record = self.remove_master_row(&filename, position)?;
                 let reverse = UndoEntry::RowDelete { filename, master_row, position, record };
                 let result = UndoRedoResult {
                     row: Some(master_row),
@@ -292,8 +319,6 @@ impl MyApp {
         anchor_col_id: ColumnId,
         rows: &[Vec<String>],
     ) -> usize {
-        let key = (filename.to_string(), tab_id);
-        let num_master_rows = self.sheets_data.get(filename).map_or(0, |s| s.len());
         let headers = self.tree.iter_all_tabs().find_map(|(_, tab)| tab.columns.get(filename).cloned());
         let Some(headers) = headers else {
             return 0;
@@ -309,19 +334,9 @@ impl MyApp {
 
             // Resolve the displayed row to a stable master row index, same
             // fallback EditCell uses.
-            let master_row = self
-                .filtered_data
-                .get(&key)
-                .and_then(|sheet| sheet.get(display_row as usize))
-                .map(|(idx, _)| *idx)
-                .or(Some(display_row as usize));
-
-            let Some(master_row) = master_row else {
+            let Some(master_row) = self.master_row_at(filename, tab_id, display_row) else {
                 break;
             };
-            if master_row >= num_master_rows {
-                break;
-            }
 
             for (col_offset, value) in row_values.iter().enumerate() {
                 let position = anchor_position + col_offset;
@@ -368,14 +383,13 @@ impl MyApp {
             return 0;
         }
 
-        let key = (filename.to_string(), tab_id);
-        let master_rows: Vec<usize> = match self.filtered_data.get(&key) {
-            Some(display) => display.iter().map(|(idx, _)| *idx).collect(),
-            None => self
-                .sheets_data
-                .get(filename)
-                .map(|sheet| sheet.iter().map(|(idx, _)| *idx).collect())
-                .unwrap_or_default(),
+        let master_rows: Vec<usize> = match (
+            self.sheets_data.get(filename),
+            self.filtered_data.get(&(filename.to_string(), tab_id)),
+        ) {
+            (Some(master), Some(view)) => view.iter().map(|&i| master[i as usize].0).collect(),
+            (Some(master), None) => master.iter().map(|(idx, _)| *idx).collect(),
+            _ => vec![],
         };
 
         let all_col_ids: Vec<ColumnId> = self
@@ -428,31 +442,19 @@ impl MyApp {
     /// view of that file. Pushes an UndoEntry::RowDelete capturing enough to
     /// restore it. Returns `true` if a row was actually removed.
     fn apply_delete_row(&mut self, filename: &str, tab_id: TabId, row_nr: u64) -> bool {
-        let key = (filename.to_string(), tab_id);
-        let master_row = self
-            .filtered_data
-            .get(&key)
-            .and_then(|sheet| sheet.get(row_nr as usize))
-            .map(|(idx, _)| *idx)
-            .or(Some(row_nr as usize));
-
-        let Some(master_row) = master_row else {
+        let Some(master_row) = self.master_row_at(filename, tab_id, row_nr) else {
             return false;
         };
-
-        let Some(sheet) = self.sheets_data.get_mut(filename) else {
+        let Some(position) = self
+            .sheets_data
+            .get(filename)
+            .and_then(|sheet| sheet.iter().position(|(idx, _)| *idx == master_row))
+        else {
             return false;
         };
-        let Some(position) = sheet.iter().position(|(idx, _)| *idx == master_row) else {
+        let Some(record) = self.remove_master_row(filename, position) else {
             return false;
         };
-        let record = sheet.remove(position);
-
-        for ((fname, _), display_sheet) in self.filtered_data.iter_mut() {
-            if fname == filename {
-                display_sheet.retain(|(idx, _)| *idx != master_row);
-            }
-        }
 
         self.push_undo(
             filename,
@@ -486,27 +488,23 @@ impl MyApp {
 
         let empty_record: StringRecord = std::iter::repeat("").take(num_cols).collect();
 
-        let sheet = self.sheets_data.get_mut(filename)?;
+        let len = self.sheets_data.get(filename)?.len();
         let position = match anchor {
             Some((row_nr, insert_position)) => {
-                let key = (filename.to_string(), tab_id);
-                let anchor_master_row = self
-                    .filtered_data
-                    .get(&key)
-                    .and_then(|s| s.get(row_nr as usize))
-                    .map(|(idx, _)| *idx)
-                    .unwrap_or(row_nr as usize);
-                let anchor_position = sheet.iter().position(|(idx, _)| *idx == anchor_master_row);
+                let anchor_position = match self.filtered_data.get(&(filename.to_string(), tab_id)) {
+                    Some(view) => view.get(row_nr as usize).map(|&p| p as usize),
+                    None => Some(row_nr as usize),
+                }
+                .filter(|&p| p < len);
                 match (anchor_position, insert_position) {
                     (Some(p), InsertPosition::Before) => p,
                     (Some(p), InsertPosition::After) => p + 1,
-                    (None, _) => sheet.len(),
+                    (None, _) => len,
                 }
             }
-            None => sheet.len(),
+            None => len,
         };
-        let sheet = self.sheets_data.get_mut(filename)?;
-        sheet.insert(position.min(sheet.len()), (master_row, empty_record));
+        self.insert_master_row(filename, position, (master_row, empty_record))?;
 
         self.push_undo(filename, UndoEntry::RowInsert { filename: filename.to_string(), master_row });
         Some(master_row)
@@ -532,13 +530,6 @@ impl MyApp {
         if let Some(sheet) = self.sheets_data.get_mut(filename) {
             for (_, record) in sheet.iter_mut() {
                 *record = record.iter().enumerate().filter(|(i, _)| *i != position).map(|(_, f)| f).collect();
-            }
-        }
-        for ((fname, _), display_sheet) in self.filtered_data.iter_mut() {
-            if fname == filename {
-                for (_, record) in display_sheet.iter_mut() {
-                    *record = record.iter().enumerate().filter(|(i, _)| *i != position).map(|(_, f)| f).collect();
-                }
             }
         }
         for tab in self.tree.iter_all_tabs_mut() {
@@ -570,15 +561,6 @@ impl MyApp {
                 let mut fields: Vec<&str> = record.iter().collect();
                 fields.insert(position.min(fields.len()), values.get(idx).copied().unwrap_or(""));
                 *record = fields.into_iter().collect();
-            }
-        }
-        for ((fname, _), display_sheet) in self.filtered_data.iter_mut() {
-            if fname == filename {
-                for (idx, record) in display_sheet.iter_mut() {
-                    let mut fields: Vec<&str> = record.iter().collect();
-                    fields.insert(position.min(fields.len()), values.get(idx).copied().unwrap_or(""));
-                    *record = fields.into_iter().collect();
-                }
             }
         }
         for tab in self.tree.iter_all_tabs_mut() {
@@ -706,23 +688,24 @@ impl MyApp {
                     .get(&(filename.to_string(), tab_id))
                     .map_or(false, |f| !f.is_empty());
 
-                let sheet_data = active_sheet_data(
-                    &self.sheets_data,
-                    &self.filtered_data,
-                    &filename,
-                    tab_id,
-                    filter_active,
-                );
+                let key = (filename.clone(), tab_id);
+                let rows = active_sheet_data(&self.sheets_data, &self.filtered_data, &filename, tab_id, filter_active);
 
-                if !sheet_data.is_empty() {
-                    let master_clone = sheet_data.clone();
+                if rows.len() > 0 {
+                    // Sort the tab's current view, or every master row if it has none.
+                    let view: View = match self.filtered_data.get(&key) {
+                        Some(v) => v.clone(),
+                        None => (0..rows.len() as u32).collect(),
+                    };
+                    // ponytail: clones master for the worker thread; Arc'd master if this shows up in profiles
+                    let master_clone = self.sheets_data[&filename].clone();
                     let chan = chan.clone();
                     let ctx = ctx.clone();
                     let filename = filename.clone();
                     let epoch = bump_epoch(&mut self.request_epoch, (filename.clone(), tab_id));
 
                     thread::spawn(move || {
-                        let sorted = sort_data(master_clone, sort_order);
+                        let sorted = sort_indices(&master_clone, view, sort_order);
 
                         chan.send_msg(UiMessage::SetDisplayData(sorted, filename, tab_id, epoch));
 
@@ -755,7 +738,7 @@ impl MyApp {
                     let epoch = bump_epoch(&mut self.request_epoch, (filename.clone(), tab_id));
 
                     thread::spawn(move || {
-                        let filtered = filter_data(master_clone, filter);
+                        let filtered = filter_indices(&master_clone, &filter);
 
                         chan.send_msg(UiMessage::SetDisplayData(filtered, filename, tab_id, epoch));
 
@@ -832,15 +815,7 @@ impl MyApp {
                     // row_nr is an index into the currently displayed (filtered/sorted)
                     // view. Resolve it to a stable master row index first, then always
                     // write through to master -- the filtered view is just a cache.
-                    let key = (filename.clone(), tab_id);
-                    let master_row = self
-                        .filtered_data
-                        .get(&key)
-                        .and_then(|sheet| sheet.get(row_nr as usize))
-                        .map(|(idx, _)| *idx)
-                        .or(Some(row_nr as usize));
-
-                    if let Some(master_row) = master_row {
+                    if let Some(master_row) = self.master_row_at(&filename, tab_id, row_nr) {
                         if let Some(old_value) = self.read_cell(&filename, master_row, col_id) {
                             self.write_cell(&filename, master_row, col_id, &new_value);
                             self.push_undo(
@@ -905,9 +880,7 @@ impl MyApp {
                         if let Err(e) = write_csv(&filename, &headers, data) {
                             eprintln!("Failed to save {}: {:?}", filename, e);
                         } else {
-                            let stack_len = self.undo_stack.get(&filename).map_or(0, |s| s.len());
-                            self.clean_marker.insert(filename.clone(), stack_len);
-                            self.refresh_dirty(&filename);
+                            self.history.mark_clean(&filename);
                             let short_name =
                                 filename.split('/').last().unwrap_or(&filename).to_string();
                             crate::toast::show(ctx, format!("Saved: {short_name}"));
@@ -997,7 +970,7 @@ impl MyApp {
                     focused_tab,
                     global_filter: &self.global_filter,
                     filters: &mut self.filters,
-                    dirty_files: &self.dirty_files,
+                    history: &self.history,
                 },
             );
 
@@ -1079,14 +1052,11 @@ mod tests {
             files_list: vec![],
             global_filter: "".to_string(),
             filters: HashMap::new(),
-            dirty_files: HashSet::new(),
             request_epoch: HashMap::new(),
-            undo_stack: HashMap::new(),
-            redo_stack: HashMap::new(),
-            clean_marker: HashMap::new(),
+            history: Default::default(),
             next_row_id: HashMap::new(),
             next_col_id: HashMap::new(),
-            agent_bridge: crate::screenshot_bridge::AgentBridge::new(),
+            agent_bridge: agent_bridge::AgentBridge::new(),
         }
     }
 
@@ -1110,19 +1080,19 @@ mod tests {
     }
 
     fn push_undo_entry(app: &mut MyApp, filename: &str, entry: UndoEntry) {
-        app.undo_stack.entry(filename.to_string()).or_default().push(entry);
+        app.history.push_undo_entry(&filename.to_string(), entry);
     }
 
     fn push_redo_entry(app: &mut MyApp, filename: &str, entry: UndoEntry) {
-        app.redo_stack.entry(filename.to_string()).or_default().push(entry);
+        app.history.push_redo_entry(&filename.to_string(), entry);
     }
 
     fn undo_len(app: &MyApp, filename: &str) -> usize {
-        app.undo_stack.get(filename).map_or(0, |s| s.len())
+        app.history.undo_len(&filename.to_string())
     }
 
     fn redo_len(app: &MyApp, filename: &str) -> usize {
-        app.redo_stack.get(filename).map_or(0, |s| s.len())
+        app.history.redo_len(&filename.to_string())
     }
 
     #[test]
@@ -1145,7 +1115,7 @@ mod tests {
         assert_eq!(result.overwritten, "a");
         assert_eq!(app.read_cell("f.csv", 0, 0), Some("original".to_string()));
         assert_eq!(redo_len(&app, "f.csv"), 1);
-        match &app.redo_stack["f.csv"][0] {
+        match app.history.peek_redo(&"f.csv".to_string()).unwrap() {
             UndoEntry::CellEdit { old_value, .. } => assert_eq!(old_value, "a"),
             other => panic!("expected CellEdit, got a different UndoEntry variant: {:?}", std::mem::discriminant(other)),
         }
@@ -1154,7 +1124,7 @@ mod tests {
         // default of 0 -- so the file reads as clean, not dirty. See
         // undo_back_to_clean_marker_is_not_dirty for the full edit-then-undo
         // scenario via write_cell + push_undo.
-        assert!(!app.dirty_files.contains("f.csv"));
+        assert!(!app.history.is_dirty(&"f.csv".to_string()));
     }
 
     /// Regression test for the reported bug: editing a cell then undoing
@@ -1165,7 +1135,7 @@ mod tests {
         app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
         set_columns(&mut app, "f.csv", 1);
         // File just loaded: clean_marker defaults to 0, undo_stack is empty.
-        assert!(!app.dirty_files.contains("f.csv"));
+        assert!(!app.history.is_dirty(&"f.csv".to_string()));
 
         // Simulate a real edit: write the new value, then push_undo (the
         // same path UiMessage::EditCell takes).
@@ -1179,17 +1149,17 @@ mod tests {
                 old_value: "a".to_string(),
             },
         );
-        assert!(app.dirty_files.contains("f.csv"));
+        assert!(app.history.is_dirty(&"f.csv".to_string()));
 
         // Undo back to the original value: stack length returns to 0,
         // matching clean_marker, so the file must read as clean again.
         app.apply_undo("f.csv");
         assert_eq!(app.read_cell("f.csv", 0, 0), Some("a".to_string()));
-        assert!(!app.dirty_files.contains("f.csv"));
+        assert!(!app.history.is_dirty(&"f.csv".to_string()));
 
         // Redo re-applies the edit: dirty again.
         app.apply_redo("f.csv");
-        assert!(app.dirty_files.contains("f.csv"));
+        assert!(app.history.is_dirty(&"f.csv".to_string()));
     }
 
     /// A file can be dirty even at undo_stack.len() == 0 relative to a
@@ -1213,14 +1183,13 @@ mod tests {
             },
         );
         // Simulate a save: mark this stack depth (1) as the new clean point.
-        app.clean_marker.insert("f.csv".to_string(), undo_len(&app, "f.csv"));
-        app.refresh_dirty("f.csv");
-        assert!(!app.dirty_files.contains("f.csv"));
+        app.history.mark_clean(&"f.csv".to_string());
+        assert!(!app.history.is_dirty(&"f.csv".to_string()));
 
         // Undo below the save point: now dirty relative to what's on disk,
         // even though the stack is shorter than its mid-edit peak.
         app.apply_undo("f.csv");
-        assert!(app.dirty_files.contains("f.csv"));
+        assert!(app.history.is_dirty(&"f.csv".to_string()));
     }
 
     #[test]
@@ -1274,14 +1243,14 @@ mod tests {
     fn undo_on_empty_stack_is_noop() {
         let mut app = test_app();
         assert!(app.apply_undo("f.csv").is_none());
-        assert!(app.dirty_files.is_empty());
+        assert!(!app.history.any_dirty());
     }
 
     #[test]
     fn redo_on_empty_stack_is_noop() {
         let mut app = test_app();
         assert!(app.apply_redo("f.csv").is_none());
-        assert!(app.dirty_files.is_empty());
+        assert!(!app.history.any_dirty());
     }
 
     #[test]
@@ -1313,13 +1282,12 @@ mod tests {
         });
 
         if let Some(old_value) = app.read_cell("f.csv", 0, 0) {
-            push_undo_entry(&mut app, "f.csv", UndoEntry::CellEdit {
+            app.push_undo("f.csv", UndoEntry::CellEdit {
                 filename: "f.csv".to_string(),
                 master_row: 0,
                 col_id: 0,
                 old_value,
             });
-            app.redo_stack.remove("f.csv");
         }
         app.write_cell("f.csv", 0, 0, "c");
 
@@ -1347,10 +1315,10 @@ mod tests {
         assert_eq!(app.read_cell("f.csv", 0, 1), Some("y".to_string()));
         assert_eq!(app.read_cell("f.csv", 1, 0), Some("z".to_string()));
         assert_eq!(app.read_cell("f.csv", 1, 1), Some("w".to_string()));
-        assert!(app.dirty_files.contains("f.csv"));
+        assert!(app.history.is_dirty(&"f.csv".to_string()));
         // The whole paste is one undoable action, not four separate entries.
         assert_eq!(undo_len(&app, "f.csv"), 1);
-        match &app.undo_stack["f.csv"][0] {
+        match app.history.peek_undo(&"f.csv".to_string()).unwrap() {
             UndoEntry::Batch(entries) => assert_eq!(entries.len(), 4),
             other => panic!("expected a Batch, got {:?}", std::mem::discriminant(other)),
         }
@@ -1416,7 +1384,7 @@ mod tests {
         let count = app.apply_paste("f.csv", 1, 0, 0, &[]);
 
         assert_eq!(count, 0);
-        assert!(app.dirty_files.is_empty());
+        assert!(!app.history.any_dirty());
     }
 
     #[test]
@@ -1437,7 +1405,7 @@ mod tests {
         assert_eq!(app.read_cell("f.csv", 1, 1), Some("baz".to_string()));
         // The whole replace-all is one undoable action.
         assert_eq!(undo_len(&app, "f.csv"), 1);
-        match &app.undo_stack["f.csv"][0] {
+        match app.history.peek_undo(&"f.csv".to_string()).unwrap() {
             UndoEntry::Batch(entries) => assert_eq!(entries.len(), 2),
             other => panic!("expected a Batch, got {:?}", std::mem::discriminant(other)),
         }
@@ -1470,7 +1438,7 @@ mod tests {
         // Simulate an active filter that only surfaced row 1 (master index 1).
         app.filtered_data.insert(
             ("f.csv".to_string(), 1),
-            vec![row(1, &["foo"])],
+            vec![1u32],
         );
 
         let count = app.apply_replace_all("f.csv", 1, "foo", "X", ReplaceScope::AllColumns);
@@ -1490,7 +1458,7 @@ mod tests {
         let count = app.apply_replace_all("f.csv", 1, "foo", "X", ReplaceScope::AllColumns);
 
         assert_eq!(count, 0);
-        assert!(app.dirty_files.is_empty());
+        assert!(!app.history.any_dirty());
         assert_eq!(undo_len(&app, "f.csv"), 0);
     }
 
@@ -1518,7 +1486,7 @@ mod tests {
 
         let remaining: Vec<usize> = app.sheets_data["f.csv"].iter().map(|(idx, _)| *idx).collect();
         assert_eq!(remaining, vec![0, 2]);
-        assert!(app.dirty_files.contains("f.csv"));
+        assert!(app.history.is_dirty(&"f.csv".to_string()));
         assert_eq!(undo_len(&app, "f.csv"), 1);
     }
 
@@ -1531,16 +1499,28 @@ mod tests {
         );
         app.filtered_data.insert(
             ("f.csv".to_string(), 1),
-            vec![row(0, &["a"]), row(1, &["b"])],
+            vec![0u32, 1],
         );
 
         assert!(app.apply_delete_row("f.csv", 1, 0));
 
-        let filtered: Vec<usize> = app.filtered_data[&("f.csv".to_string(), 1)]
-            .iter()
-            .map(|(idx, _)| *idx)
-            .collect();
-        assert_eq!(filtered, vec![1]);
+        // 'b' (master row 1) shifted from position 1 to 0.
+        assert_eq!(app.filtered_data[&("f.csv".to_string(), 1)], vec![0u32]);
+        assert_eq!(app.sheets_data["f.csv"][0].0, 1);
+    }
+
+    #[test]
+    fn insert_row_shifts_views_so_they_keep_pointing_at_the_same_rows() {
+        let mut app = test_app();
+        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"]), row(1, &["b"])]);
+        app.next_row_id.insert("f.csv".to_string(), 2);
+        set_columns(&mut app, "f.csv", 1);
+        app.filtered_data.insert(("f.csv".to_string(), 1), vec![1u32]); // view shows only 'b'
+
+        app.apply_insert_row("f.csv", 1, Some((0, InsertPosition::Before)));
+
+        let view = &app.filtered_data[&("f.csv".to_string(), 1)];
+        assert_eq!(app.sheets_data["f.csv"][view[0] as usize].0, 1);
     }
 
     #[test]
@@ -1549,7 +1529,7 @@ mod tests {
         app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
 
         assert!(!app.apply_delete_row("f.csv", 1, 5));
-        assert!(app.dirty_files.is_empty());
+        assert!(!app.history.any_dirty());
     }
 
     #[test]
@@ -1568,7 +1548,7 @@ mod tests {
         assert_eq!(app.sheets_data["f.csv"].len(), 3);
         assert_eq!(app.read_cell("f.csv", 2, 0), Some("".to_string()));
         assert_eq!(app.next_row_id["f.csv"], 3);
-        assert!(app.dirty_files.contains("f.csv"));
+        assert!(app.history.is_dirty(&"f.csv".to_string()));
     }
 
     #[test]
@@ -1743,7 +1723,7 @@ mod tests {
             assert_eq!(headers.len(), 2);
             assert!(headers.iter().all(|h| h.id != 1));
         }
-        assert!(app.dirty_files.contains("f.csv"));
+        assert!(app.history.is_dirty(&"f.csv".to_string()));
     }
 
     #[test]
@@ -1753,7 +1733,7 @@ mod tests {
         set_columns(&mut app, "f.csv", 1);
 
         assert!(!app.apply_delete_column("f.csv", 99));
-        assert!(app.dirty_files.is_empty());
+        assert!(!app.history.any_dirty());
     }
 
     #[test]
