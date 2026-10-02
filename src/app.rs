@@ -627,7 +627,17 @@ impl MyApp {
 }
 
 impl MyApp {
+    /// The tab a newly opened file should display in: the one asked for,
+    /// else the focused tab, else the first tab. Menu and drag-and-drop opens
+    /// pass `None`, which would otherwise load the file without showing it.
+    fn resolve_target_tab(&mut self, tab_id: Option<usize>) -> Option<usize> {
+        tab_id
+            .or_else(|| self.tree.find_active_focused().map(|(_, tab)| tab.id))
+            .or_else(|| self.tree.iter_all_tabs().next().map(|(_, tab)| tab.id))
+    }
+
     pub fn load_file(&mut self, ctx: &egui::Context, file_name: String, tab_id: Option<usize>) {
+        let tab_id = self.resolve_target_tab(tab_id);
         self.picked_path = Some(file_name.clone());
 
         self.files_list.push(file_name.clone());
@@ -1093,6 +1103,13 @@ mod tests {
 
     fn redo_len(app: &MyApp, filename: &str) -> usize {
         app.history.redo_len(&filename.to_string())
+    }
+
+    #[test]
+    fn open_without_tab_targets_a_tab_instead_of_none() {
+        let mut app = test_app();
+        assert_eq!(app.resolve_target_tab(Some(7)), Some(7));
+        assert_eq!(app.resolve_target_tab(None), Some(1));
     }
 
     #[test]
