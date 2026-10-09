@@ -56,9 +56,18 @@ pub fn csv_quote(value: &str) -> String {
     }
 }
 
-pub fn write_csv(path: &str, headers: &[FileHeader], data: &SheetVec) -> Result<(), csv::Error> {
-    let mut writer = csv::Writer::from_path(path)?;
-    writer.write_record(headers.iter().map(|h| h.name.as_str()))?;
+pub fn write_csv(
+    path: &str,
+    headers: &[FileHeader],
+    data: &SheetVec,
+    format: CsvFormat,
+) -> Result<(), csv::Error> {
+    let mut writer = csv::WriterBuilder::new()
+        .delimiter(format.delimiter)
+        .from_path(path)?;
+    if format.has_header {
+        writer.write_record(headers.iter().map(|h| h.name.as_str()))?;
+    }
     for (_, record) in data {
         writer.write_record(record)?;
     }
@@ -124,14 +133,132 @@ pub fn sort_indices(master: &SheetVec, view: View, sort_by: (usize, SortOrder)) 
     keyed.into_iter().map(|(_, i)| i).collect()
 }
 
-pub fn iterate_csv(path: &str) -> csv::Result<(csv::Reader<std::fs::File>, StringRecord)> {
-    let mut rdr = csv::Reader::from_path(path)?;
-    let headers = rdr.headers()?.clone();
+/// How a file is laid out on disk, so it can be read and written back the
+/// same way.
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub struct CsvFormat {
+    pub delimiter: u8,
+    /// Whether the first row holds column names (otherwise it is data).
+    pub has_header: bool,
+}
+
+impl Default for CsvFormat {
+    fn default() -> Self {
+        CsvFormat {
+            delimiter: b',',
+            has_header: true,
+        }
+    }
+}
+
+const DELIMITER_CANDIDATES: [u8; 4] = [b',', b';', b'\t', b'|'];
+const SNIFF_BYTES: u64 = 64 * 1024;
+const SNIFF_RECORDS: usize = 100;
+
+fn sample_records(sample: &[u8], delimiter: u8) -> Vec<Vec<String>> {
+    csv::ReaderBuilder::new()
+        .delimiter(delimiter)
+        .has_headers(false)
+        .flexible(true)
+        .from_reader(sample)
+        .records()
+        .take(SNIFF_RECORDS)
+        .filter_map(|r| r.ok())
+        .map(|r| r.iter().map(str::to_string).collect())
+        .collect()
+}
+
+/// Guess the delimiter: the candidate that splits the most sampled records
+/// into the same number (> 1) of fields. Ties favour the earlier candidate
+/// (comma first). Falls back to comma.
+pub fn sniff_delimiter(sample: &[u8]) -> u8 {
+    let mut best = (0usize, 0usize, b',');
+    for &d in &DELIMITER_CANDIDATES {
+        let records = sample_records(sample, d);
+        let mut counts = std::collections::HashMap::new();
+        for r in &records {
+            *counts.entry(r.len()).or_insert(0usize) += 1;
+        }
+        let Some((&fields, &rows)) = counts.iter().max_by_key(|(f, c)| (**c, **f)) else {
+            continue;
+        };
+        if fields > 1 && (rows, fields) > (best.0, best.1) {
+            best = (rows, fields, d);
+        }
+    }
+    best.2
+}
+
+/// Guess whether the first row is a header: it is data if some column's
+/// first cell is numeric while every other sampled cell in that column is
+/// too (a header would be text above numbers). Otherwise it is a header.
+pub fn sniff_has_header(records: &[Vec<String>]) -> bool {
+    let Some((first, rest)) = records.split_first() else {
+        return true;
+    };
+    if rest.is_empty() {
+        return true;
+    }
+    let numeric = |c: &str| matches!(SortKey::parse(c), SortKey::Num(_));
+    let first_row_is_data = first.iter().enumerate().any(|(col, cell)| {
+        numeric(cell) && rest.iter().all(|r| r.get(col).is_some_and(|c| numeric(c)))
+    });
+    !first_row_is_data
+}
+
+pub fn sniff_format(path: &str) -> std::io::Result<CsvFormat> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    let file_len = std::fs::metadata(path)?.len();
+    std::fs::File::open(path)?
+        .take(SNIFF_BYTES)
+        .read_to_end(&mut buf)?;
+    // Drop a trailing partial line so it can't skew the field counts.
+    if file_len > SNIFF_BYTES {
+        if let Some(end) = buf.iter().rposition(|b| *b == b'\n') {
+            buf.truncate(end + 1);
+        }
+    }
+    let delimiter = sniff_delimiter(&buf);
+    let has_header = sniff_has_header(&sample_records(&buf, delimiter));
+    Ok(CsvFormat {
+        delimiter,
+        has_header,
+    })
+}
+
+pub fn iterate_csv(
+    path: &str,
+    format: CsvFormat,
+) -> csv::Result<(csv::Reader<std::fs::File>, StringRecord)> {
+    let mut rdr = csv::ReaderBuilder::new()
+        .delimiter(format.delimiter)
+        .has_headers(format.has_header)
+        .from_path(path)?;
+    let headers = if format.has_header {
+        rdr.headers()?.clone()
+    } else {
+        // Peek at the first row only to learn the column count.
+        let mut first = StringRecord::new();
+        let columns = if rdr.read_record(&mut first)? {
+            first.len()
+        } else {
+            0
+        };
+        let mut rdr2 = csv::ReaderBuilder::new()
+            .delimiter(format.delimiter)
+            .has_headers(false)
+            .from_path(path)?;
+        std::mem::swap(&mut rdr, &mut rdr2);
+        (1..=columns).map(|i| format!("Column {i}")).collect()
+    };
     Ok((rdr, headers))
 }
 
-pub fn open_csv_file(path: &str) -> (csv::Reader<std::fs::File>, Vec<FileHeader>) {
-    match iterate_csv(path) {
+/// Open a CSV file, sniffing its delimiter and whether it has a header row.
+pub fn open_csv_file(path: &str) -> (csv::Reader<std::fs::File>, Vec<FileHeader>, CsvFormat) {
+    let format = sniff_format(path).unwrap_or_default();
+    match iterate_csv(path, format) {
         Ok((csv_reader, headers)) => {
             let headers = headers
                 .into_iter()
@@ -143,7 +270,7 @@ pub fn open_csv_file(path: &str) -> (csv::Reader<std::fs::File>, Vec<FileHeader>
                     ..FileHeader::default()
                 })
                 .collect::<Vec<_>>();
-            (csv_reader, headers)
+            (csv_reader, headers, format)
         }
         Err(err) => {
             eprintln!("Error reading CSV file: {}", err);
@@ -192,8 +319,14 @@ mod tests {
     fn sort_indices_orders_by_column_and_keeps_master_rows() {
         let sheet: SheetVec = vec![row(0, &["3"]), row(1, &["1"]), row(2, &["2"])];
         let all: View = vec![0, 1, 2];
-        assert_eq!(sort_indices(&sheet, all.clone(), (0, SortOrder::Asc)), vec![1, 2, 0]);
-        assert_eq!(sort_indices(&sheet, all, (0, SortOrder::Dsc)), vec![0, 2, 1]);
+        assert_eq!(
+            sort_indices(&sheet, all.clone(), (0, SortOrder::Asc)),
+            vec![1, 2, 0]
+        );
+        assert_eq!(
+            sort_indices(&sheet, all, (0, SortOrder::Dsc)),
+            vec![0, 2, 1]
+        );
     }
 
     #[test]
@@ -204,14 +337,23 @@ mod tests {
             .map(|(i, v)| (i, StringRecord::from(vec![*v])))
             .collect();
         let all: View = (0..sheet.len() as u32).collect();
-        assert_eq!(sort_indices(&sheet, all.clone(), (0, SortOrder::Asc)), vec![3, 2, 5, 0, 4, 1]);
-        assert_eq!(sort_indices(&sheet, all, (0, SortOrder::Dsc)), vec![1, 4, 0, 5, 2, 3]);
+        assert_eq!(
+            sort_indices(&sheet, all.clone(), (0, SortOrder::Asc)),
+            vec![3, 2, 5, 0, 4, 1]
+        );
+        assert_eq!(
+            sort_indices(&sheet, all, (0, SortOrder::Dsc)),
+            vec![1, 4, 0, 5, 2, 3]
+        );
     }
 
     #[test]
     fn sort_indices_only_reorders_the_given_view() {
         let sheet: SheetVec = vec![row(0, &["3"]), row(1, &["1"]), row(2, &["2"])];
-        assert_eq!(sort_indices(&sheet, vec![2, 0], (0, SortOrder::Asc)), vec![2, 0]);
+        assert_eq!(
+            sort_indices(&sheet, vec![2, 0], (0, SortOrder::Asc)),
+            vec![2, 0]
+        );
     }
 
     #[test]
@@ -224,5 +366,67 @@ mod tests {
     fn filter_indices_empty_filter_matches_everything() {
         let sheet: SheetVec = vec![row(0, &["a"]), row(1, &["b"])];
         assert_eq!(filter_indices(&sheet, ""), vec![0, 1]);
+    }
+
+    #[test]
+    fn sniffs_common_delimiters() {
+        assert_eq!(sniff_delimiter(b"a,b,c\n1,2,3\n"), b',');
+        assert_eq!(sniff_delimiter(b"a;b;c\n1;2;3\n"), b';');
+        assert_eq!(sniff_delimiter(b"a\tb\tc\n1\t2\t3\n"), b'\t');
+        assert_eq!(sniff_delimiter(b"a|b\n1|2\n"), b'|');
+        assert_eq!(sniff_delimiter(b"single\ncolumn\n"), b',');
+        assert_eq!(sniff_delimiter(b""), b',');
+    }
+
+    #[test]
+    fn sniff_ignores_delimiters_inside_quotes_and_decimal_commas() {
+        assert_eq!(sniff_delimiter(b"a;b\n\"x,y,z\";1,5\n\"p,q\";2,5\n"), b';');
+    }
+
+    #[test]
+    fn detects_header_row() {
+        let rec = |rows: &[&[&str]]| -> Vec<Vec<String>> {
+            rows.iter()
+                .map(|r| r.iter().map(|s| s.to_string()).collect())
+                .collect()
+        };
+        assert!(sniff_has_header(&rec(&[
+            &["name", "age"],
+            &["bob", "3"],
+            &["al", "4"]
+        ])));
+        assert!(!sniff_has_header(&rec(&[
+            &["1", "x"],
+            &["2", "y"],
+            &["3", "z"]
+        ])));
+        assert!(sniff_has_header(&rec(&[&["a", "b"]])));
+        assert!(sniff_has_header(&rec(&[&["id", "n"], &["1", "2"]])));
+    }
+
+    #[test]
+    fn open_and_write_round_trip_semicolon_headerless() {
+        let dir = std::env::temp_dir().join(format!("csv_model_sniff_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.csv");
+        let path = path.to_str().unwrap();
+        std::fs::write(path, "1;a\n2;b\n3;c\n").unwrap();
+        let (mut rdr, headers, format) = open_csv_file(path);
+        assert_eq!(
+            format,
+            CsvFormat {
+                delimiter: b';',
+                has_header: false
+            }
+        );
+        assert_eq!(
+            headers.iter().map(|h| h.name.as_str()).collect::<Vec<_>>(),
+            ["Column 1", "Column 2"]
+        );
+        let data: SheetVec = rdr.records().filter_map(|r| r.ok()).enumerate().collect();
+        assert_eq!(data.len(), 3);
+        write_csv(path, &headers, &data, format).unwrap();
+        assert_eq!(std::fs::read_to_string(path).unwrap(), "1;a\n2;b\n3;c\n");
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

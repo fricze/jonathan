@@ -225,6 +225,8 @@ pub struct MyApp {
     /// Next column_id to assign when inserting a column into a file. Seeded
     /// from max(existing FileHeader.id) + 1 when the file loads.
     pub next_col_id: HashMap<Filename, ColumnId>,
+    /// Delimiter / header-row layout sniffed at load, reused on save.
+    pub csv_formats: HashMap<Filename, csv_model::CsvFormat>,
     /// Lets an external MCP-driven agent screenshot and control this app for
     /// testing -- see crates/agent_bridge. Polled once per frame; a
     /// no-op unless something writes to its request directory.

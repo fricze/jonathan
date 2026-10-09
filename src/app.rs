@@ -642,7 +642,8 @@ impl MyApp {
 
         self.files_list.push(file_name.clone());
 
-        let (mut reader, headers) = open_csv_file(&file_name);
+        let (mut reader, headers, format) = open_csv_file(&file_name);
+        self.csv_formats.insert(file_name.clone(), format);
 
         let next_col_id = headers.iter().map(|h| h.id).max().map_or(0, |m| m + 1);
         self.next_col_id.insert(file_name.clone(), next_col_id);
@@ -887,7 +888,12 @@ impl MyApp {
                             .find_map(|(_, tab)| tab.columns.get(&filename))
                             .cloned()
                             .unwrap_or_default();
-                        if let Err(e) = write_csv(&filename, &headers, data) {
+                        if let Err(e) = write_csv(
+                            &filename,
+                            &headers,
+                            data,
+                            self.csv_formats.get(&filename).copied().unwrap_or_default(),
+                        ) {
                             eprintln!("Failed to save {}: {:?}", filename, e);
                         } else {
                             self.history.mark_clean(&filename);
@@ -1066,6 +1072,7 @@ mod tests {
             history: Default::default(),
             next_row_id: HashMap::new(),
             next_col_id: HashMap::new(),
+            csv_formats: HashMap::new(),
             agent_bridge: agent_bridge::AgentBridge::new(),
         }
     }
