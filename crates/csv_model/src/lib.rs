@@ -82,14 +82,46 @@ pub fn filter_indices(master: &SheetVec, filter: &str) -> View {
         .collect()
 }
 
+/// Sort key for one cell: finite numbers order numerically and before any
+/// text; everything else (including empty cells) orders as plain strings.
+enum SortKey<'a> {
+    Num(f64),
+    Text(&'a str),
+}
+
+impl<'a> SortKey<'a> {
+    fn parse(cell: &'a str) -> Self {
+        match cell.trim().parse::<f64>() {
+            Ok(n) if n.is_finite() => SortKey::Num(n),
+            _ => SortKey::Text(cell),
+        }
+    }
+
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self, other) {
+            (SortKey::Num(a), SortKey::Num(b)) => a.total_cmp(b),
+            (SortKey::Num(_), SortKey::Text(_)) => std::cmp::Ordering::Less,
+            (SortKey::Text(_), SortKey::Num(_)) => std::cmp::Ordering::Greater,
+            (SortKey::Text(a), SortKey::Text(b)) => a.cmp(b),
+        }
+    }
+}
+
 /// `view` sorted by column `sort_by.0` of the rows it points at (stable).
-pub fn sort_indices(master: &SheetVec, mut view: View, sort_by: (usize, SortOrder)) -> View {
-    let cell = |i: &u32| master[*i as usize].1.get(sort_by.0).unwrap_or_default();
-    view.sort_by(|a, b| match sort_by.1 {
-        SortOrder::Asc => cell(a).cmp(cell(b)),
-        SortOrder::Dsc => cell(b).cmp(cell(a)),
-    });
-    view
+/// Numeric cells sort by value (`2` < `10`), ahead of non-numeric ones.
+pub fn sort_indices(master: &SheetVec, view: View, sort_by: (usize, SortOrder)) -> View {
+    let mut keyed: Vec<(SortKey, u32)> = view
+        .into_iter()
+        .map(|i| {
+            let cell = master[i as usize].1.get(sort_by.0).unwrap_or_default();
+            (SortKey::parse(cell), i)
+        })
+        .collect();
+    match sort_by.1 {
+        SortOrder::Asc => keyed.sort_by(|a, b| a.0.cmp(&b.0)),
+        SortOrder::Dsc => keyed.sort_by(|a, b| b.0.cmp(&a.0)),
+    }
+    keyed.into_iter().map(|(_, i)| i).collect()
 }
 
 pub fn iterate_csv(path: &str) -> csv::Result<(csv::Reader<std::fs::File>, StringRecord)> {
@@ -162,6 +194,18 @@ mod tests {
         let all: View = vec![0, 1, 2];
         assert_eq!(sort_indices(&sheet, all.clone(), (0, SortOrder::Asc)), vec![1, 2, 0]);
         assert_eq!(sort_indices(&sheet, all, (0, SortOrder::Dsc)), vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn sort_indices_orders_numbers_by_value_before_text() {
+        let sheet: SheetVec = ["10", "abc", "2", "-1.5", "", "3"]
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (i, StringRecord::from(vec![*v])))
+            .collect();
+        let all: View = (0..sheet.len() as u32).collect();
+        assert_eq!(sort_indices(&sheet, all.clone(), (0, SortOrder::Asc)), vec![3, 2, 5, 0, 4, 1]);
+        assert_eq!(sort_indices(&sheet, all, (0, SortOrder::Dsc)), vec![1, 4, 0, 5, 2, 3]);
     }
 
     #[test]
