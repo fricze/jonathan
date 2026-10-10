@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::thread;
 
 use csv_model::{edit_record, filter_indices, open_csv_file, sort_indices, write_csv};
-use crate::menu::OPEN_FILE_ID;
+use crate::menu::{COPY_AS_CSV_ID, OPEN_FILE_ID};
 use crate::types::{
     ColumnId, CsvTabViewer, FileHeader, InsertPosition, MyApp, ReplaceScope, SendUiMessage, SheetTab,
     SortOrder, TabId, UiMessage, UndoEntry, View, SheetRow, active_sheet_data, column_position,
@@ -774,7 +774,10 @@ impl MyApp {
         // Handle macOS menu events
         #[cfg(target_os = "macos")]
         if let Ok(event) = MenuEvent::receiver().try_recv() {
-            if event.id.as_ref() == OPEN_FILE_ID {
+            if event.id.as_ref() == COPY_AS_CSV_ID {
+                crate::menu::request_copy_as_csv();
+                ctx.request_repaint();
+            } else if event.id.as_ref() == OPEN_FILE_ID {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("CSV", &["csv"])
                     .pick_file()

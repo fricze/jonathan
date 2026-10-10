@@ -46,14 +46,50 @@ pub fn edit_record(sheet: &mut SheetVec, master_row: usize, col: usize, value: &
     false
 }
 
-/// Wrap a CSV field value in double-quotes if it contains a comma, double-quote, or newline.
-/// Internal double-quotes are escaped by doubling them.
-pub fn csv_quote(value: &str) -> String {
-    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+/// Wrap a field value in double-quotes if it contains `delimiter`, a
+/// double-quote, or a newline. Internal double-quotes are escaped by doubling.
+pub fn quote_field(value: &str, delimiter: u8) -> String {
+    if value.contains(delimiter as char) || value.contains(['"', '\n', '\r']) {
         format!("\"{}\"", value.replace('"', "\"\""))
     } else {
         value.to_string()
     }
+}
+
+/// `quote_field` for comma-delimited CSV.
+pub fn csv_quote(value: &str) -> String {
+    quote_field(value, b',')
+}
+
+/// Rows of cells as delimited text (newline between rows), quoting only
+/// where `delimiter` makes it necessary -- tab for clipboard/TSV, comma for CSV.
+pub fn format_rows(rows: &[Vec<String>], delimiter: u8) -> String {
+    let sep = (delimiter as char).to_string();
+    rows.iter()
+        .map(|row| {
+            row.iter()
+                .map(|c| quote_field(c, delimiter))
+                .collect::<Vec<_>>()
+                .join(&sep)
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Parse pasted text into a grid of cells. Text containing a tab is TSV (what
+/// spreadsheets put on the clipboard). Otherwise, multi-line text is split on
+/// whichever delimiter splits it consistently (CSV); anything else -- e.g. a
+/// lone "Smith, John" -- is not split, so each line is one cell.
+pub fn parse_clipboard(text: &str) -> Vec<Vec<String>> {
+    let delimiter = if text.contains('\t') {
+        b'\t'
+    } else {
+        match best_delimiter(text.as_bytes()) {
+            Some((rows, _, d)) if rows >= 2 => d,
+            _ => b'\t',
+        }
+    };
+    sample_records(text.as_bytes(), delimiter, usize::MAX)
 }
 
 pub fn write_csv(
@@ -155,26 +191,26 @@ const DELIMITER_CANDIDATES: [u8; 4] = [b',', b';', b'\t', b'|'];
 const SNIFF_BYTES: u64 = 64 * 1024;
 const SNIFF_RECORDS: usize = 100;
 
-fn sample_records(sample: &[u8], delimiter: u8) -> Vec<Vec<String>> {
+fn sample_records(sample: &[u8], delimiter: u8, limit: usize) -> Vec<Vec<String>> {
     csv::ReaderBuilder::new()
         .delimiter(delimiter)
         .has_headers(false)
         .flexible(true)
         .from_reader(sample)
         .records()
-        .take(SNIFF_RECORDS)
+        .take(limit)
         .filter_map(|r| r.ok())
         .map(|r| r.iter().map(str::to_string).collect())
         .collect()
 }
 
-/// Guess the delimiter: the candidate that splits the most sampled records
-/// into the same number (> 1) of fields. Ties favour the earlier candidate
-/// (comma first). Falls back to comma.
-pub fn sniff_delimiter(sample: &[u8]) -> u8 {
-    let mut best = (0usize, 0usize, b',');
+/// The candidate delimiter that splits the most sampled records into the
+/// same number (> 1) of fields, as (matching rows, fields, delimiter). Ties
+/// favour the earlier candidate (comma first).
+fn best_delimiter(sample: &[u8]) -> Option<(usize, usize, u8)> {
+    let mut best: Option<(usize, usize, u8)> = None;
     for &d in &DELIMITER_CANDIDATES {
-        let records = sample_records(sample, d);
+        let records = sample_records(sample, d, SNIFF_RECORDS);
         let mut counts = std::collections::HashMap::new();
         for r in &records {
             *counts.entry(r.len()).or_insert(0usize) += 1;
@@ -182,11 +218,16 @@ pub fn sniff_delimiter(sample: &[u8]) -> u8 {
         let Some((&fields, &rows)) = counts.iter().max_by_key(|(f, c)| (**c, **f)) else {
             continue;
         };
-        if fields > 1 && (rows, fields) > (best.0, best.1) {
-            best = (rows, fields, d);
+        if fields > 1 && best.is_none_or(|(br, bf, _)| (rows, fields) > (br, bf)) {
+            best = Some((rows, fields, d));
         }
     }
-    best.2
+    best
+}
+
+/// Guess the delimiter of a sample of file content; comma if unclear.
+pub fn sniff_delimiter(sample: &[u8]) -> u8 {
+    best_delimiter(sample).map_or(b',', |(_, _, d)| d)
 }
 
 /// Guess whether the first row is a header: it is data if some column's
@@ -220,7 +261,7 @@ pub fn sniff_format(path: &str) -> std::io::Result<CsvFormat> {
         }
     }
     let delimiter = sniff_delimiter(&buf);
-    let has_header = sniff_has_header(&sample_records(&buf, delimiter));
+    let has_header = sniff_has_header(&sample_records(&buf, delimiter, SNIFF_RECORDS));
     Ok(CsvFormat {
         delimiter,
         has_header,
@@ -428,5 +469,47 @@ mod tests {
         write_csv(path, &headers, &data, format).unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), "1;a\n2;b\n3;c\n");
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn format_rows_quotes_only_for_the_chosen_delimiter() {
+        let rows = vec![vec![
+            "Smith, John".to_string(),
+            "x\ty".to_string(),
+            "q\"".to_string(),
+        ]];
+        assert_eq!(
+            format_rows(&rows, b'\t'),
+            "Smith, John\t\"x\ty\"\t\"q\"\"\""
+        );
+        assert_eq!(format_rows(&rows, b','), "\"Smith, John\",x\ty,\"q\"\"\"");
+    }
+
+    #[test]
+    fn parse_clipboard_detects_tsv_csv_and_plain_text() {
+        let g = |rows: &[&[&str]]| -> Vec<Vec<String>> {
+            rows.iter()
+                .map(|r| r.iter().map(|s| s.to_string()).collect())
+                .collect()
+        };
+        assert_eq!(
+            parse_clipboard("a\tb\nc\td"),
+            g(&[&["a", "b"], &["c", "d"]])
+        );
+        assert_eq!(parse_clipboard("a\t\"x,y\"\n"), g(&[&["a", "x,y"]]));
+        assert_eq!(parse_clipboard("a,b\nc,d"), g(&[&["a", "b"], &["c", "d"]]));
+        assert_eq!(parse_clipboard("a;b\nc;d"), g(&[&["a", "b"], &["c", "d"]]));
+        assert_eq!(parse_clipboard("Smith, John"), g(&[&["Smith, John"]]));
+        assert_eq!(parse_clipboard("one\ntwo"), g(&[&["one"], &["two"]]));
+        assert_eq!(parse_clipboard("a\tb\nc"), g(&[&["a", "b"], &["c"]]));
+    }
+
+    #[test]
+    fn tsv_round_trips_through_format_and_parse() {
+        let rows = vec![
+            vec!["a,b".to_string(), "c\"d".to_string()],
+            vec!["e\nf".to_string(), "".to_string()],
+        ];
+        assert_eq!(parse_clipboard(&format_rows(&rows, b'\t')), rows);
     }
 }

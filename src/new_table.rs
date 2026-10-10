@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::mpsc::Sender};
 
 use egui::{Align2, Color32, Context, Id, Margin, NumExt as _, Sense, TextFormat};
 
-use csv_model::csv_quote;
+use csv_model::{format_rows, parse_clipboard};
 use crate::types::{
     ColumnId, FileHeader, Filename, SelectionState, SendUiMessage, Rows, SortOrder, TabId, UiMessage,
 };
@@ -136,10 +136,20 @@ impl<'a> Table<'a> {
     }
 
     fn handle_clipboard_copy(&self, ui: &egui::Ui) {
-        let copy_requested = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
-        if !copy_requested || self.selection.selected_cells.is_empty() {
+        // Only a table with a selection may claim the menu request, so a
+        // table without one can't swallow it.
+        if self.selection.selected_cells.is_empty() {
             return;
         }
+        // Cmd+C copies tab-separated (what spreadsheets paste natively); the
+        // "Copy as CSV" menu item asks for comma-separated instead.
+        let copy_as_csv = crate::menu::take_copy_as_csv_request();
+        let copy_requested =
+            ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) || copy_as_csv;
+        if !copy_requested {
+            return;
+        }
+        let delimiter = if copy_as_csv { b',' } else { b'\t' };
 
         let min_row = self
             .selection
@@ -170,7 +180,7 @@ impl<'a> Table<'a> {
             .max()
             .unwrap_or(0);
 
-        let mut csv_rows: Vec<String> = Vec::new();
+        let mut rows: Vec<Vec<String>> = Vec::new();
         for r in min_row..=max_row {
             let mut row_fields: Vec<String> = Vec::new();
             for c in min_col..=max_col {
@@ -181,15 +191,15 @@ impl<'a> Table<'a> {
                         .get(r as usize)
                         .and_then(|(_, row)| row.get(actual_col))
                         .unwrap_or("");
-                    row_fields.push(csv_quote(value));
+                    row_fields.push(value.to_string());
                 } else {
                     row_fields.push(String::new());
                 }
             }
-            csv_rows.push(row_fields.join(","));
+            rows.push(row_fields);
         }
 
-        ui.ctx().copy_text(csv_rows.join("\n"));
+        ui.ctx().copy_text(format_rows(&rows, delimiter));
         crate::toast::show(ui.ctx(), "Copied to clipboard");
     }
 
@@ -224,15 +234,7 @@ impl<'a> Table<'a> {
             return;
         };
 
-        let mut reader = csv::ReaderBuilder::new()
-            .has_headers(false)
-            .from_reader(pasted.as_bytes());
-
-        let rows: Vec<Vec<String>> = reader
-            .records()
-            .filter_map(|r| r.ok())
-            .map(|record| record.iter().map(|f| f.to_string()).collect())
-            .collect();
+        let rows = parse_clipboard(&pasted);
 
         if rows.is_empty() {
             return;
