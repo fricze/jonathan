@@ -5,6 +5,9 @@
 
 use csv::StringRecord;
 
+mod sheet;
+pub use sheet::{MemorySheet, Sheet};
+
 pub type ColumnId = usize;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -95,7 +98,7 @@ pub fn parse_clipboard(text: &str) -> Vec<Vec<String>> {
 pub fn write_csv(
     path: &str,
     headers: &[FileHeader],
-    data: &SheetVec,
+    data: &dyn Sheet,
     format: CsvFormat,
 ) -> Result<(), csv::Error> {
     let mut writer = csv::WriterBuilder::new()
@@ -104,8 +107,10 @@ pub fn write_csv(
     if format.has_header {
         writer.write_record(headers.iter().map(|h| h.name.as_str()))?;
     }
-    for (_, record) in data {
-        writer.write_record(record)?;
+    for position in 0..data.len() {
+        if let Some(record) = data.record(position) {
+            writer.write_record(record.as_ref())?;
+        }
     }
     writer.flush()?;
     Ok(())
@@ -466,7 +471,7 @@ mod tests {
         );
         let data: SheetVec = rdr.records().filter_map(|r| r.ok()).enumerate().collect();
         assert_eq!(data.len(), 3);
-        write_csv(path, &headers, &data, format).unwrap();
+        write_csv(path, &headers, &MemorySheet::new(data), format).unwrap();
         assert_eq!(std::fs::read_to_string(path).unwrap(), "1;a\n2;b\n3;c\n");
         std::fs::remove_dir_all(dir).unwrap();
     }

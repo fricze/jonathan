@@ -91,10 +91,9 @@ impl<'a> Table<'a> {
         }
 
         // --- Display mode ---
-        let row = self.data.get(row_nr as usize);
-        if let Some((_, row)) = row {
-            let cell = row.get(actual_col);
-            if let Some(cell_content) = cell {
+        {
+            let cell = self.data.cell(row_nr as usize, actual_col);
+            if let Some(cell_content) = cell.as_deref() {
                 let filter = self.filter;
 
                 let label = if filter.is_empty() {
@@ -186,12 +185,8 @@ impl<'a> Table<'a> {
             for c in min_col..=max_col {
                 if self.selection.selected_cells.contains(&(r, c)) {
                     let actual_col = self.actual_col(c);
-                    let value = self
-                        .data
-                        .get(r as usize)
-                        .and_then(|(_, row)| row.get(actual_col))
-                        .unwrap_or("");
-                    row_fields.push(value.to_string());
+                    let value = self.data.cell(r as usize, actual_col).unwrap_or_default();
+                    row_fields.push(value.into_owned());
                 } else {
                     row_fields.push(String::new());
                 }
@@ -410,11 +405,7 @@ impl<'a> Table<'a> {
         if self.edit.editing_cell.is_none() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             if let Some((row_nr, col_nr)) = self.selection.cursor().or(self.selection.anchor_cell) {
                 let actual_col = self.actual_col(col_nr);
-                if let Some(content) = self
-                    .data
-                    .get(row_nr as usize)
-                    .and_then(|(_, r)| r.get(actual_col))
-                {
+                if let Some(content) = self.data.cell(row_nr as usize, actual_col) {
                     *self.edit.editing_cell = Some((row_nr, col_nr));
                     *self.edit.edit_buffer = content.to_string();
                 }
@@ -600,11 +591,7 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
 
         if cell_response.double_clicked() {
             let actual_col = self.actual_col(col_nr);
-            if let Some(content) = self
-                .data
-                .get(row_nr as usize)
-                .and_then(|(_, r)| r.get(actual_col))
-            {
+            if let Some(content) = self.data.cell(row_nr as usize, actual_col) {
                 *self.edit.editing_cell = Some((row_nr, col_nr));
                 *self.edit.edit_buffer = content.to_string();
             }

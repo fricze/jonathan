@@ -4,7 +4,7 @@ use egui_dock::{DockArea, Style};
 use std::path::PathBuf;
 use std::thread;
 
-use csv_model::{edit_record, filter_indices, open_csv_file, sort_indices, write_csv};
+use csv_model::{MemorySheet, SheetVec, open_csv_file, write_csv};
 use crate::menu::{COPY_AS_CSV_ID, OPEN_FILE_ID};
 use crate::types::{
     ColumnId, CsvTabViewer, FileHeader, InsertPosition, MyApp, ReplaceScope, SendUiMessage, SheetTab,
@@ -74,11 +74,9 @@ impl MyApp {
     /// recorded).
     fn read_cell(&self, filename: &str, master_row: usize, col_id: ColumnId) -> Option<String> {
         let position = self.column_position(filename, col_id)?;
-        self.sheets_data
-            .get(filename)
-            .and_then(|sheet| sheet.iter().find(|(idx, _)| *idx == master_row))
-            .and_then(|(_, record)| record.get(position))
-            .map(|s| s.to_string())
+        let sheet = self.sheets_data.get(filename)?;
+        let row_position = sheet.position_of(master_row)?;
+        sheet.cell(row_position, position).map(|v| v.into_owned())
     }
 
     /// Resolve a column_id to its current display position in `filename`'s
@@ -119,7 +117,7 @@ impl MyApp {
             return;
         };
         if let Some(sheet) = self.sheets_data.get_mut(filename) {
-            edit_record(sheet, master_row, position, value);
+            sheet.set_cell(master_row, position, value);
         }
     }
 
@@ -131,7 +129,7 @@ impl MyApp {
             Some(view) => *view.get(row_nr as usize)? as usize,
             None => row_nr as usize,
         };
-        master.get(position).map(|(id, _)| *id)
+        master.row_id(position)
     }
 
     /// Drop in-flight sort/filter results for `filename`: they were computed
@@ -149,10 +147,7 @@ impl MyApp {
     fn remove_master_row(&mut self, filename: &str, position: usize) -> Option<SheetRow> {
         let row = {
             let sheet = self.sheets_data.get_mut(filename)?;
-            if position >= sheet.len() {
-                return None;
-            }
-            sheet.remove(position)
+            sheet.remove_row(position)?
         };
         self.invalidate_pending_views(filename);
         let p = position as u32;
@@ -170,7 +165,7 @@ impl MyApp {
     fn insert_master_row(&mut self, filename: &str, position: usize, row: SheetRow) -> Option<()> {
         let sheet = self.sheets_data.get_mut(filename)?;
         let position = position.min(sheet.len());
-        sheet.insert(position, row);
+        sheet.insert_row(position, row);
         self.invalidate_pending_views(filename);
         let p = position as u32;
         for ((fname, _), view) in self.filtered_data.iter_mut() {
@@ -236,7 +231,7 @@ impl MyApp {
                 Some((reverse, result))
             }
             UndoEntry::RowInsert { filename, master_row } => {
-                let position = self.sheets_data.get(&filename)?.iter().position(|(idx, _)| *idx == master_row)?;
+                let position = self.sheets_data.get(&filename)?.position_of(master_row)?;
                 let record = self.remove_master_row(&filename, position)?;
                 let reverse = UndoEntry::RowDelete { filename, master_row, position, record };
                 let result = UndoRedoResult {
@@ -387,8 +382,8 @@ impl MyApp {
             self.sheets_data.get(filename),
             self.filtered_data.get(&(filename.to_string(), tab_id)),
         ) {
-            (Some(master), Some(view)) => view.iter().map(|&i| master[i as usize].0).collect(),
-            (Some(master), None) => master.iter().map(|(idx, _)| *idx).collect(),
+            (Some(master), Some(view)) => view.iter().filter_map(|&i| master.row_id(i as usize)).collect(),
+            (Some(master), None) => (0..master.len()).filter_map(|i| master.row_id(i)).collect(),
             _ => vec![],
         };
 
@@ -445,11 +440,7 @@ impl MyApp {
         let Some(master_row) = self.master_row_at(filename, tab_id, row_nr) else {
             return false;
         };
-        let Some(position) = self
-            .sheets_data
-            .get(filename)
-            .and_then(|sheet| sheet.iter().position(|(idx, _)| *idx == master_row))
-        else {
+        let Some(position) = self.sheets_data.get(filename).and_then(|sheet| sheet.position_of(master_row)) else {
             return false;
         };
         let Some(record) = self.remove_master_row(filename, position) else {
@@ -516,22 +507,11 @@ impl MyApp {
     /// that file. Returns each row's value at that position before removal
     /// (keyed by master_row), for undo to restore.
     fn remove_column_at(&mut self, filename: &str, position: usize, header_id: ColumnId) -> Vec<(usize, String)> {
-        let values_by_row: Vec<(usize, String)> = self
+        let values_by_row = self
             .sheets_data
-            .get(filename)
-            .map(|sheet| {
-                sheet
-                    .iter()
-                    .filter_map(|(idx, record)| record.get(position).map(|v| (*idx, v.to_string())))
-                    .collect()
-            })
+            .get_mut(filename)
+            .map(|sheet| sheet.remove_column(position))
             .unwrap_or_default();
-
-        if let Some(sheet) = self.sheets_data.get_mut(filename) {
-            for (_, record) in sheet.iter_mut() {
-                *record = record.iter().enumerate().filter(|(i, _)| *i != position).map(|(_, f)| f).collect();
-            }
-        }
         for tab in self.tree.iter_all_tabs_mut() {
             if let Some(headers) = tab.1.columns.get_mut(filename) {
                 headers.retain(|h| h.id != header_id);
@@ -553,15 +533,8 @@ impl MyApp {
         header: FileHeader,
         values_by_row: &[(usize, String)],
     ) {
-        let values: std::collections::HashMap<usize, &str> =
-            values_by_row.iter().map(|(idx, v)| (*idx, v.as_str())).collect();
-
         if let Some(sheet) = self.sheets_data.get_mut(filename) {
-            for (idx, record) in sheet.iter_mut() {
-                let mut fields: Vec<&str> = record.iter().collect();
-                fields.insert(position.min(fields.len()), values.get(idx).copied().unwrap_or(""));
-                *record = fields.into_iter().collect();
-            }
+            sheet.insert_column(position, values_by_row);
         }
         for tab in self.tree.iter_all_tabs_mut() {
             if let Some(headers) = tab.1.columns.get_mut(filename) {
@@ -669,13 +642,13 @@ impl MyApp {
         let ctx = ctx.clone();
 
         thread::spawn(move || {
-            let master_data = reader
+            let master_data: SheetVec = reader
                 .records()
                 .filter_map(|record| record.ok())
                 .enumerate()
                 .collect::<Vec<_>>();
 
-            chan.send_msg(UiMessage::SetMaster(master_data, file_name.clone()));
+            chan.send_msg(UiMessage::SetMaster(Box::new(MemorySheet::new(master_data)), file_name.clone()));
 
             ctx.request_repaint();
         });
@@ -708,15 +681,15 @@ impl MyApp {
                         Some(v) => v.clone(),
                         None => (0..rows.len() as u32).collect(),
                     };
-                    // ponytail: clones master for the worker thread; Arc'd master if this shows up in profiles
-                    let master_clone = self.sheets_data[&filename].clone();
+                    // ponytail: a snapshot copies the rows for the in-memory backend; a lazy backend shares its file
+                    let snapshot = self.sheets_data[&filename].snapshot();
                     let chan = chan.clone();
                     let ctx = ctx.clone();
                     let filename = filename.clone();
                     let epoch = bump_epoch(&mut self.request_epoch, (filename.clone(), tab_id));
 
                     thread::spawn(move || {
-                        let sorted = sort_indices(&master_clone, view, sort_order);
+                        let sorted = snapshot.sort(view, sort_order);
 
                         chan.send_msg(UiMessage::SetDisplayData(sorted, filename, tab_id, epoch));
 
@@ -742,14 +715,14 @@ impl MyApp {
 
             if sheet_tab.id == tab_id {
                 if let Some(master_data) = self.sheets_data.get(&filename) {
-                    let master_clone = master_data.clone();
+                    let snapshot = master_data.snapshot();
                     let chan = chan.clone();
                     let ctx = ctx.clone();
                     let filename = filename.clone();
                     let epoch = bump_epoch(&mut self.request_epoch, (filename.clone(), tab_id));
 
                     thread::spawn(move || {
-                        let filtered = filter_indices(&master_clone, &filter);
+                        let filtered = snapshot.filter(&filter);
 
                         chan.send_msg(UiMessage::SetDisplayData(filtered, filename, tab_id, epoch));
 
@@ -802,7 +775,7 @@ impl MyApp {
         while let Ok(message) = self.worker_chan.1.try_recv() {
             match message {
                 UiMessage::SetMaster(master, file_name) => {
-                    let next_id = master.iter().map(|(idx, _)| *idx).max().map_or(0, |m| m + 1);
+                    let next_id = (0..master.len()).filter_map(|i| master.row_id(i)).max().map_or(0, |m| m + 1);
                     self.next_row_id.insert(file_name.clone(), next_id);
                     self.sheets_data.insert(file_name, master);
                 }
@@ -894,7 +867,7 @@ impl MyApp {
                         if let Err(e) = write_csv(
                             &filename,
                             &headers,
-                            data,
+                            data.as_ref(),
                             self.csv_formats.get(&filename).copied().unwrap_or_default(),
                         ) {
                             eprintln!("Failed to save {}: {:?}", filename, e);
@@ -1080,6 +1053,22 @@ mod tests {
         }
     }
 
+    /// Test shorthand: load `rows` into an in-memory sheet under `name`.
+    trait InsertRows {
+        fn insert_rows(&mut self, name: String, rows: Vec<(usize, StringRecord)>);
+    }
+
+    impl InsertRows for HashMap<String, Box<dyn csv_model::Sheet>> {
+        fn insert_rows(&mut self, name: String, rows: Vec<(usize, StringRecord)>) {
+            self.insert(name, Box::new(MemorySheet::new(rows)));
+        }
+    }
+
+    fn row_ids(app: &MyApp, filename: &str) -> Vec<usize> {
+        let sheet = &app.sheets_data[filename];
+        (0..sheet.len()).filter_map(|i| sheet.row_id(i)).collect()
+    }
+
     fn row(idx: usize, fields: &[&str]) -> (usize, StringRecord) {
         (idx, StringRecord::from(fields.to_vec()))
     }
@@ -1125,7 +1114,7 @@ mod tests {
     #[test]
     fn undo_restores_previous_value_and_pushes_redo() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a"]), row(1, &["b"])],
         );
@@ -1159,7 +1148,7 @@ mod tests {
     #[test]
     fn undo_back_to_clean_marker_is_not_dirty() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a"])]);
         set_columns(&mut app, "f.csv", 1);
         // File just loaded: clean_marker defaults to 0, undo_stack is empty.
         assert!(!app.history.is_dirty(&"f.csv".to_string()));
@@ -1196,7 +1185,7 @@ mod tests {
     #[test]
     fn dirty_tracked_relative_to_save_point_not_zero() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a"])]);
         set_columns(&mut app, "f.csv", 1);
 
         app.write_cell("f.csv", 0, 0, "b");
@@ -1222,7 +1211,7 @@ mod tests {
     #[test]
     fn undo_then_redo_round_trips() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["current"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["current"])]);
         set_columns(&mut app, "f.csv", 1);
         push_undo_entry(&mut app, "f.csv", UndoEntry::CellEdit {
             filename: "f.csv".to_string(),
@@ -1244,7 +1233,7 @@ mod tests {
     #[test]
     fn multiple_undos_restore_in_reverse_order() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["v3"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["v3"])]);
         set_columns(&mut app, "f.csv", 1);
         // Simulate two edits: v1 -> v2 -> v3, each push recording the prior value.
         push_undo_entry(&mut app, "f.csv", UndoEntry::CellEdit {
@@ -1299,7 +1288,7 @@ mod tests {
     #[test]
     fn new_edit_clears_redo_stack() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["b"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["b"])]);
         set_columns(&mut app, "f.csv", 1);
         push_redo_entry(&mut app, "f.csv", UndoEntry::CellEdit {
             filename: "f.csv".to_string(),
@@ -1325,7 +1314,7 @@ mod tests {
     #[test]
     fn paste_writes_grid_starting_at_anchor() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a", "b"]), row(1, &["c", "d"])],
         );
@@ -1354,7 +1343,7 @@ mod tests {
     #[test]
     fn paste_skips_rows_beyond_sheet_bounds() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a"])]);
         set_columns(&mut app, "f.csv", 1);
 
         // Anchor at row 0 with 3 pasted rows, but only 1 row exists.
@@ -1372,7 +1361,7 @@ mod tests {
     #[test]
     fn paste_skips_columns_beyond_header_bounds() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a", "b"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a", "b"])]);
         set_columns(&mut app, "f.csv", 2);
 
         // Pasted row has 3 values but only 2 columns exist.
@@ -1387,7 +1376,7 @@ mod tests {
     #[test]
     fn paste_at_nonzero_anchor_offsets_correctly() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a", "b", "c"]), row(1, &["d", "e", "f"])],
         );
@@ -1405,7 +1394,7 @@ mod tests {
     #[test]
     fn paste_empty_rows_is_noop() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a"])]);
         set_columns(&mut app, "f.csv", 1);
 
         let count = app.apply_paste("f.csv", 1, 0, 0, &[]);
@@ -1417,7 +1406,7 @@ mod tests {
     #[test]
     fn replace_all_columns_across_all_rows_when_no_filter() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["foo", "bar"]), row(1, &["foobar", "baz"])],
         );
@@ -1441,7 +1430,7 @@ mod tests {
     #[test]
     fn replace_current_column_only() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["foo", "foo"])],
         );
@@ -1457,7 +1446,7 @@ mod tests {
     #[test]
     fn replace_all_only_touches_filtered_rows_when_filter_active() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["foo"]), row(1, &["foo"]), row(2, &["foo"])],
         );
@@ -1479,7 +1468,7 @@ mod tests {
     #[test]
     fn replace_all_no_match_changes_nothing() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["bar"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["bar"])]);
         set_columns(&mut app, "f.csv", 1);
 
         let count = app.apply_replace_all("f.csv", 1, "foo", "X", ReplaceScope::AllColumns);
@@ -1492,7 +1481,7 @@ mod tests {
     #[test]
     fn replace_all_empty_find_is_noop() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["bar"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["bar"])]);
         set_columns(&mut app, "f.csv", 1);
 
         let count = app.apply_replace_all("f.csv", 1, "", "X", ReplaceScope::AllColumns);
@@ -1504,14 +1493,14 @@ mod tests {
     #[test]
     fn delete_row_removes_by_stable_master_row() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a"]), row(1, &["b"]), row(2, &["c"])],
         );
 
         assert!(app.apply_delete_row("f.csv", 1, 1));
 
-        let remaining: Vec<usize> = app.sheets_data["f.csv"].iter().map(|(idx, _)| *idx).collect();
+        let remaining: Vec<usize> = row_ids(&app, "f.csv");
         assert_eq!(remaining, vec![0, 2]);
         assert!(app.history.is_dirty(&"f.csv".to_string()));
         assert_eq!(undo_len(&app, "f.csv"), 1);
@@ -1520,7 +1509,7 @@ mod tests {
     #[test]
     fn delete_row_also_removes_from_filtered_views() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a"]), row(1, &["b"])],
         );
@@ -1533,13 +1522,13 @@ mod tests {
 
         // 'b' (master row 1) shifted from position 1 to 0.
         assert_eq!(app.filtered_data[&("f.csv".to_string(), 1)], vec![0u32]);
-        assert_eq!(app.sheets_data["f.csv"][0].0, 1);
+        assert_eq!(row_ids(&app, "f.csv")[0], 1);
     }
 
     #[test]
     fn insert_row_shifts_views_so_they_keep_pointing_at_the_same_rows() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"]), row(1, &["b"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a"]), row(1, &["b"])]);
         app.next_row_id.insert("f.csv".to_string(), 2);
         set_columns(&mut app, "f.csv", 1);
         app.filtered_data.insert(("f.csv".to_string(), 1), vec![1u32]); // view shows only 'b'
@@ -1547,13 +1536,13 @@ mod tests {
         app.apply_insert_row("f.csv", 1, Some((0, InsertPosition::Before)));
 
         let view = &app.filtered_data[&("f.csv".to_string(), 1)];
-        assert_eq!(app.sheets_data["f.csv"][view[0] as usize].0, 1);
+        assert_eq!(row_ids(&app, "f.csv")[view[0] as usize], 1);
     }
 
     #[test]
     fn delete_row_missing_row_is_noop() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a"])]);
 
         assert!(!app.apply_delete_row("f.csv", 1, 5));
         assert!(!app.history.any_dirty());
@@ -1562,7 +1551,7 @@ mod tests {
     #[test]
     fn insert_row_assigns_fresh_master_row_id() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a"]), row(1, &["b"])],
         );
@@ -1581,7 +1570,7 @@ mod tests {
     #[test]
     fn insert_row_after_anchor_lands_immediately_below() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a"]), row(1, &["b"]), row(2, &["c"])],
         );
@@ -1593,14 +1582,14 @@ mod tests {
             .apply_insert_row("f.csv", 1, Some((0, InsertPosition::After)))
             .expect("insert should apply");
 
-        let order: Vec<usize> = app.sheets_data["f.csv"].iter().map(|(idx, _)| *idx).collect();
+        let order: Vec<usize> = row_ids(&app, "f.csv");
         assert_eq!(order, vec![0, new_id, 1, 2]);
     }
 
     #[test]
     fn insert_row_before_anchor_lands_immediately_above() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a"]), row(1, &["b"]), row(2, &["c"])],
         );
@@ -1613,14 +1602,14 @@ mod tests {
             .apply_insert_row("f.csv", 1, Some((0, InsertPosition::Before)))
             .expect("insert should apply");
 
-        let order: Vec<usize> = app.sheets_data["f.csv"].iter().map(|(idx, _)| *idx).collect();
+        let order: Vec<usize> = row_ids(&app, "f.csv");
         assert_eq!(order, vec![new_id, 0, 1, 2]);
     }
 
     #[test]
     fn delete_then_undo_restores_row_at_original_position() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a"]), row(1, &["b"]), row(2, &["c"])],
         );
@@ -1632,7 +1621,7 @@ mod tests {
         let result = app.apply_undo("f.csv").expect("undo should restore the row");
         assert_eq!(result.row, Some(1));
         assert_eq!(app.sheets_data["f.csv"].len(), 3);
-        let restored: Vec<usize> = app.sheets_data["f.csv"].iter().map(|(idx, _)| *idx).collect();
+        let restored: Vec<usize> = row_ids(&app, "f.csv");
         assert_eq!(restored, vec![0, 1, 2]);
         assert_eq!(app.read_cell("f.csv", 1, 0), Some("b".to_string()));
     }
@@ -1640,7 +1629,7 @@ mod tests {
     #[test]
     fn insert_then_undo_removes_the_row() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a"])]);
         app.next_row_id.insert("f.csv".to_string(), 1);
         set_columns(&mut app, "f.csv", 1);
 
@@ -1655,7 +1644,7 @@ mod tests {
     #[test]
     fn delete_undo_redo_round_trips() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a"]), row(1, &["b"])],
         );
@@ -1665,7 +1654,7 @@ mod tests {
         app.apply_redo("f.csv");
 
         assert_eq!(app.sheets_data["f.csv"].len(), 1);
-        let remaining: Vec<usize> = app.sheets_data["f.csv"].iter().map(|(idx, _)| *idx).collect();
+        let remaining: Vec<usize> = row_ids(&app, "f.csv");
         assert_eq!(remaining, vec![0]);
     }
 
@@ -1678,7 +1667,7 @@ mod tests {
     fn undo_survives_a_column_position_shift() {
         let mut app = test_app();
         // Three columns: id 0 "name", id 1 "dupa", id 2 "age".
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["alice", "x", "30"])],
         );
@@ -1710,9 +1699,7 @@ mod tests {
                 headers.retain(|h| h.id != 0);
             }
         }
-        for (_, record) in app.sheets_data.get_mut("f.csv").unwrap() {
-            *record = record.iter().skip(1).collect();
-        }
+        app.sheets_data.get_mut("f.csv").unwrap().remove_column(0);
 
         // "dupa" (id 1) is now at position 0, "age" (id 2) at position 1.
         assert_eq!(app.read_cell("f.csv", 0, 1), Some("y".to_string())); // still id 1
@@ -1731,7 +1718,7 @@ mod tests {
     #[test]
     fn delete_column_removes_field_and_header_by_id() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a", "b", "c"]), row(1, &["d", "e", "f"])],
         );
@@ -1756,7 +1743,7 @@ mod tests {
     #[test]
     fn delete_column_missing_id_is_noop() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a"])]);
         set_columns(&mut app, "f.csv", 1);
 
         assert!(!app.apply_delete_column("f.csv", 99));
@@ -1766,7 +1753,7 @@ mod tests {
     #[test]
     fn insert_column_appends_empty_field_with_fresh_id() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a", "b"])],
         );
@@ -1787,7 +1774,7 @@ mod tests {
     #[test]
     fn insert_column_after_specific_id_lands_in_position() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a", "b"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a", "b"])]);
         set_columns(&mut app, "f.csv", 2); // ids 0, 1
         app.next_col_id.insert("f.csv".to_string(), 2);
 
@@ -1804,7 +1791,7 @@ mod tests {
     #[test]
     fn delete_column_then_undo_restores_header_position_and_values() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a", "b", "c"]), row(1, &["d", "e", "f"])],
         );
@@ -1825,15 +1812,15 @@ mod tests {
     #[test]
     fn insert_column_then_undo_removes_it() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a"])]);
         set_columns(&mut app, "f.csv", 1);
         app.next_col_id.insert("f.csv".to_string(), 1);
 
         app.apply_insert_column("f.csv", None, "new");
-        assert_eq!(app.sheets_data["f.csv"][0].1.len(), 2);
+        assert_eq!(app.sheets_data["f.csv"].record(0).unwrap().len(), 2);
 
         app.apply_undo("f.csv");
-        assert_eq!(app.sheets_data["f.csv"][0].1.len(), 1);
+        assert_eq!(app.sheets_data["f.csv"].record(0).unwrap().len(), 1);
         assert_eq!(app.read_cell("f.csv", 0, 0), Some("a".to_string()));
 
         let headers = app.tree.iter_all_tabs().next().unwrap().1.columns.get("f.csv").unwrap();
@@ -1843,7 +1830,7 @@ mod tests {
     #[test]
     fn delete_column_undo_redo_round_trips() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a", "b"])],
         );
@@ -1853,7 +1840,7 @@ mod tests {
         app.apply_undo("f.csv");
         app.apply_redo("f.csv");
 
-        assert_eq!(app.sheets_data["f.csv"][0].1.len(), 1);
+        assert_eq!(app.sheets_data["f.csv"].record(0).unwrap().len(), 1);
         assert_eq!(app.read_cell("f.csv", 0, 1), Some("b".to_string()));
         let headers = app.tree.iter_all_tabs().next().unwrap().1.columns.get("f.csv").unwrap();
         assert_eq!(headers.len(), 1);
@@ -1865,7 +1852,7 @@ mod tests {
     #[test]
     fn paste_undo_restores_all_cells_in_one_action() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a", "b"]), row(1, &["c", "d"])],
         );

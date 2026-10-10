@@ -1,10 +1,11 @@
-pub use csv_model::{ColumnId, FileHeader, SheetRow, SheetVec, SortOrder, View};
+pub use csv_model::{ColumnId, FileHeader, MemorySheet, Sheet, SheetRow, SortOrder, View};
 pub use selection::SelectionState;
 pub use undo_history::UndoHistory;
 #[cfg(test)]
 use csv::StringRecord;
 use egui::Context;
 use egui_dock::{DockState, NodeIndex, SurfaceIndex};
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use std::sync::mpsc::{Receiver, Sender};
@@ -40,7 +41,7 @@ pub enum UiMessage {
     /// same file+tab) can be dropped instead of racing to overwrite the
     /// latest one.
     SetDisplayData(View, String, TabId, u64),
-    SetMaster(SheetVec, String),
+    SetMaster(Box<dyn Sheet>, String),
     /// filename, tab_id, row_nr (in displayed data), column_id, new value.
     /// column_id (not a position) so a stored/replayed edit stays correct
     /// even if a column insert/delete shifts positions in between.
@@ -107,7 +108,7 @@ pub type Filters = HashMap<(Filename, TabId), String>;
 /// The rows a tab displays: master, optionally seen through a `View`.
 #[derive(Clone, Copy)]
 pub struct Rows<'a> {
-    master: &'a SheetVec,
+    master: &'a dyn Sheet,
     view: Option<&'a [u32]>,
 }
 
@@ -116,11 +117,13 @@ impl<'a> Rows<'a> {
         self.view.map_or(self.master.len(), |v| v.len())
     }
 
-    pub fn get(&self, row_nr: usize) -> Option<&'a SheetRow> {
-        match self.view {
-            Some(v) => self.master.get(*v.get(row_nr)? as usize),
-            None => self.master.get(row_nr),
-        }
+    /// Value of the cell at displayed row `row_nr`, field index `col`.
+    pub fn cell(&self, row_nr: usize, col: usize) -> Option<Cow<'a, str>> {
+        let position = match self.view {
+            Some(v) => *v.get(row_nr)? as usize,
+            None => row_nr,
+        };
+        self.master.cell(position, col)
     }
 }
 
@@ -129,19 +132,19 @@ impl<'a> Rows<'a> {
 /// - master data if no filter is active
 /// - nothing if a filter is pending but results haven't arrived yet
 pub fn active_sheet_data<'a>(
-    master: &'a HashMap<Filename, SheetVec>,
+    master: &'a HashMap<Filename, Box<dyn Sheet>>,
     filtered: &'a HashMap<(Filename, TabId), View>,
     filename: &str,
     tab_id: TabId,
     filter_active: bool,
 ) -> Rows<'a> {
     use std::sync::LazyLock;
-    static EMPTY: LazyLock<SheetVec> = LazyLock::new(Vec::new);
+    static EMPTY: LazyLock<MemorySheet> = LazyLock::new(MemorySheet::default);
     match (master.get(filename), filtered.get(&(filename.to_string(), tab_id))) {
-        (Some(m), None) if filter_active => Rows { master: m, view: Some(&[]) },
-        (Some(m), None) => Rows { master: m, view: None },
-        (Some(m), Some(v)) => Rows { master: m, view: Some(v) },
-        _ => Rows { master: &EMPTY, view: None },
+        (Some(m), None) if filter_active => Rows { master: m.as_ref(), view: Some(&[]) },
+        (Some(m), None) => Rows { master: m.as_ref(), view: None },
+        (Some(m), Some(v)) => Rows { master: m.as_ref(), view: Some(v) },
+        _ => Rows { master: &*EMPTY, view: None },
     }
 }
 
@@ -203,7 +206,7 @@ pub struct MyApp {
     pub loading: bool,
     pub worker_chan: Chan<UiMessage>,
     pub ui_chan: Chan<Ping>,
-    pub sheets_data: HashMap<String, SheetVec>,
+    pub sheets_data: HashMap<String, Box<dyn Sheet>>,
     // Filtered/sorted views keyed by (filename, tab_id). Each tab can show
     // the same master file filtered or sorted differently.
     pub filtered_data: HashMap<(Filename, TabId), View>,
@@ -235,7 +238,7 @@ pub struct MyApp {
 
 pub struct CsvTabViewer<'a> {
     pub added_nodes: &'a mut Vec<(SurfaceIndex, NodeIndex, Filename)>,
-    pub promised_data: &'a HashMap<Filename, SheetVec>,
+    pub promised_data: &'a HashMap<Filename, Box<dyn Sheet>>,
     pub filtered_data: &'a HashMap<(Filename, TabId), View>,
     pub ctx: &'a Context,
     pub sender: &'a Sender<UiMessage>,
@@ -251,33 +254,36 @@ pub struct CsvTabViewer<'a> {
 mod tests {
     use super::*;
 
+    fn master_with(rows: &[&str]) -> HashMap<Filename, Box<dyn Sheet>> {
+        let sheet = MemorySheet::new(
+            rows.iter().enumerate().map(|(i, v)| (i, StringRecord::from(vec![*v]))).collect(),
+        );
+        HashMap::from([("f.csv".to_string(), Box::new(sheet) as Box<dyn Sheet>)])
+    }
+
     #[test]
     fn active_sheet_data_prefers_filtered_view_when_present() {
-        let mut master = HashMap::new();
-        master.insert("f.csv".to_string(), vec![(0usize, StringRecord::from(vec!["m"]))]);
+        let master = master_with(&["m", "n"]);
         let mut filtered: HashMap<(Filename, TabId), View> = HashMap::new();
-        master.get_mut("f.csv").unwrap().push((1, StringRecord::from(vec!["n"])));
         filtered.insert(("f.csv".to_string(), 1usize), vec![1u32]);
 
         let data = active_sheet_data(&master, &filtered, "f.csv", 1, true);
         assert_eq!(data.len(), 1);
-        assert_eq!(data.get(0).unwrap().1.get(0), Some("n"));
+        assert_eq!(data.cell(0, 0).as_deref(), Some("n"));
     }
 
     #[test]
     fn active_sheet_data_falls_back_to_master_when_no_filter_active() {
-        let mut master = HashMap::new();
-        master.insert("f.csv".to_string(), vec![(0usize, StringRecord::from(vec!["m"]))]);
+        let master = master_with(&["m"]);
         let filtered = HashMap::new();
 
         let data = active_sheet_data(&master, &filtered, "f.csv", 1, false);
-        assert_eq!(data.get(0).unwrap().1.get(0), Some("m"));
+        assert_eq!(data.cell(0, 0).as_deref(), Some("m"));
     }
 
     #[test]
     fn active_sheet_data_returns_empty_when_filter_pending() {
-        let mut master = HashMap::new();
-        master.insert("f.csv".to_string(), vec![(0usize, StringRecord::from(vec!["m"]))]);
+        let master = master_with(&["m"]);
         let filtered = HashMap::new();
 
         let data = active_sheet_data(&master, &filtered, "f.csv", 1, true);
