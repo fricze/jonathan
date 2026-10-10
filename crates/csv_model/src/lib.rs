@@ -103,6 +103,7 @@ pub fn write_csv(
 ) -> Result<(), csv::Error> {
     let mut writer = csv::WriterBuilder::new()
         .delimiter(format.delimiter)
+        .flexible(true)
         .from_path(path)?;
     if format.has_header {
         writer.write_record(headers.iter().map(|h| h.name.as_str()))?;
@@ -280,6 +281,7 @@ pub fn iterate_csv(
     let mut rdr = csv::ReaderBuilder::new()
         .delimiter(format.delimiter)
         .has_headers(format.has_header)
+        .flexible(true)
         .from_path(path)?;
     let headers = if format.has_header {
         rdr.headers()?.clone()
@@ -294,6 +296,7 @@ pub fn iterate_csv(
         let mut rdr2 = csv::ReaderBuilder::new()
             .delimiter(format.delimiter)
             .has_headers(false)
+            .flexible(true)
             .from_path(path)?;
         std::mem::swap(&mut rdr, &mut rdr2);
         (1..=columns).map(|i| format!("Column {i}")).collect()
@@ -323,6 +326,42 @@ pub fn open_csv_file(path: &str) -> (csv::Reader<std::fs::File>, Vec<FileHeader>
             std::process::exit(1);
         }
     }
+}
+
+/// What the loader had to do to rows it could not read verbatim.
+#[derive(Debug, Default, PartialEq, Eq, Clone, Copy)]
+pub struct LoadStats {
+    pub lossy_rows: usize,
+    pub skipped_rows: usize,
+}
+
+/// Read every row of `reader` verbatim: rows with more or fewer fields than
+/// the header are kept as they are, and a row that isn't valid UTF-8 is kept
+/// with U+FFFD in place of the bad bytes (counted in `lossy_rows`). Only a row
+/// the parser cannot produce at all is skipped (counted in `skipped_rows`).
+/// The reader must be flexible (see `iterate_csv`), or ragged rows error.
+pub fn read_rows<R: std::io::Read>(reader: &mut csv::Reader<R>) -> (SheetVec, LoadStats) {
+    let mut rows = SheetVec::new();
+    let mut stats = LoadStats::default();
+    let mut raw = csv::ByteRecord::new();
+    loop {
+        match reader.read_byte_record(&mut raw) {
+            Ok(false) => break,
+            Ok(true) => {
+                let record = StringRecord::from_byte_record(raw.clone()).unwrap_or_else(|_| {
+                    stats.lossy_rows += 1;
+                    StringRecord::from_byte_record_lossy(raw.clone())
+                });
+                rows.push((rows.len(), record));
+            }
+            Err(err) if err.is_io_error() => {
+                stats.skipped_rows += 1;
+                break;
+            }
+            Err(_) => stats.skipped_rows += 1,
+        }
+    }
+    (rows, stats)
 }
 
 #[cfg(test)]
@@ -516,5 +555,62 @@ mod tests {
             vec!["e\nf".to_string(), "".to_string()],
         ];
         assert_eq!(parse_clipboard(&format_rows(&rows, b'\t')), rows);
+    }
+
+    fn temp_file(name: &str, bytes: &[u8]) -> (std::path::PathBuf, String) {
+        let dir = std::env::temp_dir().join(format!("csv_model_{name}_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.csv");
+        std::fs::write(&path, bytes).unwrap();
+        let p = path.to_str().unwrap().to_string();
+        (dir, p)
+    }
+
+    fn lens(rows: &SheetVec) -> Vec<usize> {
+        rows.iter().map(|(_, r)| r.len()).collect()
+    }
+
+    #[test]
+    fn read_rows_keeps_ragged_rows() {
+        let (dir, path) = temp_file("ragged", b"a,b,c\n1,2\n3,4,5,6\n7,8,9\n");
+        let (mut rdr, _, _) = open_csv_file(&path);
+        let (rows, stats) = read_rows(&mut rdr);
+        assert_eq!(lens(&rows), vec![2, 4, 3]);
+        assert_eq!(
+            rows.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(stats, LoadStats::default());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn read_rows_keeps_invalid_utf8_rows_lossily_and_counts_them() {
+        let (dir, path) = temp_file("utf8", b"a,b\n1,2\nx,\xff\n3,4\n");
+        let (mut rdr, _, _) = open_csv_file(&path);
+        let (rows, stats) = read_rows(&mut rdr);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1].1.get(1), Some("\u{fffd}"));
+        assert_eq!(
+            stats,
+            LoadStats {
+                lossy_rows: 1,
+                skipped_rows: 0
+            }
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn write_csv_saves_ragged_rows_unchanged() {
+        let (dir, path) = temp_file("ragged_save", b"a,b,c\n1,2\n3,4,5,6\n7,8,9\n");
+        let (mut rdr, headers, format) = open_csv_file(&path);
+        let (rows, _) = read_rows(&mut rdr);
+        write_csv(&path, &headers, &MemorySheet::new(rows), format).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "a,b,c\n1,2\n3,4,5,6\n7,8,9\n"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
     }
 }

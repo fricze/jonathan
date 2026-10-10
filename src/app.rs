@@ -4,7 +4,7 @@ use egui_dock::{DockArea, Style};
 use std::path::PathBuf;
 use std::thread;
 
-use csv_model::{MemorySheet, SheetVec, open_csv_file, write_csv};
+use csv_model::{LoadStats, MemorySheet, open_csv_file, read_rows, write_csv};
 use crate::menu::{COPY_AS_CSV_ID, OPEN_FILE_ID};
 use crate::types::{
     ColumnId, CsvTabViewer, FileHeader, InsertPosition, MyApp, ReplaceScope, SendUiMessage, SheetTab,
@@ -61,6 +61,22 @@ fn undo_redo_toast(action: &str, result: &UndoRedoResult) -> (String, String) {
 }
 
 /// Bump the request epoch for a (filename, tab_id) key and return the new value.
+/// What to tell the user when loading had to alter or skip rows. Saving
+/// writes the replacement characters back, so lossy rows are worth a warning.
+fn load_warning(stats: &LoadStats) -> Option<String> {
+    let mut parts = Vec::new();
+    if stats.lossy_rows > 0 {
+        parts.push(format!(
+            "{} row(s) are not valid UTF-8; bad bytes are shown as replacement characters and will be replaced on save",
+            stats.lossy_rows
+        ));
+    }
+    if stats.skipped_rows > 0 {
+        parts.push(format!("{} row(s) could not be read and were skipped", stats.skipped_rows));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
 fn bump_epoch(epochs: &mut std::collections::HashMap<(String, usize), u64>, key: (String, usize)) -> u64 {
     let entry = epochs.entry(key).or_insert(0);
     *entry += 1;
@@ -642,11 +658,11 @@ impl MyApp {
         let ctx = ctx.clone();
 
         thread::spawn(move || {
-            let master_data: SheetVec = reader
-                .records()
-                .filter_map(|record| record.ok())
-                .enumerate()
-                .collect::<Vec<_>>();
+            let (master_data, stats) = read_rows(&mut reader);
+
+            if let Some(warning) = load_warning(&stats) {
+                crate::toast::show(&ctx, warning);
+            }
 
             chan.send_msg(UiMessage::SetMaster(Box::new(MemorySheet::new(master_data)), file_name.clone()));
 
@@ -1067,6 +1083,15 @@ mod tests {
     fn row_ids(app: &MyApp, filename: &str) -> Vec<usize> {
         let sheet = &app.sheets_data[filename];
         (0..sheet.len()).filter_map(|i| sheet.row_id(i)).collect()
+    }
+
+    #[test]
+    fn load_warning_is_silent_for_clean_loads_and_names_the_problem_otherwise() {
+        assert_eq!(load_warning(&LoadStats::default()), None);
+        let lossy = load_warning(&LoadStats { lossy_rows: 2, skipped_rows: 0 }).unwrap();
+        assert!(lossy.contains("2 row(s) are not valid UTF-8"));
+        let both = load_warning(&LoadStats { lossy_rows: 1, skipped_rows: 3 }).unwrap();
+        assert!(both.contains("3 row(s) could not be read"));
     }
 
     fn row(idx: usize, fields: &[&str]) -> (usize, StringRecord) {
