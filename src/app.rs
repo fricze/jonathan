@@ -791,7 +791,7 @@ impl MyApp {
         while let Ok(message) = self.worker_chan.1.try_recv() {
             match message {
                 UiMessage::SetMaster(master, file_name) => {
-                    let next_id = (0..master.len()).filter_map(|i| master.row_id(i)).max().map_or(0, |m| m + 1);
+                    let next_id = master.next_row_id();
                     self.next_row_id.insert(file_name.clone(), next_id);
                     self.sheets_data.insert(file_name, master);
                 }

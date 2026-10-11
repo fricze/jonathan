@@ -26,6 +26,12 @@ pub trait Sheet: Send + Sync {
     /// Stable id of the row at `position`.
     fn row_id(&self, position: usize) -> Option<usize>;
 
+    /// One past the largest row id present (0 when empty). Backends that can
+    /// answer without visiting every row should override this.
+    fn next_row_id(&self) -> usize {
+        (0..self.len()).filter_map(|i| self.row_id(i)).max().map_or(0, |m| m + 1)
+    }
+
     /// Current position of the row with stable id `row_id`.
     fn position_of(&self, row_id: usize) -> Option<usize>;
 
@@ -97,6 +103,10 @@ impl Sheet for MemorySheet {
 
     fn position_of(&self, row_id: usize) -> Option<usize> {
         self.rows.iter().position(|(id, _)| *id == row_id)
+    }
+
+    fn next_row_id(&self) -> usize {
+        self.rows.iter().map(|(id, _)| *id).max().map_or(0, |m| m + 1)
     }
 
     fn cell(&self, position: usize, col: usize) -> Option<Cow<'_, str>> {
@@ -218,6 +228,18 @@ mod tests {
             s.record(0).unwrap().iter().collect::<Vec<_>>(),
             ["", "a", "b", "c"]
         );
+    }
+
+    #[test]
+    fn next_row_id_is_one_past_the_largest_id() {
+        assert_eq!(MemorySheet::default().next_row_id(), 0);
+        let mut s = sheet(&[(7, &["a"]), (3, &["b"])]);
+        assert_eq!(s.next_row_id(), 8);
+        // Removing the largest id must not let it be handed out again by
+        // the sheet itself; the app tracks that separately, so this only
+        // reports what is present.
+        s.remove_row(0);
+        assert_eq!(s.next_row_id(), 4);
     }
 
     #[test]
