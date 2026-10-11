@@ -8,6 +8,9 @@ use csv::StringRecord;
 mod sheet;
 pub use sheet::{MemorySheet, Sheet};
 
+#[cfg(test)]
+pub(crate) mod conformance;
+
 pub type ColumnId = usize;
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -123,12 +126,13 @@ pub fn write_csv(
 /// when master rows are inserted or removed.
 pub type View = Vec<u32>;
 
-/// Positions of master rows with any cell containing `filter`.
+/// Positions of master rows with any cell containing `filter`. An empty
+/// `filter` matches every row, including rows with no cells.
 pub fn filter_indices(master: &SheetVec, filter: &str) -> View {
     master
         .iter()
         .enumerate()
-        .filter(|(_, (_, r))| r.iter().any(|c| c.contains(filter)))
+        .filter(|(_, (_, r))| filter.is_empty() || r.iter().any(|c| c.contains(filter)))
         .map(|(i, _)| i as u32)
         .collect()
 }

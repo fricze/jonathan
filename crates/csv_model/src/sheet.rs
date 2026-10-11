@@ -29,7 +29,10 @@ pub trait Sheet: Send + Sync {
     /// One past the largest row id present (0 when empty). Backends that can
     /// answer without visiting every row should override this.
     fn next_row_id(&self) -> usize {
-        (0..self.len()).filter_map(|i| self.row_id(i)).max().map_or(0, |m| m + 1)
+        (0..self.len())
+            .filter_map(|i| self.row_id(i))
+            .max()
+            .map_or(0, |m| m + 1)
     }
 
     /// Current position of the row with stable id `row_id`.
@@ -106,7 +109,11 @@ impl Sheet for MemorySheet {
     }
 
     fn next_row_id(&self) -> usize {
-        self.rows.iter().map(|(id, _)| *id).max().map_or(0, |m| m + 1)
+        self.rows
+            .iter()
+            .map(|(id, _)| *id)
+            .max()
+            .map_or(0, |m| m + 1)
     }
 
     fn cell(&self, position: usize, col: usize) -> Option<Cow<'_, str>> {
@@ -255,5 +262,26 @@ mod tests {
         let s = sheet(&[(0, &["10"]), (1, &["2"]), (2, &["x"])]);
         assert_eq!(s.filter("2"), vec![1]);
         assert_eq!(s.sort(vec![0, 1, 2], (0, SortOrder::Asc)), vec![1, 0, 2]);
+    }
+
+    fn make_memory(rows: SheetVec) -> Box<dyn Sheet> {
+        Box::new(MemorySheet::new(rows))
+    }
+
+    #[test]
+    fn memory_sheet_meets_the_sheet_contract() {
+        crate::conformance::run_all(&make_memory);
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::prelude::ProptestConfig::with_cases(300))]
+
+        #[test]
+        fn memory_sheet_agrees_with_the_reference_model(
+            initial in crate::conformance::initial_rows(),
+            ops in crate::conformance::ops(),
+        ) {
+            crate::conformance::check_ops(&make_memory, &initial, &ops);
+        }
     }
 }
