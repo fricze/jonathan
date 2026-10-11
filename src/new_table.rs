@@ -2,7 +2,7 @@ use std::{collections::BTreeMap, sync::mpsc::Sender};
 
 use egui::{Align2, Color32, Context, Id, Margin, NumExt as _, Sense, TextFormat};
 
-use csv_model::csv_quote;
+use csv_model::{format_rows, parse_clipboard};
 use crate::types::{
     ColumnId, FileHeader, Filename, SelectionState, SendUiMessage, Rows, SortOrder, TabId, UiMessage,
 };
@@ -91,10 +91,9 @@ impl<'a> Table<'a> {
         }
 
         // --- Display mode ---
-        let row = self.data.get(row_nr as usize);
-        if let Some((_, row)) = row {
-            let cell = row.get(actual_col);
-            if let Some(cell_content) = cell {
+        {
+            let cell = self.data.cell(row_nr as usize, actual_col);
+            if let Some(cell_content) = cell.as_deref() {
                 let filter = self.filter;
 
                 let label = if filter.is_empty() {
@@ -136,10 +135,20 @@ impl<'a> Table<'a> {
     }
 
     fn handle_clipboard_copy(&self, ui: &egui::Ui) {
-        let copy_requested = ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy)));
-        if !copy_requested || self.selection.selected_cells.is_empty() {
+        // Only a table with a selection may claim the menu request, so a
+        // table without one can't swallow it.
+        if self.selection.selected_cells.is_empty() {
             return;
         }
+        // Cmd+C copies tab-separated (what spreadsheets paste natively); the
+        // "Copy as CSV" menu item asks for comma-separated instead.
+        let copy_as_csv = crate::menu::take_copy_as_csv_request();
+        let copy_requested =
+            ui.input(|i| i.events.iter().any(|e| matches!(e, egui::Event::Copy))) || copy_as_csv;
+        if !copy_requested {
+            return;
+        }
+        let delimiter = if copy_as_csv { b',' } else { b'\t' };
 
         let min_row = self
             .selection
@@ -170,26 +179,22 @@ impl<'a> Table<'a> {
             .max()
             .unwrap_or(0);
 
-        let mut csv_rows: Vec<String> = Vec::new();
+        let mut rows: Vec<Vec<String>> = Vec::new();
         for r in min_row..=max_row {
             let mut row_fields: Vec<String> = Vec::new();
             for c in min_col..=max_col {
                 if self.selection.selected_cells.contains(&(r, c)) {
                     let actual_col = self.actual_col(c);
-                    let value = self
-                        .data
-                        .get(r as usize)
-                        .and_then(|(_, row)| row.get(actual_col))
-                        .unwrap_or("");
-                    row_fields.push(csv_quote(value));
+                    let value = self.data.cell(r as usize, actual_col).unwrap_or_default();
+                    row_fields.push(value.into_owned());
                 } else {
                     row_fields.push(String::new());
                 }
             }
-            csv_rows.push(row_fields.join(","));
+            rows.push(row_fields);
         }
 
-        ui.ctx().copy_text(csv_rows.join("\n"));
+        ui.ctx().copy_text(format_rows(&rows, delimiter));
         crate::toast::show(ui.ctx(), "Copied to clipboard");
     }
 
@@ -224,15 +229,7 @@ impl<'a> Table<'a> {
             return;
         };
 
-        let mut reader = csv::ReaderBuilder::new()
-            .has_headers(false)
-            .from_reader(pasted.as_bytes());
-
-        let rows: Vec<Vec<String>> = reader
-            .records()
-            .filter_map(|r| r.ok())
-            .map(|record| record.iter().map(|f| f.to_string()).collect())
-            .collect();
+        let rows = parse_clipboard(&pasted);
 
         if rows.is_empty() {
             return;
@@ -408,11 +405,7 @@ impl<'a> Table<'a> {
         if self.edit.editing_cell.is_none() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
             if let Some((row_nr, col_nr)) = self.selection.cursor().or(self.selection.anchor_cell) {
                 let actual_col = self.actual_col(col_nr);
-                if let Some(content) = self
-                    .data
-                    .get(row_nr as usize)
-                    .and_then(|(_, r)| r.get(actual_col))
-                {
+                if let Some(content) = self.data.cell(row_nr as usize, actual_col) {
                     *self.edit.editing_cell = Some((row_nr, col_nr));
                     *self.edit.edit_buffer = content.to_string();
                 }
@@ -598,11 +591,7 @@ impl<'a> egui_table::TableDelegate for Table<'a> {
 
         if cell_response.double_clicked() {
             let actual_col = self.actual_col(col_nr);
-            if let Some(content) = self
-                .data
-                .get(row_nr as usize)
-                .and_then(|(_, r)| r.get(actual_col))
-            {
+            if let Some(content) = self.data.cell(row_nr as usize, actual_col) {
                 *self.edit.editing_cell = Some((row_nr, col_nr));
                 *self.edit.edit_buffer = content.to_string();
             }
