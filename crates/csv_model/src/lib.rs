@@ -5,7 +5,9 @@
 
 use csv::StringRecord;
 
+mod row_index;
 mod sheet;
+pub use row_index::{RowIndex, RowIndexBuilder};
 pub use sheet::{MemorySheet, Sheet};
 
 #[cfg(test)]
