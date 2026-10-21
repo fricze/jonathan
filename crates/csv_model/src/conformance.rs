@@ -32,17 +32,29 @@ pub fn fields(sheet: &dyn Sheet, position: usize) -> Option<Vec<String>> {
 
 // ---------------------------------------------------------------- scenarios
 
+/// A backend that is loaded from a file can only be asked to start from
+/// rows a file can hold: sequential ids from 0 and at least one field per
+/// row (a zero-field row is a blank line on disk, which CSV skips). Edits may
+/// still produce such rows later, e.g. by removing a row's only column.
 pub fn run_all(make: &Make) {
+    run_read_only(make);
+    run_edits(make);
+}
+
+pub fn run_read_only(make: &Make) {
     empty_sheet(make);
     reads_by_position_and_id(make);
     ragged_rows_read_back_as_they_are(make);
+    filter_matches_any_cell(make);
+    sort_orders_numbers_by_value_then_text(make);
+}
+
+pub fn run_edits(make: &Make) {
     set_cell_by_id(make);
     remove_and_reinsert_row_restores_order_and_id(make);
     insert_row_clamps_to_end(make);
     column_remove_insert_round_trip(make);
     snapshot_is_isolated_from_later_edits(make);
-    filter_matches_any_cell(make);
-    sort_orders_numbers_by_value_then_text(make);
 }
 
 fn empty_sheet(make: &Make) {
@@ -58,20 +70,16 @@ fn empty_sheet(make: &Make) {
 }
 
 fn reads_by_position_and_id(make: &Make) {
-    let mut rows = rows_of(&[&["a", "b"], &["c", "d"], &["e", "f"]]);
-    rows[0].0 = 10;
-    rows[1].0 = 4;
-    rows[2].0 = 7;
-    let s = make(rows);
+    let s = make(rows_of(&[&["a", "b"], &["c", "d"], &["e", "f"]]));
     assert_eq!(s.len(), 3);
     assert_eq!(
         (s.row_id(0), s.row_id(1), s.row_id(2)),
-        (Some(10), Some(4), Some(7))
+        (Some(0), Some(1), Some(2))
     );
     assert_eq!(s.row_id(3), None);
-    assert_eq!(s.position_of(7), Some(2));
-    assert_eq!(s.position_of(5), None);
-    assert_eq!(s.next_row_id(), 11);
+    assert_eq!(s.position_of(2), Some(2));
+    assert_eq!(s.position_of(3), None);
+    assert_eq!(s.next_row_id(), 3);
     assert_eq!(s.cell(1, 1).as_deref(), Some("d"));
     assert_eq!(s.cell(1, 2), None);
     assert_eq!(s.cell(3, 0), None);
@@ -79,26 +87,25 @@ fn reads_by_position_and_id(make: &Make) {
 }
 
 fn ragged_rows_read_back_as_they_are(make: &Make) {
-    let s = make(rows_of(&[&["a"], &["b", "c", "d"], &[]]));
+    let s = make(rows_of(&[&["a"], &["b", "c", "d"], &[""]]));
     assert_eq!(fields(s.as_ref(), 0), Some(vec!["a".into()]));
     assert_eq!(fields(s.as_ref(), 1).unwrap().len(), 3);
-    assert_eq!(fields(s.as_ref(), 2), Some(vec![]));
+    assert_eq!(fields(s.as_ref(), 2), Some(vec!["".into()]));
     assert_eq!(s.cell(0, 1), None);
 }
 
 fn set_cell_by_id(make: &Make) {
-    let mut rows = rows_of(&[&["a", "b"], &["c", "d"]]);
-    rows[0].0 = 9;
-    rows[1].0 = 2;
-    let mut s = make(rows);
+    let mut s = make(rows_of(&[&["z"], &["a", "b"], &["c", "d"]]));
+    s.remove_row(0); // ids now differ from positions: id 2 sits at position 1
     assert!(s.set_cell(2, 1, "X"));
     assert_eq!(s.cell(1, 1).as_deref(), Some("X"));
     assert_eq!(s.cell(0, 1).as_deref(), Some("b"));
     assert!(!s.set_cell(5, 0, "no"), "missing row id");
+    assert!(!s.set_cell(0, 0, "no"), "removed row id");
     assert!(!s.set_cell(2, 2, "no"), "column past the row's end");
-    assert!(s.set_cell(9, 0, "multi\nline, \"quoted\""));
+    assert!(s.set_cell(1, 0, "multi\nline, \"quoted\""));
     assert_eq!(s.cell(0, 0).as_deref(), Some("multi\nline, \"quoted\""));
-    assert!(s.set_cell(9, 0, ""));
+    assert!(s.set_cell(1, 0, ""));
     assert_eq!(s.cell(0, 0).as_deref(), Some(""));
 }
 
@@ -168,7 +175,12 @@ fn snapshot_is_isolated_from_later_edits(make: &Make) {
 }
 
 fn filter_matches_any_cell(make: &Make) {
-    let s = make(rows_of(&[&["apple", "x"], &["y", "grape"], &["pear"], &[]]));
+    let s = make(rows_of(&[
+        &["apple", "x"],
+        &["y", "grape"],
+        &["pear"],
+        &[""],
+    ]));
     assert_eq!(s.filter("ap"), vec![0, 1]);
     assert_eq!(s.filter("pear"), vec![2]);
     assert_eq!(s.filter("zzz"), Vec::<u32>::new());
@@ -313,7 +325,7 @@ pub fn ops() -> impl Strategy<Value = Vec<Op>> {
 }
 
 pub fn initial_rows() -> impl Strategy<Value = Vec<Vec<String>>> {
-    prop::collection::vec(prop::collection::vec(text(), 0..4), 0..6)
+    prop::collection::vec(prop::collection::vec(text(), 1..4), 0..6)
 }
 
 pub fn to_sheet_vec(rows: &[Vec<String>]) -> SheetVec {
@@ -437,6 +449,34 @@ pub fn check_ops(make: &Make, initial: &[Vec<String>], ops: &[Op]) {
             snap.as_ref(),
             frozen,
             &format!("snapshot #{i} checked at the end"),
+        );
+    }
+}
+
+/// Filter and sort must give exactly what [`crate::MemorySheet`] gives on the
+/// same rows. `needle` is taken from the data half the time so it matches.
+pub fn check_filter_sort(
+    make: &Make,
+    initial: &[Vec<String>],
+    needle: &str,
+    col: usize,
+    dsc: bool,
+) {
+    let reference = crate::MemorySheet::new(to_sheet_vec(initial));
+    let sheet = make(to_sheet_vec(initial));
+    assert_eq!(
+        sheet.filter(needle),
+        reference.filter(needle),
+        "filter({needle:?})"
+    );
+    let order = if dsc { SortOrder::Dsc } else { SortOrder::Asc };
+    let all: Vec<u32> = (0..initial.len() as u32).collect();
+    let subset: Vec<u32> = all.iter().copied().filter(|i| i % 2 == 0).collect();
+    for view in [all, subset] {
+        assert_eq!(
+            sheet.sort(view.clone(), (col, order)),
+            reference.sort(view.clone(), (col, order)),
+            "sort col {col} {order:?} of {view:?}"
         );
     }
 }

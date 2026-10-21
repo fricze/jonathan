@@ -73,19 +73,19 @@ either. The worker thread builds the index, then sends `SetMaster` as today.
 
 Each step: write the failing tests, run them red, implement, run green, commit.
 
-0. **Conformance suite.** Lift the existing `MemorySheet` tests into
+0. **Conformance suite** (DONE). Lift the existing `MemorySheet` tests into
    `fn conformance(make: fn(SheetVec) -> Box<dyn Sheet>)`. Green for
    `MemorySheet`. Add a model-based property test (`proptest`): apply the same
    random sequence of `set_cell / remove_row / insert_row / remove_column /
    insert_column / snapshot` to a `MemorySheet` and the candidate; after each op
    assert identical `len`, `row_id`, `record` for every position. This is the
    main oracle for everything below.
-1. **Row index** (pure, on `&[u8]`). Cases: LF, CRLF, lone CR, quoted newline,
+1. **Row index** (DONE; pure, on `&[u8]`). Cases: LF, CRLF, lone CR, quoted newline,
    `""` escape, mid-field quote, no trailing newline, blank trailing line, BOM,
    headerless, `;`/tab/`|`, empty file, header-only, ragged rows. Property: for
    random CSV text, parsing each indexed slice yields the same records as
    `csv::Reader` over the whole text.
-2. **FileSheet read-only** on `VecSource`: `len`, `row_id == position`,
+2. **FileSheet read-only** (DONE) on `VecSource`: `len`, `row_id == position`,
    `cell`, `record`, ragged rows, invalid UTF-8, out-of-range -> `None`, cache
    returns the same values as a cold read. Conformance (read-only subset) green.
 3. **Cell edits**: `set_cell` + read-back, edit then snapshot isolation,
@@ -129,3 +129,17 @@ Each step: write the failing tests, run them red, implement, run green, commit.
   path in step 7 gets that for free.
 - Files changed on disk by another process while open: detect via size/mtime
   check before save and prompt, rather than silently overwriting.
+
+## Notes from implementation
+
+- A file can only hold rows with at least one field (a zero-field row is a blank
+  line, which CSV skips) and ids at load are sequential from 0. The conformance
+  suite's load-time scenarios and generators respect that; edits may still
+  produce zero-field rows (removing a row's only column). Saving such a row
+  would write a blank line and lose it -- same as `MemorySheet` today; decide
+  what save should do before step 7.
+- `filter` and `sort` in `FileSheet` are correct but unoptimised full scans
+  that bypass the row cache; step 6 adds the prefilter and parallelism under
+  the existing equality-with-`MemorySheet` property tests.
+- Step 2 left the five edit methods as `todo!()`; steps 3-5 replace them, so
+  `FileSheet` must not be wired into the app before then.

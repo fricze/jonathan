@@ -5,8 +5,10 @@
 
 use csv::StringRecord;
 
+mod file_sheet;
 mod row_index;
 mod sheet;
+pub use file_sheet::{ByteSource, FileSheet, VecSource};
 pub use row_index::{RowIndex, RowIndexBuilder};
 pub use sheet::{MemorySheet, Sheet};
 
@@ -167,14 +169,22 @@ impl<'a> SortKey<'a> {
 /// `view` sorted by column `sort_by.0` of the rows it points at (stable).
 /// Numeric cells sort by value (`2` < `10`), ahead of non-numeric ones.
 pub fn sort_indices(master: &SheetVec, view: View, sort_by: (usize, SortOrder)) -> View {
-    let mut keyed: Vec<(SortKey, u32)> = view
+    let items = view
         .into_iter()
-        .map(|i| {
-            let cell = master[i as usize].1.get(sort_by.0).unwrap_or_default();
-            (SortKey::parse(cell), i)
-        })
+        .map(|i| (master[i as usize].1.get(sort_by.0).unwrap_or_default(), i))
         .collect();
-    match sort_by.1 {
+    sort_cells(items, sort_by.1)
+}
+
+/// Order `(cell text, row position)` pairs by cell (stable; numbers by value
+/// before text) and return the positions. Shared by every `Sheet` backend so
+/// they all order identically.
+pub(crate) fn sort_cells(items: Vec<(&str, u32)>, order: SortOrder) -> View {
+    let mut keyed: Vec<(SortKey, u32)> = items
+        .into_iter()
+        .map(|(c, i)| (SortKey::parse(c), i))
+        .collect();
+    match order {
         SortOrder::Asc => keyed.sort_by(|a, b| a.0.cmp(&b.0)),
         SortOrder::Dsc => keyed.sort_by(|a, b| b.0.cmp(&a.0)),
     }

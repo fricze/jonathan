@@ -264,6 +264,13 @@ mod tests {
         assert_eq!(s.sort(vec![0, 1, 2], (0, SortOrder::Asc)), vec![1, 0, 2]);
     }
 
+    #[test]
+    fn empty_needle_matches_a_row_with_no_cells() {
+        let s = sheet(&[(0, &["a"]), (1, &[])]);
+        assert_eq!(s.filter(""), vec![0, 1]);
+        assert_eq!(s.filter("a"), vec![0]);
+    }
+
     fn make_memory(rows: SheetVec) -> Box<dyn Sheet> {
         Box::new(MemorySheet::new(rows))
     }
