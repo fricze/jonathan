@@ -88,7 +88,7 @@ Each step: write the failing tests, run them red, implement, run green, commit.
 2. **FileSheet read-only** (DONE) on `VecSource`: `len`, `row_id == position`,
    `cell`, `record`, ragged rows, invalid UTF-8, out-of-range -> `None`, cache
    returns the same values as a cold read. Conformance (read-only subset) green.
-3. **Cell edits**: `set_cell` + read-back, edit then snapshot isolation,
+3. **Cell edits** (DONE): `set_cell` + read-back, edit then snapshot isolation,
    `set_cell` on a missing row/col returns `false`.
 4. **Structural edits**: `remove_row` / `insert_row` / `position_of`, id
    stability, remove-then-reinsert round trip (mirrors the app's undo tests),

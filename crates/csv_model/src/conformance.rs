@@ -49,6 +49,52 @@ pub fn run_read_only(make: &Make) {
     sort_orders_numbers_by_value_then_text(make);
 }
 
+/// The slice of the edit contract that only needs `set_cell`.
+pub fn run_cell_edits(make: &Make) {
+    set_cell_in_place(make);
+    snapshot_is_isolated_from_cell_edits(make);
+}
+
+fn set_cell_in_place(make: &Make) {
+    let mut s = make(rows_of(&[&["a", "b"], &["c", "d"], &["e"]]));
+    assert!(s.set_cell(1, 1, "X"));
+    assert_eq!(fields(s.as_ref(), 1), Some(vec!["c".into(), "X".into()]));
+    assert_eq!(
+        fields(s.as_ref(), 0),
+        Some(vec!["a".into(), "b".into()]),
+        "neighbours untouched"
+    );
+    assert!(s.set_cell(1, 1, "Y"), "same cell again");
+    assert_eq!(s.cell(1, 1).as_deref(), Some("Y"));
+    assert!(!s.set_cell(9, 0, "no"), "missing row id");
+    assert!(!s.set_cell(2, 1, "no"), "column past the row's end");
+    assert_eq!(
+        fields(s.as_ref(), 2),
+        Some(vec!["e".into()]),
+        "failed edits change nothing"
+    );
+    assert!(s.set_cell(0, 0, "multi\nline, \"quoted\""));
+    assert_eq!(s.cell(0, 0).as_deref(), Some("multi\nline, \"quoted\""));
+    assert!(s.set_cell(0, 0, ""));
+    assert_eq!(s.cell(0, 0).as_deref(), Some(""));
+    assert_eq!(s.len(), 3);
+}
+
+fn snapshot_is_isolated_from_cell_edits(make: &Make) {
+    let mut s = make(rows_of(&[&["a"], &["b"]]));
+    s.set_cell(0, 0, "first");
+    let snap = s.snapshot();
+    s.set_cell(0, 0, "second");
+    s.set_cell(1, 0, "other");
+    assert_eq!(
+        snap.cell(0, 0).as_deref(),
+        Some("first"),
+        "edit made after the snapshot"
+    );
+    assert_eq!(snap.cell(1, 0).as_deref(), Some("b"));
+    assert_eq!(s.cell(0, 0).as_deref(), Some("second"));
+}
+
 pub fn run_edits(make: &Make) {
     set_cell_by_id(make);
     remove_and_reinsert_row_restores_order_and_id(make);
@@ -319,6 +365,16 @@ pub fn ops() -> impl Strategy<Value = Vec<Op>> {
         2 => (0usize..8).prop_map(|position| Op::ReinsertRemovedRow { position }),
         2 => (0usize..5).prop_map(|col| Op::RemoveColumn { col }),
         2 => (0usize..6, any::<bool>()).prop_map(|(col, restore)| Op::InsertColumn { col, restore }),
+        1 => Just(Op::Snapshot),
+    ];
+    prop::collection::vec(op, 0..40)
+}
+
+/// Only the ops a backend with just `set_cell` can do.
+pub fn cell_edit_ops() -> impl Strategy<Value = Vec<Op>> {
+    let op = prop_oneof![
+        4 => (any::<usize>(), 0usize..5, text()).prop_map(|(pick, col, value)| Op::SetCell { pick, col, value }),
+        1 => (0usize..5).prop_map(|col| Op::SetCellMissingRow { col }),
         1 => Just(Op::Snapshot),
     ];
     prop::collection::vec(op, 0..40)

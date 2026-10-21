@@ -68,6 +68,12 @@ pub struct FileSheet {
     index: Arc<RowIndex>,
     delimiter: u8,
     cache: Arc<Mutex<RowCache>>,
+    /// Rows changed since load, keyed by row id. The file itself is never
+    /// written. A row is copied in here the first time one of its cells is
+    /// edited and read from here ever after, so the cache cannot serve it
+    /// stale. `Arc` makes a snapshot share the copies until either side
+    /// edits one (`Arc::make_mut` then copies it).
+    edited: HashMap<usize, Arc<StringRecord>>,
 }
 
 impl FileSheet {
@@ -106,6 +112,7 @@ impl FileSheet {
                 order: VecDeque::new(),
                 capacity,
             })),
+            edited: HashMap::new(),
         })
     }
 
@@ -139,8 +146,26 @@ impl FileSheet {
         )
     }
 
-    /// `read_row` through the cache.
+    /// Row id at `position`. Ids equal positions until rows can be inserted
+    /// or removed.
+    fn id_at(&self, position: usize) -> Option<usize> {
+        (position < self.index.len()).then_some(position)
+    }
+
+    /// The row as the user sees it, bypassing the cache: the edited copy if
+    /// there is one, else straight from the file. Scans use this.
+    fn load_row(&self, position: usize) -> Option<Cow<'_, StringRecord>> {
+        match self.edited.get(&self.id_at(position)?) {
+            Some(edited) => Some(Cow::Borrowed(edited.as_ref())),
+            None => self.read_row(position).map(Cow::Owned),
+        }
+    }
+
+    /// The row as the user sees it, through the cache.
     fn row(&self, position: usize) -> Option<Arc<StringRecord>> {
+        if let Some(edited) = self.edited.get(&self.id_at(position)?) {
+            return Some(edited.clone());
+        }
         let lock = || self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(hit) = lock().rows.get(&position) {
             return Some(hit.clone());
@@ -178,8 +203,21 @@ impl Sheet for FileSheet {
         self.row(position).map(|r| Cow::Owned((*r).clone()))
     }
 
-    fn set_cell(&mut self, _row_id: usize, _col: usize, _value: &str) -> bool {
-        todo!("FileSheet edits")
+    fn set_cell(&mut self, row_id: usize, col: usize, value: &str) -> bool {
+        // Ids equal positions for now (see `id_at`).
+        let Some(current) = self.row(row_id) else {
+            return false;
+        };
+        if col >= current.len() {
+            return false;
+        }
+        let rewritten: StringRecord = current
+            .iter()
+            .enumerate()
+            .map(|(i, f)| if i == col { value } else { f })
+            .collect();
+        self.edited.insert(row_id, Arc::new(rewritten));
+        true
     }
 
     fn remove_row(&mut self, _position: usize) -> Option<SheetRow> {
@@ -205,7 +243,7 @@ impl Sheet for FileSheet {
             .filter(|&p| {
                 needle.is_empty()
                     || self
-                        .read_row(p)
+                        .load_row(p)
                         .is_some_and(|r| r.iter().any(|c| c.contains(needle)))
             })
             .map(|p| p as u32)
@@ -217,7 +255,7 @@ impl Sheet for FileSheet {
             .into_iter()
             .map(|p| {
                 let text = self
-                    .read_row(p as usize)
+                    .load_row(p as usize)
                     .and_then(|r| r.get(sort_by.0).map(str::to_string))
                     .unwrap_or_default();
                 (text, p)
@@ -455,6 +493,105 @@ mod tests {
     }
 
     #[test]
+    fn edited_cell_reads_back_through_cell_and_record() {
+        let mut s = open(b"h1,h2\n1,2\n3,4\n", true);
+        assert!(s.set_cell(1, 0, "X"));
+        assert_eq!(s.cell(1, 0).as_deref(), Some("X"));
+        assert_eq!(strs(&s, 1), Some(vec!["X".into(), "4".into()]));
+        assert_eq!(
+            strs(&s, 0),
+            Some(vec!["1".into(), "2".into()]),
+            "other rows untouched"
+        );
+    }
+
+    #[test]
+    fn editing_a_row_that_is_already_cached_shows_the_new_value() {
+        let mut s = open(b"1,2\n3,4\n", false);
+        assert_eq!(s.cell(0, 0).as_deref(), Some("1")); // now cached
+        s.set_cell(0, 0, "new");
+        assert_eq!(s.cell(0, 0).as_deref(), Some("new"));
+        assert_eq!(strs(&s, 0), Some(vec!["new".into(), "2".into()]));
+    }
+
+    #[test]
+    fn a_row_edited_twice_keeps_both_edits() {
+        let mut s = open(b"1,2\n", false);
+        s.set_cell(0, 0, "a");
+        s.set_cell(0, 1, "b");
+        assert_eq!(strs(&s, 0), Some(vec!["a".into(), "b".into()]));
+    }
+
+    #[test]
+    fn edited_rows_are_served_from_memory_not_re_read() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let src = Arc::new(Counting(
+            VecSource(b"1,2\n3,4\n".to_vec()),
+            Default::default(),
+        ));
+        let mut s = FileSheet::with_cache_capacity(src.clone(), b',', false, 0).unwrap();
+        s.set_cell(0, 0, "x");
+        let after_edit = src.1.load(Relaxed);
+        for _ in 0..5 {
+            s.cell(0, 0);
+            s.cell(0, 1);
+        }
+        assert_eq!(
+            src.1.load(Relaxed),
+            after_edit,
+            "even with the row cache off"
+        );
+    }
+
+    #[test]
+    fn a_failed_edit_does_not_create_or_change_anything() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let src = Arc::new(Counting(
+            VecSource(b"1,2\n3\n".to_vec()),
+            Default::default(),
+        ));
+        let mut s = FileSheet::with_cache_capacity(src.clone(), b',', false, 0).unwrap();
+        assert!(!s.set_cell(7, 0, "x"), "no such row");
+        assert!(!s.set_cell(1, 1, "x"), "column past the end of a short row");
+        assert_eq!(strs(&s, 1), Some(vec!["3".into()]));
+        let before = src.1.load(Relaxed);
+        s.cell(1, 0);
+        assert_eq!(
+            src.1.load(Relaxed),
+            before + 1,
+            "row 1 still comes from the file"
+        );
+    }
+
+    #[test]
+    fn a_row_that_cannot_be_read_cannot_be_edited() {
+        let src = Arc::new(Shrinks(VecSource(b"1,2\n".to_vec()), Default::default()));
+        let mut s = FileSheet::new(src.clone(), b',', false).unwrap();
+        src.1.store(true, std::sync::atomic::Ordering::Relaxed);
+        assert!(!s.set_cell(0, 0, "x"));
+    }
+
+    #[test]
+    fn filter_sees_edited_text_not_the_old_text() {
+        let mut s = open(b"apple\nbanana\n", false);
+        s.set_cell(0, 0, "cherry");
+        assert_eq!(s.filter("cherry"), vec![0]);
+        assert_eq!(s.filter("apple"), Vec::<u32>::new());
+    }
+
+    #[test]
+    fn sort_orders_by_edited_text() {
+        let mut s = open(b"1\n2\n3\n", false);
+        s.set_cell(0, 0, "9");
+        assert_eq!(s.sort(vec![0, 1, 2], (0, SortOrder::Asc)), vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn cell_edit_contract_holds() {
+        conformance::run_cell_edits(MAKE);
+    }
+
+    #[test]
     fn read_only_contract_holds() {
         conformance::run_read_only(MAKE);
     }
@@ -465,6 +602,14 @@ mod tests {
         #[test]
         fn loads_exactly_what_a_memory_sheet_holds(initial in conformance::initial_rows()) {
             conformance::check_ops(MAKE, &initial, &[]);
+        }
+
+        #[test]
+        fn random_cell_edits_match_the_reference_model(
+            initial in conformance::initial_rows(),
+            ops in conformance::cell_edit_ops(),
+        ) {
+            conformance::check_ops(MAKE, &initial, &ops);
         }
 
         #[test]
