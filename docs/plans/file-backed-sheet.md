@@ -93,7 +93,7 @@ Each step: write the failing tests, run them red, implement, run green, commit.
 4. **Structural edits** (DONE): `remove_row` / `insert_row` / `position_of`, id
    stability, remove-then-reinsert round trip (mirrors the app's undo tests),
    insert past the end clamps. Full conformance + property test green.
-5. **Column ops** via `ColSource`: remove/insert round trip returns the same
+5. **Column ops** (DONE) via `ColSource`: remove/insert round trip returns the same
    values, insert at 0 / middle / end, ragged rows.
 6. **filter / sort** equal to `MemorySheet` on random data (property test),
    including edited and inserted rows, needles containing delimiters/quotes
@@ -150,3 +150,17 @@ Each step: write the failing tests, run them red, implement, run green, commit.
   `next_row_id` scan it once it exists; after the first structural edit memory
   is ~16 bytes/row (index + order). Candidates if it matters: u32 ids, or a
   tree/gap structure instead of a flat Vec.
+- Step 5 changed the design: instead of a column-source list, column edits are
+  an **operation log** (`ColOp::Remove` / `ColOp::Insert`) replayed on every
+  row read from the file. Reason: the contract clamps `insert_column` to each
+  row's own length, so ragged rows need the same per-row sequence of
+  operations a plain in-memory sheet applies; a global column list cannot
+  express that. `edited` rows hold post-log content and are updated eagerly
+  when an op is added. The row cache is keyed by (id, log length) because it is
+  shared with snapshots that may sit at an earlier point in the log.
+  Costs: every file-row read replays the whole log (cheap for a handful of
+  ops, worth compacting if logs get long); `remove_column` reads the column
+  from every row to return undo values (O(rows) disk reads).
+- All of `conformance::run_all` plus the full random-operation test now pass
+  for `FileSheet`. Remaining before it can replace `MemorySheet` in the app:
+  optimised filter/sort (6), save (7), a real file `ByteSource` (8), wiring (9).

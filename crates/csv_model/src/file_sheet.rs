@@ -42,21 +42,59 @@ const DEFAULT_CACHE_ROWS: usize = 1024;
 /// Recently parsed rows, oldest evicted first. The table asks for the same
 /// visible rows every frame, once per cell; this keeps that from re-reading
 /// and re-parsing the row for each one.
+///
+/// Keyed by (row id, number of column operations applied): the cached row is
+/// the file row *after* those operations, and the cache is shared with
+/// snapshots, which may be at an earlier point in the column history.
+type CacheKey = (usize, usize);
+
 struct RowCache {
-    rows: HashMap<usize, Arc<StringRecord>>,
-    order: VecDeque<usize>,
+    rows: HashMap<CacheKey, Arc<StringRecord>>,
+    order: VecDeque<CacheKey>,
     capacity: usize,
 }
 
 impl RowCache {
-    fn insert(&mut self, position: usize, row: Arc<StringRecord>) {
-        if self.capacity == 0 || self.rows.insert(position, row).is_some() {
+    fn insert(&mut self, key: CacheKey, row: Arc<StringRecord>) {
+        if self.capacity == 0 || self.rows.insert(key, row).is_some() {
             return;
         }
-        self.order.push_back(position);
+        self.order.push_back(key);
         while self.order.len() > self.capacity {
             if let Some(old) = self.order.pop_front() {
                 self.rows.remove(&old);
+            }
+        }
+    }
+}
+
+/// A column insert or remove, replayed lazily on every row read from the
+/// file. Per-row (not a global column list) because the contract clamps
+/// inserts to each row's own length, so ragged rows must see the same
+/// sequence of operations a plain in-memory sheet would apply to them.
+#[derive(Clone)]
+enum ColOp {
+    Remove(usize),
+    Insert {
+        col: usize,
+        values: Arc<HashMap<usize, String>>,
+    },
+}
+
+impl ColOp {
+    fn apply(&self, id: usize, row: &StringRecord) -> StringRecord {
+        match self {
+            ColOp::Remove(col) => row
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| i != col)
+                .map(|(_, f)| f)
+                .collect(),
+            ColOp::Insert { col, values } => {
+                let mut fields: Vec<&str> = row.iter().collect();
+                let at = (*col).min(fields.len());
+                fields.insert(at, values.get(&id).map_or("", String::as_str));
+                fields.into_iter().collect()
             }
         }
     }
@@ -81,6 +119,10 @@ pub struct FileSheet {
     order: Option<Arc<Vec<usize>>>,
     /// File rows (ids below the row count) that have been removed.
     removed: HashSet<usize>,
+    /// Column operations since load, oldest first. Rows read from the file
+    /// have all of them applied; rows in `edited` already do (they are
+    /// updated when an operation is added). Shared with snapshots.
+    col_ops: Arc<Vec<ColOp>>,
 }
 
 impl FileSheet {
@@ -122,6 +164,7 @@ impl FileSheet {
             edited: HashMap::new(),
             order: None,
             removed: HashSet::new(),
+            col_ops: Arc::new(Vec::new()),
         })
     }
 
@@ -175,10 +218,13 @@ impl FileSheet {
         if let Some(edited) = self.edited.get(&id) {
             return Some(Cow::Borrowed(edited.as_ref()));
         }
-        self.is_live_file_row(id)
-            .then(|| self.read_row(id))
-            .flatten()
-            .map(Cow::Owned)
+        if !self.is_live_file_row(id) {
+            return None;
+        }
+        let raw = self.read_row(id)?;
+        Some(Cow::Owned(
+            self.col_ops.iter().fold(raw, |row, op| op.apply(id, &row)),
+        ))
     }
 
     fn load_row(&self, position: usize) -> Option<Cow<'_, StringRecord>> {
@@ -194,17 +240,28 @@ impl FileSheet {
         if !self.is_live_file_row(id) {
             return None;
         }
+        let key = (id, self.col_ops.len());
         let lock = || self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(hit) = lock().rows.get(&id) {
+        if let Some(hit) = lock().rows.get(&key) {
             return Some(hit.clone());
         }
-        let row = Arc::new(self.read_row(id)?);
-        lock().insert(id, row.clone());
+        let raw = self.read_row(id)?;
+        let row = Arc::new(self.col_ops.iter().fold(raw, |row, op| op.apply(id, &row)));
+        lock().insert(key, row.clone());
         Some(row)
     }
 
     fn row(&self, position: usize) -> Option<Arc<StringRecord>> {
         self.row_by_id(self.id_at(position)?)
+    }
+
+    /// Record a column operation: future file reads replay it, and rows
+    /// already copied into `edited` are updated now.
+    fn push_col_op(&mut self, op: ColOp) {
+        for (id, row) in self.edited.iter_mut() {
+            *row = Arc::new(op.apply(*id, row));
+        }
+        Arc::make_mut(&mut self.col_ops).push(op);
     }
 
     /// The order list, built as `0..n` on first use and copied if a
@@ -291,12 +348,26 @@ impl Sheet for FileSheet {
         self.edited.insert(id, Arc::new(record));
     }
 
-    fn remove_column(&mut self, _col: usize) -> Vec<(usize, String)> {
-        todo!("FileSheet edits")
+    fn remove_column(&mut self, col: usize) -> Vec<(usize, String)> {
+        // Collect first, from the rows as they are now. Rows that cannot be
+        // read from the file are skipped (they have no value to hand back).
+        let removed = (0..self.len())
+            .filter_map(|position| {
+                let id = self.id_at(position)?;
+                let row = self.load_by_id(id)?;
+                row.get(col).map(|value| (id, value.to_string()))
+            })
+            .collect();
+        self.push_col_op(ColOp::Remove(col));
+        removed
     }
 
-    fn insert_column(&mut self, _col: usize, _values_by_row: &[(usize, String)]) {
-        todo!("FileSheet edits")
+    fn insert_column(&mut self, col: usize, values_by_row: &[(usize, String)]) {
+        let values = values_by_row.iter().cloned().collect();
+        self.push_col_op(ColOp::Insert {
+            col,
+            values: Arc::new(values),
+        });
     }
 
     // Scans bypass the cache: a pass over every row would otherwise evict
@@ -780,6 +851,83 @@ mod tests {
     }
 
     #[test]
+    fn removing_a_column_returns_values_in_display_order_for_every_kind_of_row() {
+        let mut s = open(b"a,1\nb,2\nc,3\n", false);
+        s.set_cell(2, 1, "EDITED");
+        s.insert_row(1, (9, StringRecord::from(vec!["ins", "ert"])));
+        let removed = s.remove_column(1);
+        assert_eq!(
+            removed,
+            vec![
+                (0, "1".to_string()),
+                (9, "ert".to_string()),
+                (1, "2".to_string()),
+                (2, "EDITED".to_string())
+            ]
+        );
+        assert_eq!(first_cells(&s), ["a", "ins", "b", "c"]);
+        assert_eq!(s.cell(0, 1), None);
+    }
+
+    #[test]
+    fn edits_made_before_a_column_op_follow_it() {
+        let mut s = open(b"a,b,c\n", false);
+        s.set_cell(0, 2, "C!");
+        s.remove_column(0);
+        assert_eq!(strs(&s, 0), Some(vec!["b".into(), "C!".into()]));
+        s.insert_column(0, &[]);
+        assert_eq!(strs(&s, 0), Some(vec!["".into(), "b".into(), "C!".into()]));
+    }
+
+    #[test]
+    fn cell_edits_after_a_column_op_address_the_new_columns() {
+        let mut s = open(b"a,b,c\n", false);
+        s.remove_column(0);
+        assert!(s.set_cell(0, 0, "B"));
+        assert!(!s.set_cell(0, 2, "no"), "only two columns are left");
+        assert_eq!(strs(&s, 0), Some(vec!["B".into(), "c".into()]));
+    }
+
+    #[test]
+    fn a_cached_row_is_not_served_stale_after_a_column_op() {
+        let mut s = open(b"a,b\nc,d\n", false);
+        assert_eq!(s.cell(0, 0).as_deref(), Some("a")); // cached
+        s.remove_column(0);
+        assert_eq!(s.cell(0, 0).as_deref(), Some("b"));
+        s.insert_column(0, &[]);
+        assert_eq!(s.cell(0, 0).as_deref(), Some(""));
+    }
+
+    #[test]
+    fn a_snapshot_never_sees_rows_cached_under_a_newer_column_layout() {
+        let mut s = open(b"a,b\n", false);
+        let snap = s.snapshot();
+        s.remove_column(0);
+        assert_eq!(s.cell(0, 0).as_deref(), Some("b")); // fills the shared cache
+        assert_eq!(snap.cell(0, 0).as_deref(), Some("a"));
+        assert_eq!(snap.cell(0, 1).as_deref(), Some("b"));
+    }
+
+    #[test]
+    fn filter_and_sort_use_the_current_columns() {
+        let mut s = open(b"x,3\ny,1\nz,2\n", false);
+        s.remove_column(0);
+        assert_eq!(s.filter("x"), Vec::<u32>::new());
+        assert_eq!(s.filter("3"), vec![0]);
+        assert_eq!(s.sort(vec![0, 1, 2], (0, SortOrder::Asc)), vec![1, 2, 0]);
+    }
+
+    #[test]
+    fn column_edit_contract_holds() {
+        conformance::run_column_edits(MAKE);
+    }
+
+    #[test]
+    fn the_whole_sheet_contract_holds() {
+        conformance::run_all(MAKE);
+    }
+
+    #[test]
     fn row_edit_contract_holds() {
         conformance::run_row_edits(MAKE);
     }
@@ -806,6 +954,14 @@ mod tests {
         fn random_cell_edits_match_the_reference_model(
             initial in conformance::initial_rows(),
             ops in conformance::cell_edit_ops(),
+        ) {
+            conformance::check_ops(MAKE, &initial, &ops);
+        }
+
+        #[test]
+        fn random_column_row_and_cell_edits_match_the_reference_model(
+            initial in conformance::initial_rows(),
+            ops in conformance::ops(),
         ) {
             conformance::check_ops(MAKE, &initial, &ops);
         }

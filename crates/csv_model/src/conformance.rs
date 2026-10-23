@@ -115,6 +115,90 @@ pub fn run_row_edits(make: &Make) {
 
 pub fn run_column_edits(make: &Make) {
     column_remove_insert_round_trip(make);
+    short_rows_get_inserted_fields_at_their_own_end(make);
+    removing_a_column_past_a_short_rows_end_leaves_it_alone(make);
+    column_ops_interleaved_with_row_and_cell_edits(make);
+    removing_every_column_leaves_empty_rows(make);
+    snapshot_is_isolated_from_column_edits(make);
+}
+
+fn short_rows_get_inserted_fields_at_their_own_end(make: &Make) {
+    let mut s = make(rows_of(&[&["a", "b", "c"], &["d"], &["e", "f"]]));
+    s.insert_column(2, &[(1, "x".to_string())]);
+    assert_eq!(
+        fields(s.as_ref(), 0),
+        Some(vec!["a".into(), "b".into(), "".into(), "c".into()])
+    );
+    assert_eq!(
+        fields(s.as_ref(), 1),
+        Some(vec!["d".into(), "x".into()]),
+        "clamped to the row's end"
+    );
+    assert_eq!(
+        fields(s.as_ref(), 2),
+        Some(vec!["e".into(), "f".into(), "".into()])
+    );
+}
+
+fn removing_a_column_past_a_short_rows_end_leaves_it_alone(make: &Make) {
+    let mut s = make(rows_of(&[&["a", "b", "c"], &["d"], &["e", "f"]]));
+    let removed = s.remove_column(1);
+    assert_eq!(
+        removed,
+        vec![(0, "b".to_string()), (2, "f".to_string())],
+        "no value from the 1-field row"
+    );
+    assert_eq!(fields(s.as_ref(), 1), Some(vec!["d".into()]));
+    assert_eq!(fields(s.as_ref(), 2), Some(vec!["e".into()]));
+    let removed = s.remove_column(5);
+    assert!(removed.is_empty());
+}
+
+fn column_ops_interleaved_with_row_and_cell_edits(make: &Make) {
+    let mut s = make(rows_of(&[&["a", "b"], &["c", "d"], &["e", "f"]]));
+    s.set_cell(0, 1, "B"); // edit before the column op
+    let gone = s.remove_row(1).unwrap();
+    let removed = s.remove_column(0);
+    assert_eq!(removed, vec![(0, "a".to_string()), (2, "e".to_string())]);
+    assert_eq!(
+        fields(s.as_ref(), 0),
+        Some(vec!["B".into()]),
+        "earlier edit followed the column op"
+    );
+    s.insert_row(1, (7, StringRecord::from(vec!["new"]))); // logical row, as the app would hand it back
+    s.insert_column(0, &removed);
+    assert_eq!(fields(s.as_ref(), 0), Some(vec!["a".into(), "B".into()]));
+    assert_eq!(fields(s.as_ref(), 1), Some(vec!["".into(), "new".into()]));
+    assert_eq!(fields(s.as_ref(), 2), Some(vec!["e".into(), "f".into()]));
+    s.insert_row(1, gone); // the row removed before the column ops goes back as it was handed out
+    assert_eq!(fields(s.as_ref(), 1), Some(vec!["c".into(), "d".into()]));
+    assert!(s.set_cell(2, 0, "NEW"));
+    assert_eq!(s.cell(3, 0).as_deref(), Some("NEW"));
+}
+
+fn removing_every_column_leaves_empty_rows(make: &Make) {
+    let mut s = make(rows_of(&[&["a"], &["b"]]));
+    let removed = s.remove_column(0);
+    assert_eq!(removed.len(), 2);
+    assert_eq!(s.len(), 2);
+    assert_eq!(fields(s.as_ref(), 0), Some(vec![]));
+    assert_eq!(s.cell(0, 0), None);
+    assert_eq!(s.filter(""), vec![0, 1]);
+    s.insert_column(0, &removed);
+    assert_eq!(fields(s.as_ref(), 1), Some(vec!["b".into()]));
+}
+
+fn snapshot_is_isolated_from_column_edits(make: &Make) {
+    let mut s = make(rows_of(&[&["a", "b"], &["c", "d"]]));
+    s.cell(0, 0);
+    s.cell(1, 1); // warm anything the backend caches
+    let snap = s.snapshot();
+    s.remove_column(0);
+    s.insert_column(1, &[(0, "zz".to_string())]);
+    assert_eq!(fields(snap.as_ref(), 0), Some(vec!["a".into(), "b".into()]));
+    assert_eq!(fields(snap.as_ref(), 1), Some(vec!["c".into(), "d".into()]));
+    assert_eq!(snap.cell(1, 1).as_deref(), Some("d"));
+    assert_eq!(fields(s.as_ref(), 0), Some(vec!["b".into(), "zz".into()]));
 }
 
 fn removing_the_largest_id_lowers_next_row_id(make: &Make) {
