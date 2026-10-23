@@ -5,7 +5,7 @@
 //! filter, sort, snapshot. Edits arrive in the next steps.
 
 use std::borrow::Cow;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::sync::{Arc, Mutex};
 
@@ -70,10 +70,17 @@ pub struct FileSheet {
     cache: Arc<Mutex<RowCache>>,
     /// Rows changed since load, keyed by row id. The file itself is never
     /// written. A row is copied in here the first time one of its cells is
-    /// edited and read from here ever after, so the cache cannot serve it
-    /// stale. `Arc` makes a snapshot share the copies until either side
-    /// edits one (`Arc::make_mut` then copies it).
+    /// edited (or when it is inserted, or put back after a removal) and is
+    /// read from here ever after, so the cache cannot serve it stale. `Arc`
+    /// makes a snapshot share the copies until either side edits one
+    /// (`Arc::make_mut` then copies it).
     edited: HashMap<usize, Arc<StringRecord>>,
+    /// Display order as row ids. `None` means untouched: position == id, and
+    /// nothing is stored. The first insert or remove builds `0..n` and every
+    /// later one edits it. Shared with snapshots until either side edits it.
+    order: Option<Arc<Vec<usize>>>,
+    /// File rows (ids below the row count) that have been removed.
+    removed: HashSet<usize>,
 }
 
 impl FileSheet {
@@ -113,13 +120,15 @@ impl FileSheet {
                 capacity,
             })),
             edited: HashMap::new(),
+            order: None,
+            removed: HashSet::new(),
         })
     }
 
-    /// Read and parse the row at `position` straight from the source. `None`
+    /// Read and parse file row `file_row` straight from the source. `None`
     /// if there is no such row or its bytes can no longer be read.
-    fn read_row(&self, position: usize) -> Option<StringRecord> {
-        let range = self.index.row_range(position)?;
+    fn read_row(&self, file_row: usize) -> Option<StringRecord> {
+        let range = self.index.row_range(file_row)?;
         let mut bytes = vec![0u8; (range.end - range.start) as usize];
         let mut filled = 0;
         while filled < bytes.len() {
@@ -146,51 +155,94 @@ impl FileSheet {
         )
     }
 
-    /// Row id at `position`. Ids equal positions until rows can be inserted
-    /// or removed.
+    /// Row id at display `position`.
     fn id_at(&self, position: usize) -> Option<usize> {
-        (position < self.index.len()).then_some(position)
-    }
-
-    /// The row as the user sees it, bypassing the cache: the edited copy if
-    /// there is one, else straight from the file. Scans use this.
-    fn load_row(&self, position: usize) -> Option<Cow<'_, StringRecord>> {
-        match self.edited.get(&self.id_at(position)?) {
-            Some(edited) => Some(Cow::Borrowed(edited.as_ref())),
-            None => self.read_row(position).map(Cow::Owned),
+        match &self.order {
+            Some(order) => order.get(position).copied(),
+            None => (position < self.index.len()).then_some(position),
         }
     }
 
-    /// The row as the user sees it, through the cache.
-    fn row(&self, position: usize) -> Option<Arc<StringRecord>> {
-        if let Some(edited) = self.edited.get(&self.id_at(position)?) {
+    /// Whether `id` names a file row that is still part of the sheet and has
+    /// not been replaced by an edited copy.
+    fn is_live_file_row(&self, id: usize) -> bool {
+        id < self.index.len() && !self.removed.contains(&id)
+    }
+
+    /// The row with `id` as the user sees it, bypassing the cache: the edited
+    /// copy if there is one, else straight from the file. Scans use this.
+    fn load_by_id(&self, id: usize) -> Option<Cow<'_, StringRecord>> {
+        if let Some(edited) = self.edited.get(&id) {
+            return Some(Cow::Borrowed(edited.as_ref()));
+        }
+        self.is_live_file_row(id)
+            .then(|| self.read_row(id))
+            .flatten()
+            .map(Cow::Owned)
+    }
+
+    fn load_row(&self, position: usize) -> Option<Cow<'_, StringRecord>> {
+        self.load_by_id(self.id_at(position)?)
+    }
+
+    /// The row with `id` as the user sees it, through the cache (keyed by id,
+    /// not position, so inserts and removals never invalidate it).
+    fn row_by_id(&self, id: usize) -> Option<Arc<StringRecord>> {
+        if let Some(edited) = self.edited.get(&id) {
             return Some(edited.clone());
         }
+        if !self.is_live_file_row(id) {
+            return None;
+        }
         let lock = || self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(hit) = lock().rows.get(&position) {
+        if let Some(hit) = lock().rows.get(&id) {
             return Some(hit.clone());
         }
-        let row = Arc::new(self.read_row(position)?);
-        lock().insert(position, row.clone());
+        let row = Arc::new(self.read_row(id)?);
+        lock().insert(id, row.clone());
         Some(row)
+    }
+
+    fn row(&self, position: usize) -> Option<Arc<StringRecord>> {
+        self.row_by_id(self.id_at(position)?)
+    }
+
+    /// The order list, built as `0..n` on first use and copied if a
+    /// snapshot still shares it.
+    fn order_mut(&mut self) -> &mut Vec<usize> {
+        let n = self.index.len();
+        Arc::make_mut(self.order.get_or_insert_with(|| Arc::new((0..n).collect())))
+    }
+}
+
+#[cfg(test)]
+impl FileSheet {
+    fn order_is_materialized(&self) -> bool {
+        self.order.is_some()
     }
 }
 
 impl Sheet for FileSheet {
     fn len(&self) -> usize {
-        self.index.len()
+        self.order.as_ref().map_or(self.index.len(), |o| o.len())
     }
 
     fn row_id(&self, position: usize) -> Option<usize> {
-        (position < self.len()).then_some(position)
+        self.id_at(position)
     }
 
     fn position_of(&self, row_id: usize) -> Option<usize> {
-        self.row_id(row_id)
+        match &self.order {
+            Some(order) => order.iter().position(|&id| id == row_id),
+            None => (row_id < self.index.len()).then_some(row_id),
+        }
     }
 
     fn next_row_id(&self) -> usize {
-        self.len()
+        match &self.order {
+            Some(order) => order.iter().max().map_or(0, |m| m + 1),
+            None => self.index.len(),
+        }
     }
 
     fn cell(&self, position: usize, col: usize) -> Option<Cow<'_, str>> {
@@ -204,8 +256,7 @@ impl Sheet for FileSheet {
     }
 
     fn set_cell(&mut self, row_id: usize, col: usize, value: &str) -> bool {
-        // Ids equal positions for now (see `id_at`).
-        let Some(current) = self.row(row_id) else {
+        let Some(current) = self.row_by_id(row_id) else {
             return false;
         };
         if col >= current.len() {
@@ -220,12 +271,24 @@ impl Sheet for FileSheet {
         true
     }
 
-    fn remove_row(&mut self, _position: usize) -> Option<SheetRow> {
-        todo!("FileSheet edits")
+    fn remove_row(&mut self, position: usize) -> Option<SheetRow> {
+        // Read first: a row that can't be read can't be handed back for
+        // undo, so it stays where it is.
+        let id = self.id_at(position)?;
+        let record = (*self.row_by_id(id)?).clone();
+        self.order_mut().remove(position);
+        self.edited.remove(&id);
+        if id < self.index.len() {
+            self.removed.insert(id);
+        }
+        Some((id, record))
     }
 
-    fn insert_row(&mut self, _position: usize, _row: SheetRow) {
-        todo!("FileSheet edits")
+    fn insert_row(&mut self, position: usize, (id, record): SheetRow) {
+        let order = self.order_mut();
+        let at = position.min(order.len());
+        order.insert(at, id);
+        self.edited.insert(id, Arc::new(record));
     }
 
     fn remove_column(&mut self, _col: usize) -> Vec<(usize, String)> {
@@ -586,6 +649,141 @@ mod tests {
         assert_eq!(s.sort(vec![0, 1, 2], (0, SortOrder::Asc)), vec![1, 2, 0]);
     }
 
+    fn ids(s: &FileSheet) -> Vec<usize> {
+        (0..s.len()).map(|p| s.row_id(p).unwrap()).collect()
+    }
+
+    fn first_cells(s: &FileSheet) -> Vec<String> {
+        (0..s.len())
+            .map(|p| s.cell(p, 0).unwrap().into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn removing_a_middle_row_shifts_positions_but_not_ids() {
+        let mut s = open(b"a\nb\nc\nd\n", false);
+        let (id, rec) = s.remove_row(1).unwrap();
+        assert_eq!((id, rec.get(0)), (1, Some("b")));
+        assert_eq!(s.len(), 3);
+        assert_eq!(ids(&s), vec![0, 2, 3]);
+        assert_eq!(first_cells(&s), ["a", "c", "d"]);
+        assert_eq!(s.position_of(2), Some(1));
+        assert_eq!(s.position_of(1), None);
+    }
+
+    #[test]
+    fn removing_out_of_range_changes_nothing() {
+        let mut s = open(b"a\nb\n", false);
+        assert!(s.remove_row(2).is_none());
+        assert_eq!(ids(&s), vec![0, 1]);
+        assert!(
+            !s.order_is_materialized(),
+            "a failed removal builds nothing"
+        );
+    }
+
+    #[test]
+    fn remove_then_reinsert_puts_the_row_back_exactly() {
+        let mut s = open(b"a,1\nb,2\nc,3\n", false);
+        let row = s.remove_row(1).unwrap();
+        s.insert_row(1, row);
+        assert_eq!(ids(&s), vec![0, 1, 2]);
+        assert_eq!(strs(&s, 1), Some(vec!["b".into(), "2".into()]));
+        assert_eq!(s.position_of(1), Some(1));
+    }
+
+    #[test]
+    fn an_edited_row_survives_remove_and_reinsert() {
+        let mut s = open(b"a,1\nb,2\n", false);
+        s.set_cell(1, 1, "EDITED");
+        let row = s.remove_row(1).unwrap();
+        assert_eq!(row.1.get(1), Some("EDITED"));
+        s.insert_row(0, row);
+        assert_eq!(ids(&s), vec![1, 0]);
+        assert_eq!(strs(&s, 0), Some(vec!["b".into(), "EDITED".into()]));
+    }
+
+    #[test]
+    fn insert_at_start_middle_end_and_past_the_end() {
+        let mut s = open(b"a\nb\n", false);
+        s.insert_row(0, (10, StringRecord::from(vec!["start"])));
+        s.insert_row(2, (11, StringRecord::from(vec!["mid"])));
+        s.insert_row(4, (12, StringRecord::from(vec!["end"])));
+        s.insert_row(99, (13, StringRecord::from(vec!["clamped"])));
+        assert_eq!(
+            first_cells(&s),
+            ["start", "a", "mid", "b", "end", "clamped"]
+        );
+        assert_eq!(ids(&s), vec![10, 0, 11, 1, 12, 13]);
+        assert_eq!(s.next_row_id(), 14);
+    }
+
+    #[test]
+    fn an_inserted_row_is_editable_and_removable() {
+        let mut s = open(b"a\n", false);
+        s.insert_row(1, (5, StringRecord::from(vec!["x", "y"])));
+        assert!(s.set_cell(5, 1, "Y"));
+        assert_eq!(strs(&s, 1), Some(vec!["x".into(), "Y".into()]));
+        assert_eq!(s.remove_row(1).unwrap().0, 5);
+        assert_eq!(s.position_of(5), None);
+        assert!(!s.set_cell(5, 0, "gone"));
+    }
+
+    #[test]
+    fn a_removed_file_row_cannot_be_edited_until_it_is_reinserted() {
+        let mut s = open(b"a\nb\n", false);
+        let row = s.remove_row(0).unwrap();
+        assert!(!s.set_cell(0, 0, "x"));
+        s.insert_row(0, row);
+        assert!(s.set_cell(0, 0, "x"));
+    }
+
+    #[test]
+    fn the_order_list_is_only_built_by_the_first_structural_edit() {
+        let mut s = open(b"a\nb\n", false);
+        s.set_cell(0, 0, "edit");
+        s.filter("a");
+        s.snapshot();
+        assert!(!s.order_is_materialized());
+        s.remove_row(0);
+        assert!(s.order_is_materialized());
+    }
+
+    #[test]
+    fn rows_cached_before_a_shift_are_not_re_read_after_it() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let src = Arc::new(Counting(
+            VecSource(b"a\nb\nc\n".to_vec()),
+            Default::default(),
+        ));
+        let mut s = FileSheet::with_cache_capacity(src.clone(), b',', false, 8).unwrap();
+        s.cell(2, 0); // cache row id 2 while it is at position 2
+        s.remove_row(0); // row id 2 is now at position 1 (this reads row 0)
+        let before = src.1.load(Relaxed);
+        assert_eq!(s.cell(1, 0).as_deref(), Some("c"));
+        assert_eq!(
+            src.1.load(Relaxed),
+            before,
+            "served from the id-keyed cache"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_keeps_the_old_order() {
+        let mut s = open(b"a\nb\nc\n", false);
+        let snap = s.snapshot();
+        s.remove_row(0);
+        s.insert_row(0, (9, StringRecord::from(vec!["new"])));
+        assert_eq!(snap.len(), 3);
+        assert_eq!(snap.cell(0, 0).as_deref(), Some("a"));
+        assert_eq!(s.cell(0, 0).as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn row_edit_contract_holds() {
+        conformance::run_row_edits(MAKE);
+    }
+
     #[test]
     fn cell_edit_contract_holds() {
         conformance::run_cell_edits(MAKE);
@@ -608,6 +806,14 @@ mod tests {
         fn random_cell_edits_match_the_reference_model(
             initial in conformance::initial_rows(),
             ops in conformance::cell_edit_ops(),
+        ) {
+            conformance::check_ops(MAKE, &initial, &ops);
+        }
+
+        #[test]
+        fn random_row_edits_match_the_reference_model(
+            initial in conformance::initial_rows(),
+            ops in conformance::row_ops(),
         ) {
             conformance::check_ops(MAKE, &initial, &ops);
         }

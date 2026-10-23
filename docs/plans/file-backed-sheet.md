@@ -90,7 +90,7 @@ Each step: write the failing tests, run them red, implement, run green, commit.
    returns the same values as a cold read. Conformance (read-only subset) green.
 3. **Cell edits** (DONE): `set_cell` + read-back, edit then snapshot isolation,
    `set_cell` on a missing row/col returns `false`.
-4. **Structural edits**: `remove_row` / `insert_row` / `position_of`, id
+4. **Structural edits** (DONE): `remove_row` / `insert_row` / `position_of`, id
    stability, remove-then-reinsert round trip (mirrors the app's undo tests),
    insert past the end clamps. Full conformance + property test green.
 5. **Column ops** via `ColSource`: remove/insert round trip returns the same
@@ -143,3 +143,10 @@ Each step: write the failing tests, run them red, implement, run green, commit.
   the existing equality-with-`MemorySheet` property tests.
 - Step 2 left the five edit methods as `todo!()`; steps 3-5 replace them, so
   `FileSheet` must not be wired into the app before then.
+- Step 4 state: `order: Option<Arc<Vec<usize>>>` (identity until the first
+  insert/remove), `removed: HashSet` of file row ids, and the `edited` map now
+  also holds inserted and put-back rows. The row cache is keyed by id.
+  Known costs: insert/remove move the order list (O(rows)); `position_of` and
+  `next_row_id` scan it once it exists; after the first structural edit memory
+  is ~16 bytes/row (index + order). Candidates if it matters: u32 ids, or a
+  tree/gap structure instead of a flat Vec.

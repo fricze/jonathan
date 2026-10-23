@@ -96,11 +96,87 @@ fn snapshot_is_isolated_from_cell_edits(make: &Make) {
 }
 
 pub fn run_edits(make: &Make) {
+    run_cell_edits(make);
+    run_row_edits(make);
+    run_column_edits(make);
+    snapshot_is_isolated_from_later_edits(make);
+}
+
+/// The slice that needs `set_cell`, `remove_row` and `insert_row`.
+pub fn run_row_edits(make: &Make) {
     set_cell_by_id(make);
     remove_and_reinsert_row_restores_order_and_id(make);
     insert_row_clamps_to_end(make);
+    removing_the_largest_id_lowers_next_row_id(make);
+    inserted_rows_can_be_edited_and_removed(make);
+    row_edits_keep_filter_and_sort_in_step(make);
+    snapshot_is_isolated_from_row_edits(make);
+}
+
+pub fn run_column_edits(make: &Make) {
     column_remove_insert_round_trip(make);
-    snapshot_is_isolated_from_later_edits(make);
+}
+
+fn removing_the_largest_id_lowers_next_row_id(make: &Make) {
+    let mut s = make(rows_of(&[&["a"], &["b"], &["c"]]));
+    assert_eq!(s.next_row_id(), 3);
+    let last = s.remove_row(2).unwrap();
+    assert_eq!(s.next_row_id(), 2);
+    s.insert_row(2, last);
+    assert_eq!(s.next_row_id(), 3);
+    s.remove_row(0);
+    assert_eq!(s.next_row_id(), 3, "the largest id is still present");
+}
+
+fn inserted_rows_can_be_edited_and_removed(make: &Make) {
+    let mut s = make(rows_of(&[&["a"], &["b"]]));
+    s.insert_row(1, (7, StringRecord::from(vec!["new", "row"])));
+    assert_eq!(
+        (s.row_id(0), s.row_id(1), s.row_id(2)),
+        (Some(0), Some(7), Some(1))
+    );
+    assert_eq!(s.position_of(7), Some(1));
+    assert_eq!(s.position_of(1), Some(2));
+    assert!(s.set_cell(7, 1, "edited"));
+    assert_eq!(
+        fields(s.as_ref(), 1),
+        Some(vec!["new".into(), "edited".into()])
+    );
+    let gone = s.remove_row(1).unwrap();
+    assert_eq!((gone.0, gone.1.get(1)), (7, Some("edited")));
+    assert_eq!(s.len(), 2);
+    assert_eq!(s.position_of(7), None);
+    assert!(!s.set_cell(7, 0, "x"), "a removed row cannot be edited");
+    assert_eq!(s.position_of(1), Some(1));
+}
+
+fn row_edits_keep_filter_and_sort_in_step(make: &Make) {
+    let mut s = make(rows_of(&[&["b"], &["a"], &["c"]]));
+    s.remove_row(0);
+    s.insert_row(0, (9, StringRecord::from(vec!["zzz"])));
+    s.insert_row(3, (10, StringRecord::from(vec!["a2"])));
+    // positions now hold: zzz, a, c, a2
+    assert_eq!(s.filter("a"), vec![1, 3]);
+    assert_eq!(
+        s.sort(vec![0, 1, 2, 3], (0, SortOrder::Asc)),
+        vec![1, 3, 2, 0]
+    );
+}
+
+fn snapshot_is_isolated_from_row_edits(make: &Make) {
+    let mut s = make(rows_of(&[&["a"], &["b"], &["c"]]));
+    let snap = s.snapshot();
+    s.remove_row(0);
+    s.insert_row(0, (5, StringRecord::from(vec!["new"])));
+    s.set_cell(1, 0, "changed");
+    assert_eq!(snap.len(), 3);
+    assert_eq!(
+        (snap.row_id(0), snap.row_id(1), snap.row_id(2)),
+        (Some(0), Some(1), Some(2))
+    );
+    assert_eq!(snap.cell(0, 0).as_deref(), Some("a"));
+    assert_eq!(snap.cell(1, 0).as_deref(), Some("b"));
+    assert_eq!(snap.position_of(5), None);
 }
 
 fn empty_sheet(make: &Make) {
@@ -378,6 +454,20 @@ pub fn cell_edit_ops() -> impl Strategy<Value = Vec<Op>> {
         1 => Just(Op::Snapshot),
     ];
     prop::collection::vec(op, 0..40)
+}
+
+/// Cell edits plus row insert/remove/reinsert.
+pub fn row_ops() -> impl Strategy<Value = Vec<Op>> {
+    let op = prop_oneof![
+        3 => (any::<usize>(), 0usize..5, text()).prop_map(|(pick, col, value)| Op::SetCell { pick, col, value }),
+        1 => (0usize..5).prop_map(|col| Op::SetCellMissingRow { col }),
+        3 => (0usize..8).prop_map(|position| Op::RemoveRow { position }),
+        3 => (0usize..8, prop::collection::vec(text(), 1..4))
+            .prop_map(|(position, fields)| Op::InsertRow { position, fields }),
+        3 => (0usize..8).prop_map(|position| Op::ReinsertRemovedRow { position }),
+        1 => Just(Op::Snapshot),
+    ];
+    prop::collection::vec(op, 0..50)
 }
 
 pub fn initial_rows() -> impl Strategy<Value = Vec<Vec<String>>> {
