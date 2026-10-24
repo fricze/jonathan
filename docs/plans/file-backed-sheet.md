@@ -1,5 +1,10 @@
 # Plan: file-backed `Sheet` backend (TDD)
 
+> **Superseded by `docs/design/large-file-engine.md`.** Steps 0-5 below were
+> built as a correctness prototype without performance or memory budgets; the
+> design doc sets the budgets, measurements and revised plan. The contract
+> tests from steps 0-5 are kept.
+
 Goal: open files far larger than RAM with `MemorySheet`-level fidelity. The
 `Sheet` trait (`crates/csv_model/src/sheet.rs`) is the seam; this adds a second
 implementation, `FileSheet`, without touching `app.rs` beyond the load path.
