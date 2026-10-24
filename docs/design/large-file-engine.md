@@ -59,9 +59,49 @@ sandbox. Treat as order-of-magnitude, not benchmarks. Script:
 | `Vec<StringRecord>` in memory | **272 B/row = 3.7x the file text** |
 | Dense row index (current) | 8 B/row |
 
-**Not measured, and must be before the budgets are trusted:** cold-cache disk
-reads, positional reads vs mmap, parallel scaling of scans, sort cost, save
-throughput. Those are the first tasks in section 8.
+### 2.1 Second round: reads, scaling, sort, write
+
+4 GB / 55M rows synthetic file (same shape as above), 4 vCPU cloud sandbox,
+one run each. Source: `docs/design/spikes/`.
+
+| Question | Result |
+|---|---|
+| Sequential read + raw search, `pread`, warm | 64 KiB: 6.0 GB/s, 1 MiB: 5.6 GB/s, 8 MiB: 4.3 GB/s |
+| Same with `mmap`, warm | 7.8 GB/s |
+| Random 256-byte read, warm | `pread` **1.26 us**, `mmap` **0.11 us** |
+| Raw search scaling (1 / 2 / 4 threads) | 7.7 / 15.9 / 29.8 GB/s |
+| Row scan with `csv_core` (1 / 2 / 4 threads) | 10.1 / 20.9 / **45.1 M rows/s** (0.74 / 1.5 / 3.3 GB/s) |
+| Sort-key extraction, 1 thread | 8.2-9.7 M rows/s |
+| Sort 10.3M `(u64,u32)` keys | 0.5 s (1 thread), 0.2 s (4 threads) |
+| Sort 131M random keys, 4 threads | **2.7 s**, 2.1 GB of memory |
+| Re-serialise rows (parse + quote check + write), CPU only | **4.2 M rows/s** = 0.31 GB/s, 1 thread |
+| Raw copy of 4 GB to a new file | 0.15 GB/s - the sandbox disk, not the CPU |
+
+**Not valid (see `spikes/README.md`):** the "cold" read rows. The sandbox's
+`drop_caches`/`fadvise` did not evict (cold random reads cost the same as warm
+ones), so real cold-disk read throughput is **still unmeasured**, and so is
+real SSD write speed. Both are disk-bound and must be re-run on a laptop.
+Also unmeasured: parallel *index build* (needs quote-state speculation at
+chunk boundaries - the 45 M rows/s figure used chunks aligned by knowing the
+data has no newlines in quotes), sort tie-breaking cost when text prefixes
+collide, and a real 130M-row `sort` including extraction.
+
+What these numbers settle:
+* **`pread` over `mmap`.** `pread` is 8-10x slower per random access
+  (1.3 us vs 0.1 us) but that is 40x under the 50 us row budget, and it is
+  safe when the file is truncated or removed under us (mmap would crash the
+  app). Sequential `pread` at 64 KiB-1 MiB blocks is 5.6-6 GB/s, far above
+  any disk. Decision: positional reads, 1 MiB blocks; revisit only if
+  profiling shows the syscall cost.
+* **Scans scale almost linearly with threads** (4.5x on 4 for the row scan),
+  so filter/sort extraction should be parallel over chunks aligned at the
+  sparse-index samples, not left single-threaded.
+* **Sort is not the problem; extraction is.** 131M keys sort in 2.7 s; reading
+  and parsing the column is ~13 s on one thread, ~3-4 s on four. Estimated
+  10 GB sort: ~7-10 s warm, 2.1 GB transient.
+* **Save is disk-bound, not CPU-bound**, for the passthrough path
+  (`copy` at disk speed). Re-serialising every row (column edits) costs
+  ~31 s CPU for 131M rows on one thread and parallelises per piece.
 
 Consequences:
 * The current read path is ~170x slower than necessary. That is a design
@@ -81,14 +121,14 @@ Derived from section 1 and 2. Each is enforced by a test (section 7).
 | Row access (random) | <= 50 us (sample + <= 63 rows lean-parsed ~ 7 us) | U2 |
 | Visible window read (60 rows) | <= 1 ms, and *bytes read independent of file size* | U2 |
 | Index build | >= 400 MB/s warm; progressive; cancellable | U1 |
-| Filter, needle with no delimiter/quote | >= 3 GB/s (single pass of the buffer) | U3 |
-| Filter, general | >= 5M rows/s/thread | U3 |
-| Sort, one column | O(rows) time; 16 B/row transient; 10M rows < 10 s; cancellable | U4 |
+| Filter, needle with no delimiter/quote | >= 3 GB/s single thread, >= 12 GB/s on 4 threads when warm (measured 7.7 / 29.8); cold: disk-bound | U3 |
+| Filter, general (parse) | >= 5M rows/s/thread, near-linear to 4 threads (measured 10 / 45 M) | U3 |
+| Sort, one column | extraction >= 5M rows/s/thread, parallel; sort keys 16 B/row; 10M rows < 3 s warm, 131M rows < 15 s warm; cancellable (measured: 10M ~1.5 s single-thread, 131M keys sort 2.7 s) | U4 |
 | Cell/row/column edit, undo | O(1) or O(log edits); **zero file reads for column delete** | U5 |
 | Edit memory | proportional to number of edits | U8 |
 | Row cache | bounded by bytes (default 32 MB), not rows | U8 |
 | View (filter result) | 4 B per matching row | U8 |
-| Save | streaming; >= 150 MB/s or disk-bound; peak extra RAM O(1) | U6 |
+| Save | streaming; disk-bound for passthrough; re-serialise >= 2M rows/s/thread (measured 4.2); peak extra RAM O(1) | U6 |
 
 Steady-state RSS for a 500M-row file with no active filter: < 300 MB. With a
 filter matching every row it is ~2 GB (4 B/row view); acceptable for v1, and
@@ -200,6 +240,7 @@ runs the same way, so U1 holds.
   batches (the current returning-a-Vec versions remain as helpers for tests).
 * Add `fn health(&self) -> Option<IoProblem>` so the UI can show disk errors.
 * `ByteSource::read_at` errors propagate to `health`.
+Scans additionally take a thread count / use the shared worker pool.
 Everything else (`cell`, `record`, `set_cell`, `insert_row`, `remove_row`,
 `position_of`, `next_row_id`, `snapshot`) is unchanged, so `app.rs` barely moves.
 
@@ -252,10 +293,10 @@ before writing.
 
 ## 8. Plan
 
-1. **Spikes that close the unmeasured questions** (1-2 days of work, no
-   production code): cold-cache read throughput and pread vs mmap on a large
-   generated file; parallel scan scaling; sort of 10M rows by number and text;
-   write throughput. Update section 2 and the budgets with real numbers.
+1. **Spikes** - DONE for pread vs mmap, parallel scaling, sort, CPU cost of
+   re-serialise (section 2.1). STILL OPEN, needs a real laptop: cold-cache read
+   and real write throughput; parallel index build; text-prefix tie cost.
+   Run `docs/design/spikes`.
 2. **Decide D1-D5.**
 3. **Test infrastructure first:** counting allocator, instrumented source,
    file generator, perf harness with the budgets above (all failing).
