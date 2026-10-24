@@ -88,6 +88,7 @@ fn main() -> eframe::Result {
                     history: Default::default(),
                     next_row_id: HashMap::new(),
                     next_col_id: HashMap::new(),
+                    csv_formats: HashMap::new(),
                     agent_bridge: agent_bridge::AgentBridge::new(),
                 }))
             }),
