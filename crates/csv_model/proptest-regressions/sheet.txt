@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f6fd4969621ccd6bdfeb22ee41ebab9386eabccde6a439de26da8af801aefb54 # shrinks to initial = [], ops = [InsertRow { position: 0, fields: [] }, InsertColumn { col: 1, restore: false }]

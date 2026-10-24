@@ -59,7 +59,9 @@ pub trait Sheet: Send + Sync {
     fn remove_column(&mut self, col: usize) -> Vec<(usize, String)>;
 
     /// Insert a field at `col` into every row: the value from
-    /// `values_by_row` (keyed by row id) where present, empty otherwise.
+    /// `values_by_row` (keyed by row id) where present, empty otherwise. A row
+    /// with fewer than `col` fields is first padded with empty fields, so the
+    /// new column is at index `col` in every row.
     fn insert_column(&mut self, col: usize, values_by_row: &[(usize, String)]);
 
     /// Positions of rows with any cell containing `needle`.
@@ -160,7 +162,9 @@ impl Sheet for MemorySheet {
             .collect();
         for (id, record) in self.rows.iter_mut() {
             let mut fields: Vec<&str> = record.iter().collect();
-            fields.insert(col.min(fields.len()), values.get(id).copied().unwrap_or(""));
+            // A row shorter than `col` is padded so the new column lines up.
+            fields.resize(fields.len().max(col), "");
+            fields.insert(col, values.get(id).copied().unwrap_or(""));
             *record = fields.into_iter().collect();
         }
     }

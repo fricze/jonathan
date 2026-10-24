@@ -115,29 +115,53 @@ pub fn run_row_edits(make: &Make) {
 
 pub fn run_column_edits(make: &Make) {
     column_remove_insert_round_trip(make);
-    short_rows_get_inserted_fields_at_their_own_end(make);
+    short_rows_are_padded_so_inserted_columns_line_up(make);
     removing_a_column_past_a_short_rows_end_leaves_it_alone(make);
     column_ops_interleaved_with_row_and_cell_edits(make);
     removing_every_column_leaves_empty_rows(make);
     snapshot_is_isolated_from_column_edits(make);
 }
 
-fn short_rows_get_inserted_fields_at_their_own_end(make: &Make) {
-    let mut s = make(rows_of(&[&["a", "b", "c"], &["d"], &["e", "f"]]));
-    s.insert_column(2, &[(1, "x".to_string())]);
+/// A row shorter than the insertion point is treated as padded with empty
+/// fields, so the new column lines up with every other row.
+fn short_rows_are_padded_so_inserted_columns_line_up(make: &Make) {
+    let mut s = make(rows_of(&[
+        &["a", "b", "c"],
+        &["d"],
+        &["e", "f"],
+        &["g", "h", "i", "j"],
+    ]));
+    s.insert_column(2, &[(1, "x".to_string()), (2, "y".to_string())]);
     assert_eq!(
         fields(s.as_ref(), 0),
         Some(vec!["a".into(), "b".into(), "".into(), "c".into()])
     );
     assert_eq!(
         fields(s.as_ref(), 1),
-        Some(vec!["d".into(), "x".into()]),
-        "clamped to the row's end"
+        Some(vec!["d".into(), "".into(), "x".into()]),
+        "padded up to the column"
     );
     assert_eq!(
         fields(s.as_ref(), 2),
-        Some(vec!["e".into(), "f".into(), "".into()])
+        Some(vec!["e".into(), "f".into(), "y".into()]),
+        "exactly as long as the column index"
     );
+    assert_eq!(
+        fields(s.as_ref(), 3),
+        Some(vec![
+            "g".into(),
+            "h".into(),
+            "".into(),
+            "i".into(),
+            "j".into()
+        ])
+    );
+    for pos in 0..4 {
+        assert!(
+            s.cell(pos, 2).is_some(),
+            "every row has the new column at index 2"
+        );
+    }
 }
 
 fn removing_a_column_past_a_short_rows_end_leaves_it_alone(make: &Make) {
@@ -364,7 +388,7 @@ fn column_remove_insert_round_trip(make: &Make) {
         fields(s.as_ref(), 0),
         Some(vec!["".into(), "a".into(), "b".into(), "c".into()])
     );
-    s.insert_column(99, &[(0, "end".to_string())]);
+    s.insert_column(4, &[(0, "end".to_string())]); // one past the last column
     assert_eq!(s.cell(0, 4).as_deref(), Some("end"));
     assert_eq!(s.cell(1, 4).as_deref(), Some(""));
 }
@@ -476,7 +500,10 @@ impl RefModel {
                 .find(|(i, _)| i == id)
                 .map(|(_, v)| v.clone())
                 .unwrap_or_default();
-            f.insert(col.min(f.len()), v);
+            while f.len() < col {
+                f.push(String::new());
+            }
+            f.insert(col, v);
         }
     }
 }

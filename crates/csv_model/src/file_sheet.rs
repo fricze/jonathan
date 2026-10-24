@@ -69,9 +69,8 @@ impl RowCache {
 }
 
 /// A column insert or remove, replayed lazily on every row read from the
-/// file. Per-row (not a global column list) because the contract clamps
-/// inserts to each row's own length, so ragged rows must see the same
-/// sequence of operations a plain in-memory sheet would apply to them.
+/// file. (To be replaced by a column map now that short rows are padded
+/// rather than clamped; see docs/design/large-file-engine.md, 4.4.)
 #[derive(Clone)]
 enum ColOp {
     Remove(usize),
@@ -92,8 +91,9 @@ impl ColOp {
                 .collect(),
             ColOp::Insert { col, values } => {
                 let mut fields: Vec<&str> = row.iter().collect();
-                let at = (*col).min(fields.len());
-                fields.insert(at, values.get(&id).map_or("", String::as_str));
+                // Pad a short row so the new column lines up with the rest.
+                fields.resize(fields.len().max(*col), "");
+                fields.insert(*col, values.get(&id).map_or("", String::as_str));
                 fields.into_iter().collect()
             }
         }

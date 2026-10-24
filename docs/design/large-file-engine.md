@@ -115,7 +115,7 @@ relative order, so a file id is located by binary search over runs).
 `edited: HashMap<id, Arc<StringRecord>>` as now: copy-on-write rows, inserted
 rows and put-back rows. Memory ∝ edits. Snapshots share it by `Arc`.
 
-### 4.4 Columns: a column map (needs Decision D1)
+### 4.4 Columns: a column map (D1 decided: short rows are padded)
 Today column edits are an operation log replayed on every read (measured:
 ~0.24 us per row per logged operation, and `remove_column` scans the whole
 file to return undo values). Replace with a `ColumnMap`: a vector of
@@ -125,9 +125,13 @@ Undo of a column delete must not read the file, so `remove_column` returns an
 opaque *token* (MemorySheet: the values, as today; FileSheet: the column's
 source, O(1)) and `restore_column(col, token)` puts it back.
 
-This requires defining behaviour for ragged rows (D1), because the current
-contract clamps `insert_column` to each row's own length, which a column map
-cannot express.
+This needed a decision on ragged rows (D1), because the old contract clamped
+`insert_column` to each row's own length, which a column map cannot express.
+**Decided: a row shorter than the insertion column is treated as padded with
+empty fields**, so the new column lines up in every row; removing a column
+from a row that doesn't reach it is a no-op. The contract, `MemorySheet`,
+`RefModel` and the current `FileSheet` already implement this; the column map
+is now a pure internal optimisation that the existing tests guard.
 
 ### 4.5 Reading and scanning
 * One reusable `csv_core` reader and buffers per thread; no allocation per row.
@@ -185,13 +189,10 @@ Everything else (`cell`, `record`, `set_cell`, `insert_row`, `remove_row`,
 
 ## 6. Decisions needed
 
-* **D1 - ragged rows and column edits.** The current contract makes an
-  inserted column land at `min(col, row.len())` per row. Proposal: columns are
-  defined by position across the whole sheet; a short row is treated as padded
-  with empty fields, so inserting at column c inserts at c for every row
-  (padding short rows), and removing column c from a row shorter than c is a
-  no-op. Gives O(1) column edits. Changes `MemorySheet` behaviour only for
-  ragged rows combined with column edits, which are rare.
+* **D1 - ragged rows and column edits. DECIDED (padding).** Inserting at
+  column c inserts at c for every row, padding short rows with empty fields;
+  removing column c from a row shorter than c is a no-op. Gives O(1) column
+  edits with a column map. (The old behaviour clamped to each row's length.)
 * **D2 - envelope.** Is "50 GB / 500M rows on a 16 GB laptop" the target?
   If the real target is "a few GB", the sparse index and piece table are
   more than needed and I'd stop at a dense index + the lean parser.
