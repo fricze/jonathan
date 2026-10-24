@@ -10,9 +10,25 @@ Jonathan is a CSV viewer/editor whose promise is *huge files, fast and
 responsive*, with *high-quality editing* (cells stay exact text; unedited
 bytes are saved untouched).
 
-**Envelope (to be confirmed, see Decision D2).** Files from 1 KB to ~50 GB
-(~500M rows at ~100 B/row) on a 16 GB / 4-core laptop with an SSD. Below
-~256 MB the simple in-memory backend is fine and stays.
+**Envelope (D2 decided).** Required: files up to **10 GB** (~130M rows at
+~76 B/row) on a 16 GB / 4-core laptop with an SSD. Future size is unknown, so
+the design must degrade gracefully, not fall over, up to ~50 GB (~650M rows).
+Below ~256 MB the simple in-memory backend is fine and stays.
+
+What that means at 10 GB (131M rows), from the measurements in section 2:
+
+| Structure | Cost at 10 GB |
+|---|---|
+| Rows in memory as `StringRecord` (today's `MemorySheet`) | ~37 GB - impossible |
+| Dense row index (8 B/row), current `FileSheet` | 1.05 GB |
+| Order `Vec` after the first row insert/remove, current | +1.05 GB, ~100+ ms memmove per row edit |
+| **Sparse index (1 per 64 rows)** | **16 MB** |
+| **Piece table** | proportional to edits (KBs) |
+| Full index build, one thread, warm | ~19 s (progressive, cancellable) |
+| Lean full scan, one thread, warm | ~14 s; raw-buffer search ~1.3 s |
+| Filter result view if every row matches (4 B/row) | 524 MB |
+| Sort keys (16 B/row, transient) | 2.1 GB |
+| Cold-cache read of the file | ~4 s at 2.5 GB/s (NVMe), ~70 s at 150 MB/s (HDD) |
 
 **What the user must be able to do, and how it must feel:**
 
@@ -193,9 +209,9 @@ Everything else (`cell`, `record`, `set_cell`, `insert_row`, `remove_row`,
   column c inserts at c for every row, padding short rows with empty fields;
   removing column c from a row shorter than c is a no-op. Gives O(1) column
   edits with a column map. (The old behaviour clamped to each row's length.)
-* **D2 - envelope.** Is "50 GB / 500M rows on a 16 GB laptop" the target?
-  If the real target is "a few GB", the sparse index and piece table are
-  more than needed and I'd stop at a dense index + the lean parser.
+* **D2 - envelope. DECIDED:** 5-10 GB required, larger possible later. The
+  sparse index and piece table are therefore in scope (see the table in
+  section 1).
 * **D3 - backend threshold** (256 MB / 5% of RAM) and whether users get a
   setting.
 * **D4 - sort on huge files.** Accept 16 B/row transient memory and a full
