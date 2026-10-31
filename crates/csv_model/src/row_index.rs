@@ -55,6 +55,19 @@ impl RowIndex {
         self.header.clone()
     }
 
+    /// The data row whose byte range contains `offset`; `None` for offsets in
+    /// the BOM, the header, or past the end.
+    pub fn row_at_offset(&self, offset: u64) -> Option<usize> {
+        if offset >= self.total {
+            return None;
+        }
+        // Rows tile [header.end, total): the row is the last one starting at
+        // or before `offset`.
+        self.starts
+            .partition_point(|&start| start <= offset)
+            .checked_sub(1)
+    }
+
     /// Total file length in bytes.
     pub fn total_len(&self) -> u64 {
         self.total
@@ -215,6 +228,22 @@ mod tests {
             at = r.end;
         }
         assert_eq!(at, bytes.len() as u64, "ranges reach the end of the file");
+        if bytes.len() < 4000 {
+            let first = idx.header_range().end;
+            for off in 0..bytes.len() as u64 + 3 {
+                let want = (off >= first && off < bytes.len() as u64).then(|| {
+                    (0..idx.len())
+                        .find(|&i| idx.row_range(i).unwrap().contains(&off))
+                        .unwrap()
+                });
+                assert_eq!(
+                    idx.row_at_offset(off),
+                    want,
+                    "row_at_offset({off}) of {:?}",
+                    String::from_utf8_lossy(bytes)
+                );
+            }
+        }
         idx
     }
 

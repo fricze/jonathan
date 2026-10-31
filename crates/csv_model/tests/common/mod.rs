@@ -163,7 +163,10 @@ impl Instrumented {
     }
 
     pub fn stats(&self) -> IoStats {
-        IoStats { calls: self.calls.load(Relaxed), bytes: self.bytes.load(Relaxed) }
+        IoStats {
+            calls: self.calls.load(Relaxed),
+            bytes: self.bytes.load(Relaxed),
+        }
     }
 
     pub fn reset(&self) {
@@ -235,7 +238,10 @@ pub fn check_le(name: &str, measured: f64, limit: f64, unit: &str) {
         "BUDGET {name:<58} {measured:>14.3} {unit:<10} limit <= {limit:<12.3} {}",
         if ok { "PASS" } else { "FAIL" }
     );
-    assert!(ok, "{name}: {measured:.3} {unit} exceeds the budget of {limit:.3} {unit}");
+    assert!(
+        ok,
+        "{name}: {measured:.3} {unit} exceeds the budget of {limit:.3} {unit}"
+    );
 }
 
 /// Assert `measured >= limit`, printing a table line either way.
@@ -245,7 +251,10 @@ pub fn check_ge(name: &str, measured: f64, limit: f64, unit: &str) {
         "BUDGET {name:<58} {measured:>14.3} {unit:<10} limit >= {limit:<12.3} {}",
         if ok { "PASS" } else { "FAIL" }
     );
-    assert!(ok, "{name}: {measured:.3} {unit} is below the budget of {limit:.3} {unit}");
+    assert!(
+        ok,
+        "{name}: {measured:.3} {unit} is below the budget of {limit:.3} {unit}"
+    );
 }
 
 /// Fastest of `runs` timings of `f`, in seconds. Wall-clock timings on a

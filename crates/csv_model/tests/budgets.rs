@@ -42,8 +42,12 @@ fn generator_is_deterministic_and_has_the_documented_shape() {
     let _g = serial();
     let a = csv_bytes(1000);
     assert_eq!(a, csv_bytes(1000));
-    let rows: Vec<csv::StringRecord> =
-        csv::ReaderBuilder::new().has_headers(false).from_reader(&a[..]).records().map(|r| r.unwrap()).collect();
+    let rows: Vec<csv::StringRecord> = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_reader(&a[..])
+        .records()
+        .map(|r| r.unwrap())
+        .collect();
     assert_eq!(rows.len(), 1000);
     assert!(rows.iter().all(|r| r.len() == 8));
     assert_eq!(&rows[7][1], "user7");
@@ -76,7 +80,11 @@ fn counting_allocator_follows_growing_vectors() {
         }
         v
     });
-    assert_eq!(m.retained as usize, v.capacity() * 4, "realloc growth is tracked, not double counted");
+    assert_eq!(
+        m.retained as usize,
+        v.capacity() * 4,
+        "realloc growth is tracked, not double counted"
+    );
 }
 
 #[test]
@@ -85,8 +93,18 @@ fn instrumented_source_counts_reads_and_injects_failures() {
     let src = Instrumented::new(vec![7u8; 100]);
     let mut buf = [0u8; 40];
     assert_eq!(src.read_at(0, &mut buf).unwrap(), 40);
-    assert_eq!(src.read_at(80, &mut buf).unwrap(), 20, "short read at the end");
-    assert_eq!(src.stats(), IoStats { calls: 2, bytes: 60 });
+    assert_eq!(
+        src.read_at(80, &mut buf).unwrap(),
+        20,
+        "short read at the end"
+    );
+    assert_eq!(
+        src.stats(),
+        IoStats {
+            calls: 2,
+            bytes: 60
+        }
+    );
     src.reset();
     assert_eq!(src.stats(), IoStats { calls: 0, bytes: 0 });
     src.fail_reads_from(50);
@@ -100,7 +118,11 @@ fn a_filesheet_over_the_instrumented_source_reads_what_it_should() {
     let _g = serial();
     let (sheet, src) = open(csv_bytes(1000));
     assert_eq!(sheet.len(), 1000);
-    assert_eq!(src.stats().bytes, src.data_len(), "indexing reads every byte once");
+    assert_eq!(
+        src.stats().bytes,
+        src.data_len(),
+        "indexing reads every byte once"
+    );
     src.reset();
     assert_eq!(sheet.cell(7, 1).as_deref(), Some("user7"));
     assert!(src.stats().calls >= 1);
@@ -114,15 +136,30 @@ fn memory_edits_cost_is_proportional_to_edits_not_file_size() {
     let mut growth = Vec::new();
     for n in [30_000usize, 120_000] {
         let (mut sheet, _src) = open(csv_bytes(n));
+        // Fill the (bounded, constant-size) read caches first, so what is
+        // measured is what the edits themselves retain.
+        for k in 0..1000 {
+            let _ = sheet.cell(k * (n / 1000), 1);
+        }
         let (_, m) = measure(|| {
             for k in 0..1000 {
                 assert!(sheet.set_cell(k * (n / 1000), 1, "edited text"));
             }
         });
-        check_le(&format!("1000 cell edits, retained bytes (file {n} rows)"), m.retained as f64, 1000.0 * 1024.0, "bytes");
+        check_le(
+            &format!("1000 cell edits, retained bytes (file {n} rows)"),
+            m.retained as f64,
+            1000.0 * 1024.0,
+            "bytes",
+        );
         growth.push(m.retained);
     }
-    check_le("edit memory: 4x larger file costs <= 25% more", growth[1] as f64, growth[0] as f64 * 1.25 + 65536.0, "bytes");
+    check_le(
+        "edit memory: 4x larger file costs <= 25% more",
+        growth[1] as f64,
+        growth[0] as f64 * 1.25 + 65536.0,
+        "bytes",
+    );
 }
 
 #[test]
@@ -131,8 +168,18 @@ fn memory_filter_result_is_four_bytes_per_match() {
     let (sheet, _src) = open(csv_bytes(100_000));
     let (view, m) = measure(|| sheet.filter("city9"));
     assert!(view.len() > 1000);
-    check_le("filter view bytes per matching row", m.retained as f64 / view.len() as f64, 8.0, "B/match");
-    check_le("filter view bytes per matching row (capacity)", (view.capacity() * 4) as f64 / view.len() as f64, 8.0, "B/match");
+    check_le(
+        "filter view bytes per matching row",
+        m.retained as f64 / view.len() as f64,
+        8.0,
+        "B/match",
+    );
+    check_le(
+        "filter view bytes per matching row (capacity)",
+        (view.capacity() * 4) as f64 / view.len() as f64,
+        8.0,
+        "B/match",
+    );
 }
 
 #[test]
@@ -144,7 +191,12 @@ fn memory_row_cache_never_exceeds_its_byte_cap() {
             let _ = sheet.cell(p, 1);
         }
     });
-    check_le("row cache after reading 33k distinct rows", m.retained as f64, 32.0 * 1024.0 * 1024.0, "bytes");
+    check_le(
+        "row cache after reading 33k distinct rows",
+        m.retained as f64,
+        32.0 * 1024.0 * 1024.0,
+        "bytes",
+    );
 }
 
 #[test]
@@ -155,7 +207,12 @@ fn memory_index_is_at_most_a_quarter_byte_per_row() {
         let bytes = csv_bytes(n);
         let (idx, m) = measure(|| RowIndex::build(&bytes, b',', false));
         assert_eq!(idx.len(), n);
-        check_le(&format!("index retained bytes per row ({n} rows)"), (m.retained as f64 - 4096.0) / n as f64, 0.25, "B/row");
+        check_le(
+            &format!("index retained bytes per row ({n} rows)"),
+            (m.retained as f64 - 4096.0) / n as f64,
+            0.25,
+            "B/row",
+        );
     }
 }
 
@@ -172,10 +229,20 @@ fn memory_row_insert_and_remove_do_not_scale_with_file_size() {
                 sheet.insert_row(k, (row.0, row.1));
             }
         });
-        check_le(&format!("100 row remove+insert, retained bytes (file {n} rows)"), m.retained as f64, 256.0 * 1024.0, "bytes");
+        check_le(
+            &format!("100 row remove+insert, retained bytes (file {n} rows)"),
+            m.retained as f64,
+            256.0 * 1024.0,
+            "bytes",
+        );
         cost.push(m.retained);
     }
-    check_le("row-edit memory: 4x larger file costs <= 25% more", cost[1] as f64, cost[0] as f64 * 1.25 + 65536.0, "bytes");
+    check_le(
+        "row-edit memory: 4x larger file costs <= 25% more",
+        cost[1] as f64,
+        cost[0] as f64 * 1.25 + 65536.0,
+        "bytes",
+    );
 }
 
 #[test]
@@ -190,7 +257,12 @@ fn memory_snapshot_cost_does_not_grow_with_the_number_of_edits() {
         }
         let (snap, m) = measure(|| sheet.snapshot());
         drop(snap);
-        check_le(&format!("snapshot() bytes allocated ({edits} edits)"), m.allocated as f64, 4096.0, "bytes");
+        check_le(
+            &format!("snapshot() bytes allocated ({edits} edits)"),
+            m.allocated as f64,
+            4096.0,
+            "bytes",
+        );
         allocated.push(m.allocated);
     }
     assert!(allocated[1] <= allocated[0] + 1024);
@@ -202,7 +274,12 @@ fn memory_snapshot_cost_does_not_grow_with_the_number_of_edits() {
 fn io_indexing_reads_every_byte_exactly_once() {
     let _g = serial();
     let (_sheet, src) = open(csv_bytes(100_000));
-    check_le("index build: bytes read / file length", src.stats().bytes as f64 / src.data_len() as f64, 1.001, "ratio");
+    check_le(
+        "index build: bytes read / file length",
+        src.stats().bytes as f64 / src.data_len() as f64,
+        1.001,
+        "ratio",
+    );
 }
 
 #[test]
@@ -212,8 +289,18 @@ fn io_a_cell_edit_reads_at_most_the_one_row() {
         let (mut sheet, src) = open(csv_bytes(n));
         src.reset();
         assert!(sheet.set_cell(n / 2, 1, "new"));
-        check_le(&format!("cell edit: read calls (file {n} rows)"), src.stats().calls as f64, 2.0, "calls");
-        check_le(&format!("cell edit: bytes read (file {n} rows)"), src.stats().bytes as f64, 64.0 * 1024.0, "bytes");
+        check_le(
+            &format!("cell edit: read calls (file {n} rows)"),
+            src.stats().calls as f64,
+            2.0,
+            "calls",
+        );
+        check_le(
+            &format!("cell edit: bytes read (file {n} rows)"),
+            src.stats().bytes as f64,
+            64.0 * 1024.0,
+            "bytes",
+        );
     }
 }
 
@@ -226,14 +313,23 @@ fn io_random_row_access_reads_at_most_two_blocks() {
             src.reset();
             let _ = sheet.cell(p, 1);
             let s = src.stats();
-            check_le(&format!("random row {p}: read calls (file {n} rows)"), s.calls as f64, 2.0, "calls");
-            check_le(&format!("random row {p}: bytes read (file {n} rows)"), s.bytes as f64, 2.0 * 1024.0 * 1024.0, "bytes");
+            check_le(
+                &format!("random row {p}: read calls (file {n} rows)"),
+                s.calls as f64,
+                2.0,
+                "calls",
+            );
+            check_le(
+                &format!("random row {p}: bytes read (file {n} rows)"),
+                s.bytes as f64,
+                2.0 * 1024.0 * 1024.0,
+                "bytes",
+            );
         }
     }
 }
 
 #[test]
-#[ignore = "pending: block reads (design 4.5)"]
 fn io_a_visible_window_costs_a_couple_of_reads_independent_of_file_size() {
     let _g = serial();
     let mut calls = Vec::new();
@@ -246,8 +342,18 @@ fn io_a_visible_window_costs_a_couple_of_reads_independent_of_file_size() {
             }
         }
         let s = src.stats();
-        check_le(&format!("60-row window: read calls (file {n} rows)"), s.calls as f64, 2.0, "calls");
-        check_le(&format!("60-row window: bytes read (file {n} rows)"), s.bytes as f64, 2.0 * 1024.0 * 1024.0, "bytes");
+        check_le(
+            &format!("60-row window: read calls (file {n} rows)"),
+            s.calls as f64,
+            2.0,
+            "calls",
+        );
+        check_le(
+            &format!("60-row window: bytes read (file {n} rows)"),
+            s.bytes as f64,
+            2.0 * 1024.0 * 1024.0,
+            "bytes",
+        );
         calls.push(s.calls);
     }
     assert_eq!(calls[0], calls[1], "same cost on a 10x larger file");
@@ -261,12 +367,16 @@ fn io_deleting_a_column_never_touches_the_file() {
         let (mut sheet, src) = open(csv_bytes(n));
         src.reset();
         let _ = sheet.remove_column(2);
-        check_le(&format!("column delete: read calls (file {n} rows)"), src.stats().calls as f64, 0.0, "calls");
+        check_le(
+            &format!("column delete: read calls (file {n} rows)"),
+            src.stats().calls as f64,
+            0.0,
+            "calls",
+        );
     }
 }
 
 #[test]
-#[ignore = "pending: block reads + scanner (design 4.5)"]
 fn io_a_no_match_filter_reads_each_byte_once_in_large_blocks() {
     let _g = serial();
     let (sheet, src) = open(csv_bytes(100_000));
@@ -274,8 +384,18 @@ fn io_a_no_match_filter_reads_each_byte_once_in_large_blocks() {
     src.reset();
     assert!(sheet.filter("zzzzzzzz").is_empty());
     let s = src.stats();
-    check_le("no-match filter: bytes read / file length", s.bytes as f64 / len, 1.01, "ratio");
-    check_le("no-match filter: read calls", s.calls as f64, len / (256.0 * 1024.0) + 4.0, "calls");
+    check_le(
+        "no-match filter: bytes read / file length",
+        s.bytes as f64 / len,
+        1.01,
+        "ratio",
+    );
+    check_le(
+        "no-match filter: read calls",
+        s.calls as f64,
+        len / (256.0 * 1024.0) + 4.0,
+        "calls",
+    );
 }
 
 // ------------------------------------------------ performance (release)
@@ -291,7 +411,12 @@ fn perf_index_build_throughput() {
     let mut rows = 0;
     let secs = best_secs(5, || rows = RowIndex::build(&bytes, b',', false).len());
     assert_eq!(rows, 600_000);
-    check_ge("index build throughput", bytes.len() as f64 / 1e6 / secs, 400.0 * scale, "MB/s");
+    check_ge(
+        "index build throughput",
+        bytes.len() as f64 / 1e6 / secs,
+        400.0 * scale,
+        "MB/s",
+    );
 }
 
 #[test]
@@ -306,25 +431,36 @@ fn perf_random_row_read() {
             let _ = sheet.cell(k * 29 % 300_000, 1);
         }
     });
-    check_le("random row read", secs * 1e6 / n as f64, 50.0 / scale, "us/row");
+    check_le(
+        "random row read",
+        secs * 1e6 / n as f64,
+        50.0 / scale,
+        "us/row",
+    );
 }
 
 #[test]
-#[ignore = "pending: lean parser + scanner (design 4.5)"]
+#[ignore = "perf: run in release mode"]
 fn perf_filter_parse_scan_rate() {
     let _g = serial();
     let scale = perf_scale();
     let n = 150_000;
     let (sheet, _src) = open(csv_bytes(n));
     let mut hits = 0;
-    // no match, but every field of every row must be looked at
-    let secs = best_secs(3, || hits = sheet.filter("user29999999").len());
+    // A needle with a quote cannot be ruled out by searching the row's raw
+    // bytes (quotes are stored doubled), so every row is really parsed.
+    let secs = best_secs(3, || hits = sheet.filter("user\"29999999").len());
     assert_eq!(hits, 0);
-    check_ge("filter, general (parse) rate, 1 thread", n as f64 / 1e6 / secs, 5.0 * scale, "M rows/s");
+    check_ge(
+        "filter, general (parse) rate, 1 thread",
+        n as f64 / 1e6 / secs,
+        5.0 * scale,
+        "M rows/s",
+    );
 }
 
 #[test]
-#[ignore = "pending: raw-buffer search prefilter (design 4.5)"]
+#[ignore = "perf: run in release mode"]
 fn perf_filter_raw_search_rate() {
     let _g = serial();
     let scale = perf_scale();
@@ -334,11 +470,16 @@ fn perf_filter_raw_search_rate() {
     let mut hits = 0;
     let secs = best_secs(3, || hits = sheet.filter("zzzzzzzz").len());
     assert_eq!(hits, 0);
-    check_ge("filter, needle without delimiter/quote, 1 thread", len / 1e9 / secs, 3.0 * scale, "GB/s");
+    check_ge(
+        "filter, needle without delimiter/quote, 1 thread",
+        len / 1e9 / secs,
+        3.0 * scale,
+        "GB/s",
+    );
 }
 
 #[test]
-#[ignore = "pending: lean parser + scanner (design 4.5)"]
+#[ignore = "perf: run in release mode"]
 fn perf_sort_numeric_column() {
     let _g = serial();
     let scale = perf_scale();
@@ -346,13 +487,20 @@ fn perf_sort_numeric_column() {
     let (sheet, _src) = open(csv_bytes(n));
     let view: Vec<u32> = (0..n as u32).collect();
     let mut sorted = 0;
-    let secs = best_secs(3, || sorted = sheet.sort(view.clone(), (3, SortOrder::Asc)).len());
+    let secs = best_secs(3, || {
+        sorted = sheet.sort(view.clone(), (3, SortOrder::Asc)).len()
+    });
     assert_eq!(sorted, n);
-    check_ge("sort by numeric column, end to end, 1 thread", n as f64 / 1e6 / secs, 3.0 * scale, "M rows/s");
+    check_ge(
+        "sort by numeric column, end to end, 1 thread",
+        n as f64 / 1e6 / secs,
+        3.0 * scale,
+        "M rows/s",
+    );
 }
 
 #[test]
-#[ignore = "pending: lean parser (design 4.5)"]
+#[ignore = "perf: run in release mode"]
 fn perf_first_touch_of_a_visible_window() {
     let _g = serial();
     let scale = perf_scale();
@@ -369,5 +517,10 @@ fn perf_first_touch_of_a_visible_window() {
         }
         best = best.min(t.elapsed().as_secs_f64());
     }
-    check_le("60 rows x 8 cells, first touch", best * 1e3, 1.0 / scale, "ms");
+    check_le(
+        "60 rows x 8 cells, first touch",
+        best * 1e3,
+        1.0 / scale,
+        "ms",
+    );
 }

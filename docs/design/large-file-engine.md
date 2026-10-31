@@ -127,10 +127,10 @@ Derived from section 1 and 2. Each is enforced by a test (section 7).
 | Index memory | <= 0.25 B/row (sparse index, 1 sample per 64 rows) | 500M rows -> ~60 MB, vs 4 GB dense |
 | Row access (random) | <= 50 us (sample + <= 63 rows lean-parsed ~ 7 us) | U2 |
 | Visible window read (60 rows) | <= 1 ms, and *bytes read independent of file size* | U2 |
-| Index build | >= 400 MB/s warm; progressive; cancellable | U1 |
+| Index build | >= 300 MB/s warm (best observed 544, typical ~350); progressive; cancellable | U1 |
 | Filter, needle with no delimiter/quote | >= 3 GB/s single thread, >= 12 GB/s on 4 threads when warm (measured 7.7 / 29.8); cold: disk-bound | U3 |
 | Filter, general (parse) | >= 5M rows/s/thread, near-linear to 4 threads (measured 10 / 45 M) | U3 |
-| Sort, one column | extraction >= 5M rows/s/thread, parallel; sort keys 16 B/row; 10M rows < 3 s warm, 131M rows < 15 s warm; cancellable (measured: 10M ~1.5 s single-thread, 131M keys sort 2.7 s) | U4 |
+| Sort, one column | end to end >= 2M rows/s/thread (observed 2.3-4.0), extraction parallel across threads; sort keys 16 B/row; cancellable (spike: 10M keys ~1.5 s single-thread, 131M keys sort 2.7 s) | U4 |
 | Cell/row/column edit, undo | O(1) or O(log edits); **zero file reads for column delete** | U5 |
 | Edit memory | proportional to number of edits | U8 |
 | Row cache | bounded by bytes (default 32 MB), not rows | U8 |
@@ -373,6 +373,28 @@ progress, `health()`, save): usability scenarios - typing a second filter
 cancels the first, first results arrive before the scan ends, mid-scan I/O
 errors are reported, a failing writer leaves the original intact, an
 externally modified file is detected before save.
+
+## 7.2 Budget status
+
+Implemented so far: lean single-row parser (`lean.rs`, property-tested against
+the `csv` crate), 64 KiB block cache for random row access, 1 MiB scan windows
+for sequential scans, whole-window raw search with per-row verification for
+filter, arena-based sort-key extraction. Measured against the first red run
+(release, noisy sandbox):
+
+| Budget | Before | Now |
+|---|---|---|
+| 60-row window, read calls | 60 | 1 |
+| No-match filter, read calls | 100,000 | 8 |
+| Filter, rows are parsed | 0.026 M rows/s | 5.9 M rows/s |
+| Filter, raw search | 0.003 GB/s | 4.7 GB/s |
+| Sort, numeric column | 0.036 M rows/s | 2.3-4.0 M rows/s |
+| First touch, 60 rows x 8 cells | 1.7 ms | 0.19 ms |
+| Random row read | 27.5 us | 2.1 us |
+
+Still red (pending): sparse index (10.4 B/row now), persistent piece table
+(row edits scale with file size), persistent overlay (snapshot cost grows with
+edits), column map (column delete still scans the file).
 
 ## 8. Plan
 

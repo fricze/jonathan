@@ -5,12 +5,15 @@
 //! filter, sort, snapshot. Edits arrive in the next steps.
 
 use std::borrow::Cow;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
+use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
 use csv::StringRecord;
 
+use crate::lean::LeanParser;
 use crate::{RowIndex, RowIndexBuilder, Sheet, SheetRow, SortOrder, View, sort_cells};
 
 /// Random-access bytes. Positional reads (not mmap) so that a file shrinking
@@ -68,6 +71,96 @@ impl RowCache {
     }
 }
 
+/// Random row access reads aligned blocks this big. Small on purpose: a miss
+/// copies a whole block, and the budget for a random row is 50 us (a 64 KiB
+/// copy is ~12 us; 1 MiB would be ~200 us).
+const BLOCK: u64 = 64 * 1024;
+const DEFAULT_CACHE_BLOCKS: usize = 64;
+/// Scans read this much at a time while moving forward through the file.
+const SCAN_WINDOW: u64 = 1 << 20;
+
+/// Recently read blocks of the file, oldest evicted first. The base file never
+/// changes, so (unlike the row cache) this is shared freely with snapshots.
+struct BlockCache {
+    blocks: HashMap<u64, Arc<Vec<u8>>>,
+    order: VecDeque<u64>,
+    capacity: usize,
+}
+
+impl BlockCache {
+    fn insert(&mut self, no: u64, block: Arc<Vec<u8>>) {
+        if self.capacity == 0 || self.blocks.insert(no, block).is_some() {
+            return;
+        }
+        self.order.push_back(no);
+        while self.order.len() > self.capacity {
+            if let Some(old) = self.order.pop_front() {
+                self.blocks.remove(&old);
+            }
+        }
+    }
+}
+
+/// The bytes of one row: a slice of a cached block, or a copy when the row
+/// spans blocks.
+enum RowBytes {
+    Block(Arc<Vec<u8>>, Range<usize>),
+    Owned(Vec<u8>),
+}
+
+impl RowBytes {
+    fn as_slice(&self) -> &[u8] {
+        match self {
+            RowBytes::Block(block, r) => &block[r.clone()],
+            RowBytes::Owned(v) => v,
+        }
+    }
+}
+
+/// A window onto the file for one scan. Rows are requested in increasing
+/// position, so it reads large chunks (`SCAN_WINDOW`) and serves many rows from
+/// each; if the scan jumps ahead (a sparse view) it falls back to small reads.
+/// Bypasses the shared caches so a scan cannot evict what the table shows.
+struct ScanWindow {
+    start: u64,
+    data: Vec<u8>,
+}
+
+impl ScanWindow {
+    fn new() -> Self {
+        ScanWindow {
+            start: 0,
+            data: Vec::new(),
+        }
+    }
+
+    fn get(&mut self, sheet: &FileSheet, range: Range<u64>) -> Option<&[u8]> {
+        let end = self.start + self.data.len() as u64;
+        if self.data.is_empty() || range.start < self.start || range.end > end {
+            let total = sheet.source.len();
+            let sequential =
+                !self.data.is_empty() && range.start >= self.start && range.start <= end + BLOCK;
+            let want = (range.end - range.start).max(if sequential { SCAN_WINDOW } else { BLOCK });
+            let len = want.min(total.saturating_sub(range.start)) as usize;
+            self.data.resize(len, 0);
+            self.start = range.start;
+            if !sheet.read_exact_at(range.start, &mut self.data) {
+                self.data.clear();
+                return None;
+            }
+        }
+        let lo = (range.start - self.start) as usize;
+        let hi = (range.end - self.start) as usize;
+        self.data.get(lo..hi)
+    }
+}
+
+thread_local! {
+    /// One parser per thread, reused for every row read; rebuilt only if the
+    /// delimiter changes.
+    static PARSER: RefCell<Option<(u8, LeanParser)>> = const { RefCell::new(None) };
+}
+
 /// A column insert or remove, replayed lazily on every row read from the
 /// file. (To be replaced by a column map now that short rows are padded
 /// rather than clamped; see docs/design/large-file-engine.md, 4.4.)
@@ -106,6 +199,7 @@ pub struct FileSheet {
     index: Arc<RowIndex>,
     delimiter: u8,
     cache: Arc<Mutex<RowCache>>,
+    blocks: Arc<Mutex<BlockCache>>,
     /// Rows changed since load, keyed by row id. The file itself is never
     /// written. A row is copied in here the first time one of its cells is
     /// edited (or when it is inserted, or put back after a removal) and is
@@ -127,15 +221,33 @@ pub struct FileSheet {
 
 impl FileSheet {
     pub fn new(source: Arc<dyn ByteSource>, delimiter: u8, has_header: bool) -> io::Result<Self> {
-        Self::with_cache_capacity(source, delimiter, has_header, DEFAULT_CACHE_ROWS)
+        Self::with_caches(
+            source,
+            delimiter,
+            has_header,
+            DEFAULT_CACHE_ROWS,
+            DEFAULT_CACHE_BLOCKS,
+        )
     }
 
-    /// Like `new`, but remembers at most `capacity` parsed rows.
+    /// Like `new`, but remembers at most `capacity` parsed rows and caches no
+    /// blocks, so every row read that misses the row cache reaches the source.
+    /// A hook for tests that count source reads.
     pub fn with_cache_capacity(
         source: Arc<dyn ByteSource>,
         delimiter: u8,
         has_header: bool,
         capacity: usize,
+    ) -> io::Result<Self> {
+        Self::with_caches(source, delimiter, has_header, capacity, 0)
+    }
+
+    pub fn with_caches(
+        source: Arc<dyn ByteSource>,
+        delimiter: u8,
+        has_header: bool,
+        row_capacity: usize,
+        block_capacity: usize,
     ) -> io::Result<Self> {
         let mut builder = RowIndexBuilder::new(delimiter, has_header);
         let mut buf = vec![0u8; INDEX_CHUNK];
@@ -159,7 +271,12 @@ impl FileSheet {
             cache: Arc::new(Mutex::new(RowCache {
                 rows: HashMap::new(),
                 order: VecDeque::new(),
-                capacity,
+                capacity: row_capacity,
+            })),
+            blocks: Arc::new(Mutex::new(BlockCache {
+                blocks: HashMap::new(),
+                order: VecDeque::new(),
+                capacity: block_capacity,
             })),
             edited: HashMap::new(),
             order: None,
@@ -168,34 +285,89 @@ impl FileSheet {
         })
     }
 
-    /// Read and parse file row `file_row` straight from the source. `None`
-    /// if there is no such row or its bytes can no longer be read.
-    fn read_row(&self, file_row: usize) -> Option<StringRecord> {
-        let range = self.index.row_range(file_row)?;
-        let mut bytes = vec![0u8; (range.end - range.start) as usize];
+    /// Fill `buf` from `offset`, looping over short reads. `false` on error
+    /// or if the source ends early (e.g. the file shrank).
+    fn read_exact_at(&self, offset: u64, buf: &mut [u8]) -> bool {
         let mut filled = 0;
-        while filled < bytes.len() {
+        while filled < buf.len() {
             match self
                 .source
-                .read_at(range.start + filled as u64, &mut bytes[filled..])
+                .read_at(offset + filled as u64, &mut buf[filled..])
             {
-                Ok(0) | Err(_) => return None,
+                Ok(0) | Err(_) => return false,
                 Ok(n) => filled += n,
             }
         }
-        let mut reader = csv::ReaderBuilder::new()
-            .delimiter(self.delimiter)
-            .has_headers(false)
-            .flexible(true)
-            .from_reader(&bytes[..]);
-        let mut raw = csv::ByteRecord::new();
-        if !reader.read_byte_record(&mut raw).ok()? {
+        true
+    }
+
+    /// Block number `no` of the file, through the block cache.
+    fn block(&self, no: u64) -> Option<Arc<Vec<u8>>> {
+        let lock = || self.blocks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(hit) = lock().blocks.get(&no) {
+            return Some(hit.clone());
+        }
+        let start = no * BLOCK;
+        let len = BLOCK.min(self.source.len().checked_sub(start)?) as usize;
+        let mut data = vec![0u8; len];
+        if !self.read_exact_at(start, &mut data) {
             return None;
         }
-        Some(
-            StringRecord::from_byte_record(raw.clone())
-                .unwrap_or_else(|_| StringRecord::from_byte_record_lossy(raw)),
-        )
+        let block = Arc::new(data);
+        lock().insert(no, block.clone());
+        Some(block)
+    }
+
+    /// The bytes of a row, from the block cache (one block, or a copy
+    /// assembled from several when the row spans a boundary).
+    fn row_bytes(&self, range: Range<u64>) -> Option<RowBytes> {
+        if range.end <= range.start {
+            return Some(RowBytes::Owned(Vec::new()));
+        }
+        let (first, last) = (range.start / BLOCK, (range.end - 1) / BLOCK);
+        if first == last {
+            let block = self.block(first)?;
+            let base = first * BLOCK;
+            let r = (range.start - base) as usize..(range.end - base) as usize;
+            return (r.end <= block.len()).then(|| RowBytes::Block(block, r));
+        }
+        let mut out = Vec::with_capacity((range.end - range.start) as usize);
+        for no in first..=last {
+            let block = self.block(no)?;
+            let base = no * BLOCK;
+            let lo = range.start.max(base) - base;
+            let hi = (range.end.min(base + BLOCK) - base) as usize;
+            out.extend_from_slice(block.get(lo as usize..hi)?);
+        }
+        Some(RowBytes::Owned(out))
+    }
+
+    /// Read and parse file row `file_row` into a record. `None` if there is no
+    /// such row or its bytes can no longer be read.
+    fn read_row(&self, file_row: usize) -> Option<StringRecord> {
+        let bytes = self.row_bytes(self.index.row_range(file_row)?)?;
+        PARSER.with(|cell| {
+            let mut slot = cell.borrow_mut();
+            if slot.as_ref().is_none_or(|(d, _)| *d != self.delimiter) {
+                *slot = Some((self.delimiter, LeanParser::new(self.delimiter)));
+            }
+            let parser = &mut slot.as_mut()?.1;
+            let fields = parser.parse(bytes.as_slice())?;
+            let mut raw = csv::ByteRecord::new();
+            for f in fields.iter() {
+                raw.push_field(f);
+            }
+            Some(match StringRecord::from_byte_record(raw) {
+                Ok(record) => record,
+                Err(e) => StringRecord::from_byte_record_lossy(e.into_byte_record()),
+            })
+        })
+    }
+
+    /// True while positions are file rows in file order with the original
+    /// columns, which lets scans read the file front to back.
+    fn scan_is_streamable(&self) -> bool {
+        self.order.is_none() && self.col_ops.is_empty()
     }
 
     /// Row id at display `position`.
@@ -274,6 +446,10 @@ impl FileSheet {
 
 #[cfg(test)]
 impl FileSheet {
+    fn cached_rows(&self) -> usize {
+        self.cache.lock().unwrap().rows.len()
+    }
+
     fn order_is_materialized(&self) -> bool {
         self.order.is_some()
     }
@@ -370,33 +546,147 @@ impl Sheet for FileSheet {
         });
     }
 
-    // Scans bypass the cache: a pass over every row would otherwise evict
-    // the rows the table is showing.
+    // Scans bypass the shared caches so they cannot evict what the table is
+    // showing. When the order and columns are untouched (the common case: a
+    // file opened, perhaps a few cells edited) they stream the file through a
+    // large window and parse rows with the lean parser; otherwise they go
+    // row by row through the general path.
     fn filter(&self, needle: &str) -> View {
-        (0..self.len())
-            .filter(|&p| {
-                needle.is_empty()
-                    || self
-                        .load_row(p)
+        if needle.is_empty() {
+            return (0..self.len() as u32).collect();
+        }
+        if !self.scan_is_streamable() {
+            return (0..self.len())
+                .filter(|&p| {
+                    self.load_row(p)
                         .is_some_and(|r| r.iter().any(|c| c.contains(needle)))
-            })
-            .map(|p| p as u32)
-            .collect()
+                })
+                .map(|p| p as u32)
+                .collect();
+        }
+        let finder = memchr::memmem::Finder::new(needle.as_bytes());
+        // A field's text appears verbatim in the row's bytes unless it contains
+        // a quote (stored doubled), so a needle without one can rule out a row
+        // by searching bytes alone, no parsing.
+        let prefilter = !needle.as_bytes().contains(&b'"');
+        let mut parser = LeanParser::new(self.delimiter);
+        let mut hits = View::new();
+        if prefilter && !needle.as_bytes().iter().any(|&b| b == b'\n' || b == b'\r') {
+            // One search per window of many rows. A match cannot span two rows
+            // (the needle has no line break), so each match lies in one row;
+            // only those rows are parsed to check a *field* contains it.
+            let mut buf = Vec::new();
+            let mut row = 0usize;
+            while row < self.index.len() {
+                let first = self.index.row_range(row).unwrap();
+                let target = first.start + SCAN_WINDOW;
+                let last = self
+                    .index
+                    .row_at_offset(target.min(self.index.total_len() - 1))
+                    .unwrap_or(row);
+                let last = if last < row || target >= self.index.total_len() {
+                    self.index.len() - 1
+                } else {
+                    last
+                };
+                let end = self.index.row_range(last).unwrap().end;
+                buf.resize((end - first.start) as usize, 0);
+                if !self.read_exact_at(first.start, &mut buf) {
+                    break; // the file went away; report what was found so far
+                }
+                let mut at = 0usize;
+                while let Some(found) = finder.find(&buf[at..]) {
+                    let offset = first.start + (at + found) as u64;
+                    let Some(r) = self.index.row_at_offset(offset) else {
+                        break;
+                    };
+                    let range = self.index.row_range(r).unwrap();
+                    if !self.edited.contains_key(&r) {
+                        let bytes = &buf[(range.start - first.start) as usize
+                            ..(range.end - first.start) as usize];
+                        if parser
+                            .parse(bytes)
+                            .is_some_and(|f| f.iter().any(|c| finder.find(c).is_some()))
+                        {
+                            hits.push(r as u32);
+                        }
+                    }
+                    at = (range.end - first.start) as usize; // next row onward
+                }
+                row = last + 1;
+            }
+            // Edited rows are judged by their edited text, never by the file's.
+            hits.extend(
+                self.edited
+                    .iter()
+                    .filter(|(_, rec)| rec.iter().any(|c| c.contains(needle)))
+                    .map(|(&id, _)| id as u32),
+            );
+            hits.sort_unstable();
+            hits.dedup();
+            return hits;
+        }
+        let mut window = ScanWindow::new();
+        for p in 0..self.index.len() {
+            let hit = match self.edited.get(&p) {
+                Some(row) => row.iter().any(|c| c.contains(needle)),
+                None => match self.index.row_range(p).and_then(|r| window.get(self, r)) {
+                    Some(bytes) if !prefilter || finder.find(bytes).is_some() => parser
+                        .parse(bytes)
+                        .is_some_and(|f| f.iter().any(|c| finder.find(c).is_some())),
+                    _ => false,
+                },
+            };
+            if hit {
+                hits.push(p as u32);
+            }
+        }
+        hits
     }
 
     fn sort(&self, view: View, sort_by: (usize, SortOrder)) -> View {
-        let texts: Vec<(String, u32)> = view
-            .into_iter()
-            .map(|p| {
-                let text = self
-                    .load_row(p as usize)
-                    .and_then(|r| r.get(sort_by.0).map(str::to_string))
-                    .unwrap_or_default();
-                (text, p)
-            })
-            .collect();
+        if !self.scan_is_streamable() {
+            let texts: Vec<(String, u32)> = view
+                .into_iter()
+                .map(|p| {
+                    let text = self
+                        .load_row(p as usize)
+                        .and_then(|r| r.get(sort_by.0).map(str::to_string))
+                        .unwrap_or_default();
+                    (text, p)
+                })
+                .collect();
+            return sort_cells(
+                texts.iter().map(|(t, p)| (t.as_str(), *p)).collect(),
+                sort_by.1,
+            );
+        }
+        // Copy the sort column's text into one arena (one allocation, not one
+        // per row), then sort `(text, position)` pairs borrowed from it.
+        let mut window = ScanWindow::new();
+        let mut parser = LeanParser::new(self.delimiter);
+        let mut arena = String::new();
+        let mut spans = Vec::with_capacity(view.len());
+        for p in view {
+            let start = arena.len();
+            match self.edited.get(&(p as usize)) {
+                Some(row) => arena.push_str(row.get(sort_by.0).unwrap_or("")),
+                None => {
+                    let cell = self
+                        .index
+                        .row_range(p as usize)
+                        .and_then(|r| window.get(self, r))
+                        .and_then(|bytes| parser.parse(bytes))
+                        .and_then(|f| f.get(sort_by.0));
+                    if let Some(cell) = cell {
+                        arena.push_str(&String::from_utf8_lossy(cell));
+                    }
+                }
+            }
+            spans.push((start, arena.len(), p));
+        }
         sort_cells(
-            texts.iter().map(|(t, p)| (t.as_str(), *p)).collect(),
+            spans.iter().map(|&(a, b, p)| (&arena[a..b], p)).collect(),
             sort_by.1,
         )
     }
@@ -930,6 +1220,88 @@ mod tests {
     #[test]
     fn row_edit_contract_holds() {
         conformance::run_row_edits(MAKE);
+    }
+
+    /// ~4 MB of rows, so a scan needs several windows and every window
+    /// boundary lands somewhere different.
+    fn big_rows(n: usize) -> Vec<Vec<String>> {
+        (0..n)
+            .map(|i| {
+                vec![
+                    i.to_string(),
+                    format!("user{i}"),
+                    format!("city{}", i % 97),
+                    format!("note, with comma {i}"),
+                    format!("say \"{}\"", i % 13),
+                ]
+            })
+            .collect()
+    }
+
+    fn big_sheet(rows: &[Vec<String>]) -> FileSheet {
+        let mut w = csv::WriterBuilder::new().has_headers(false).from_writer(vec![]);
+        for r in rows {
+            w.write_record(r).unwrap();
+        }
+        open(&w.into_inner().unwrap(), false)
+    }
+
+    fn naive_filter(rows: &[Vec<String>], needle: &str) -> Vec<u32> {
+        (0..rows.len()).filter(|&i| rows[i].iter().any(|c| c.contains(needle))).map(|i| i as u32).collect()
+    }
+
+    #[test]
+    fn filtering_across_many_scan_windows_matches_a_naive_search() {
+        let rows = big_rows(50_000);
+        let sheet = big_sheet(&rows);
+        for needle in ["user3", "city96", "comma 4421", "x", "\"7\"", "say \"1", "0,", "user49999", "zzz"] {
+            assert_eq!(sheet.filter(needle), naive_filter(&rows, needle), "needle {needle:?}");
+        }
+    }
+
+    #[test]
+    fn edited_rows_are_judged_by_their_edited_text_across_windows() {
+        let mut rows = big_rows(50_000);
+        let mut sheet = big_sheet(&rows);
+        for (id, col, text) in [(0usize, 1usize, "needle-a"), (24_999, 3, "needle-a, here"), (49_999, 2, "xx"), (1234, 1, "user99999")] {
+            assert!(sheet.set_cell(id, col, text));
+            rows[id][col] = text.to_string();
+        }
+        for needle in ["needle-a", "user99999", "user1234", "xx", "city0", "comma 24999"] {
+            assert_eq!(sheet.filter(needle), naive_filter(&rows, needle), "needle {needle:?}");
+        }
+    }
+
+    #[test]
+    fn a_needle_with_a_line_break_matches_only_inside_a_field() {
+        // "x\ny" would match across the boundary of rows 0 and 1 in the raw
+        // bytes, but no field contains it.
+        let s = open(b"x\ny\n\"p\nq\",z\n", false);
+        assert_eq!(s.filter("x\ny"), Vec::<u32>::new());
+        assert_eq!(s.filter("p\nq"), vec![2]);
+    }
+
+    #[test]
+    fn rows_longer_than_a_scan_window_and_than_a_block_read_correctly() {
+        let huge = "y".repeat(2_500_000);
+        let mut data = b"a,1\n".to_vec();
+        data.extend_from_slice(format!("\"{huge}\",2\nb,3\n").as_bytes());
+        let s = open(&data, false);
+        assert_eq!(s.len(), 3);
+        assert_eq!(s.cell(1, 0).unwrap().len(), 2_500_000);
+        assert_eq!(s.cell(2, 0).as_deref(), Some("b"));
+        assert_eq!(s.filter("yyyy"), vec![1]);
+        assert_eq!(s.filter("b"), vec![2]);
+        assert_eq!(s.sort(vec![0, 1, 2], (1, SortOrder::Dsc)), vec![2, 1, 0]);
+    }
+
+    #[test]
+    fn rows_straddling_block_boundaries_read_back_exactly() {
+        let rows = big_rows(3_000); // ~250 KB: several 64 KiB blocks
+        let sheet = big_sheet(&rows);
+        for (i, want) in rows.iter().enumerate() {
+            assert_eq!(strs(&sheet, i).as_ref(), Some(want), "row {i}");
+        }
     }
 
     #[test]

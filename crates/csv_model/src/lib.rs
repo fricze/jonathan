@@ -6,6 +6,7 @@
 use csv::StringRecord;
 
 mod file_sheet;
+mod lean;
 mod row_index;
 mod sheet;
 pub use file_sheet::{ByteSource, FileSheet, VecSource};
