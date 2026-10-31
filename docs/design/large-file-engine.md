@@ -165,11 +165,17 @@ use: an ordered list of *pieces*, each either a run of consecutive file rows
 inserting adds a piece. Memory is proportional to the number of edits;
 position -> id and id -> position are O(log pieces) (file rows keep their
 relative order, so a file id is located by binary search over runs).
+The piece table must also be **persistent** (copy-on-write path, O(log pieces)
+per edit, O(1) snapshot): an order-statistic tree whose nodes carry row
+counts. Off-the-shelf persistent vectors index by element, not by weight, so
+this is a custom structure; it is tested against the `Vec`-based `RefModel`.
 `removed: HashSet` disappears: a removed file row is simply in no piece.
 
 ### 4.3 Overlay
-`edited: HashMap<id, Arc<StringRecord>>` as now: copy-on-write rows, inserted
-rows and put-back rows. Memory ∝ edits. Snapshots share it by `Arc`.
+`edited: id -> Arc<StringRecord>`: copy-on-write rows, inserted rows and
+put-back rows. Memory ∝ edits. **Must be a persistent map** (structural
+sharing, e.g. an HAMT), not the `HashMap` it is today: today `snapshot()`
+clones the whole map, O(edits) per snapshot. See 4.9.
 
 ### 4.4 Columns: a column map (D1 decided: short rows are padded)
 Today column edits are an operation log replayed on every read (measured:
@@ -215,8 +221,13 @@ range from the sparse index), edited rows are serialised with the file's
 delimiter/quoting rules, inserted rows likewise. If the column map is not the
 identity every row is re-serialised (lean parse + write, ~1 us/row). Check
 free space first; on any error delete the temp file and keep the original.
-After a successful save the new file becomes the base, the overlay and piece
-table reset, and the sparse index is built from offsets noted while writing.
+After a successful save the new file becomes the base, the overlay is
+cleared, and the sparse index is built from offsets noted while writing.
+**Row ids do not change at save** (see 4.9): the piece table at the moment of
+saving is flattened into an *id map* - runs of `(new base row, count, first
+id)`, memory proportional to the number of pieces - so base row `j` of the new
+file still answers to the id it had. Ids are never reused (`next_row_id` only
+grows).
 Before overwriting, compare size and modification time with what was loaded;
 if changed, ask (reload / overwrite / Save As) (U7).
 
@@ -231,6 +242,40 @@ Workers receive `snapshot()`s (cheap `Arc` clones) and a `Cancel` token, and
 send batches (`View` chunks, progress) over the existing channel. The UI shows
 live counts. A new filter/sort request cancels the previous one. Index build
 runs the same way, so U1 holds.
+
+### 4.9 Undo/redo and history (D6 decided)
+
+**Decision: operation-based undo stays; the engine's structures become
+persistent so snapshots are O(1).** Whole-sheet versions as the undo mechanism
+were considered (undo = go back to an older immutable version) and rejected:
+
+| | Operation-based (kept) | Version-per-edit |
+|---|---|---|
+| Inverse logic per edit type | needed (6 variants today) | none |
+| Memory per cell edit | ~100 B | ~1 KB (tree path copy; estimate, not measured) |
+| Bulk edit (replace-all) | one `Batch` entry | one version, but needs a bulk/transient build mode |
+| UI needs ("Undo Eye color", jump to the cell) | carried in the entry | still needs a label + target stored beside each version |
+| Undo **across save** | works if ids are stable | **breaks**: a version refers to the old base file, which save replaced |
+| Crash-recovery journal | op log is directly serialisable | structures are not |
+
+What persistence buys regardless of the undo model: background filter/sort
+workers read a frozen, consistent version while the user keeps editing, at O(1)
+cost. That is why 4.2/4.3 require persistent structures. The column map is a
+small `Arc<Vec>` (clone-on-write, size ∝ columns), which is enough.
+
+**Requirement: undo and redo keep working across save** (Cmd+Z after Cmd+S).
+Operation entries refer to row ids and column ids, so both must be stable:
+column ids already are (`FileHeader.id`); row ids are kept stable by the id map
+in 4.6. An entry made before the save, e.g. "row deleted at position p",
+undoes after the save by inserting the row back as an inserted row, which
+makes the sheet dirty again, as it should. Dirty tracking stays relative to the
+save point (`mark_clean` records the stack depth), so undoing past the save
+point shows the sheet as modified.
+
+**History memory.** Entries are small, but a replace-all over millions of cells
+creates a `Batch` of millions of old values. Cap history by bytes (default
+256 MB); when exceeded, drop the oldest entries and tell the user once. A
+column delete stores an O(1) token (4.4), not per-row values.
 
 ## 5. Trait changes this implies
 
@@ -253,6 +298,8 @@ Everything else (`cell`, `record`, `set_cell`, `insert_row`, `remove_row`,
 * **D2 - envelope. DECIDED:** 5-10 GB required, larger possible later. The
   sparse index and piece table are therefore in scope (see the table in
   section 1).
+* **D6 - undo model. DECIDED:** operation-based undo, persistent engine
+  structures, stable row ids across save (4.9).
 * **D3 - backend threshold** (256 MB / 5% of RAM) and whether users get a
   setting.
 * **D4 - sort on huge files.** Accept 16 B/row transient memory and a full
@@ -271,6 +318,14 @@ Memory (new, deterministic): a test binary with a counting
 index of N rows allocates <= 0.25 B x N + c; a 1M-row sheet with 1k edits holds
 <= k x 1k; a filter view is 4 B x matches; the row cache never exceeds its byte
 cap. Compared across N = 100k and 1M to prove linear/flat growth.
+
+Undo (new): model-based - random edits, saves and undo/redo against the
+`MemorySheet` + `RefModel` pair; after any interleaving of edit, undo, redo
+and **save**, contents equal the model and the dirty flag equals "differs from
+the saved state". Snapshot cost: a counting allocator shows `snapshot()`
+allocates a constant number of bytes independent of the number of edits.
+Stable ids: after a save, `row_id`/`position_of` give the same ids for every
+surviving row, and an undo entry recorded before the save applies after it.
 
 Complexity (new, deterministic): an instrumented `ByteSource` counting calls
 and bytes. Assertions: reading a 60-row window reads <= X KB *and the same X
@@ -301,7 +356,8 @@ before writing.
 3. **Test infrastructure first:** counting allocator, instrumented source,
    file generator, perf harness with the budgets above (all failing).
 4. **Build to make them pass, in this order:** lean reader + block reads;
-   sparse index; piece table; column map + tokens; scanner (filter, sort,
+   sparse index; persistent piece table (order-statistic tree) and persistent
+   overlay map; id map for stable ids across save; column map + tokens; scanner (filter, sort,
    cancel, progress); `health`; save; real file `ByteSource`; app wiring
    with progress UI and the backend threshold.
 5. **Wire into the app behind a setting**, dogfood on real large files, then
