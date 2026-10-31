@@ -59,6 +59,13 @@ sandbox. Treat as order-of-magnitude, not benchmarks. Script:
 | `Vec<StringRecord>` in memory | **272 B/row = 3.7x the file text** |
 | Dense row index (current) | 8 B/row |
 
+**Measurement noise.** The cloud sandbox is a shared machine: the same
+index-build code measured 544, 365, 225, 172 and 101 MB/s across runs. The
+single-run numbers in this section are therefore best cases, good for orders
+of magnitude only. Timing tests take the best of several runs and scale their
+limits by a same-run calibration (`perf_scale`); the memory and I/O budgets
+are exact byte/call counts and carry no such noise.
+
 ### 2.1 Second round: reads, scaling, sort, write
 
 4 GB / 55M rows synthetic file (same shape as above), 4 vCPU cloud sandbox,
@@ -345,6 +352,27 @@ mid-scan surfaces via `health` and does not drop rows silently; a file
 modified between open and save is detected; a writer failing at any byte
 leaves the original file byte-identical; free-space shortage is reported
 before writing.
+
+## 7.1 Test infrastructure (built)
+
+`crates/csv_model/tests/common/mod.rs`: counting allocator (per-thread, so
+the harness and parallel tests cannot disturb a measurement; whole-process
+variant for multi-threaded scans), `Instrumented` byte source (counts calls and
+bytes, injects read failures), deterministic CSV generator, `check_le` /
+`check_ge` (assert and print a table line), `best_secs`, `perf_scale`.
+`crates/csv_model/tests/budgets.rs`: the budgets. Plain tests always run
+(harness self-tests and budgets already met, as regression guards);
+`#[ignore = "pending: ..."]` are budgets the design requires and the code does
+not meet yet; `#[ignore = "perf: ..."]` are machine-speed guards. When a
+pending item lands, its `ignore` is removed in the same commit.
+`scripts/budgets.sh` runs everything in release mode and prints measured
+values against limits.
+
+Still to add, each together with the API it needs (cancellation tokens,
+progress, `health()`, save): usability scenarios - typing a second filter
+cancels the first, first results arrive before the scan ends, mid-scan I/O
+errors are reported, a failing writer leaves the original intact, an
+externally modified file is detected before save.
 
 ## 8. Plan
 
