@@ -9,6 +9,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 use std::ops::Range;
+use std::sync::atomic::Ordering::Relaxed;
 use std::sync::{Arc, Mutex};
 
 use csv::StringRecord;
@@ -16,8 +17,8 @@ use csv::StringRecord;
 use crate::lean::LeanParser;
 use crate::pieces::Pieces;
 use crate::{
-    InsertedColumn, RemovedColumn, RowIndex, RowIndexBuilder, Sheet, SheetRow, SortOrder, View,
-    sort_cells,
+    InsertedColumn, RemovedColumn, ReplacedAll, RowIndex, RowIndexBuilder, RowScope, Sheet,
+    SheetRow, SortOrder, View, sort_cells,
 };
 
 /// Random-access bytes. Positional reads (not mmap) so that a file shrinking
@@ -171,7 +172,10 @@ enum ColSource {
     /// Field `i` of the row as stored in the file.
     Original(usize),
     /// A column added since load; the value for each row id (empty if absent).
-    Added(Arc<HashMap<usize, String>>),
+    /// `id` is unique for the life of the process (not an address: addresses
+    /// are reused after a free, which would let a rule meant for a removed
+    /// column reach a new one).
+    Added(u64, Arc<HashMap<usize, String>>),
 }
 
 /// How the length of a row changes under the column operations so far, as a
@@ -234,6 +238,73 @@ impl LenFn {
     }
 }
 
+/// Identity of a source column, stable while columns move around: a rule is
+/// attached to this, not to a position.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SrcKey {
+    Original(usize),
+    /// An added column, by the address of its (shared, never mutated) values.
+    Added(u64),
+}
+
+impl ColSource {
+    /// A new added column with these per-row values, with a fresh identity.
+    fn added(values: HashMap<usize, String>) -> ColSource {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        ColSource::Added(NEXT.fetch_add(1, Relaxed), Arc::new(values))
+    }
+
+    fn key(&self) -> SrcKey {
+        match self {
+            ColSource::Original(i) => SrcKey::Original(*i),
+            ColSource::Added(id, _) => SrcKey::Added(*id),
+        }
+    }
+}
+
+/// The rows a replace-all rule covers.
+#[derive(Clone, Debug)]
+enum RuleRows {
+    All,
+    /// Sorted, unique ids.
+    Ids(Arc<Vec<usize>>),
+}
+
+impl RuleRows {
+    fn covers(&self, id: usize) -> bool {
+        match self {
+            RuleRows::All => true,
+            RuleRows::Ids(ids) => ids.binary_search(&id).is_ok(),
+        }
+    }
+}
+
+/// "Replace `find` by `replace` in these source columns of these rows",
+/// applied whenever a field is read from the file. A replace-all over a huge
+/// file is one of these, not a million edited cells (design 4.10).
+#[derive(Clone, Debug)]
+struct Rule {
+    rows: RuleRows,
+    sources: Vec<SrcKey>,
+    find: Vec<u8>,
+    replace: Vec<u8>,
+}
+
+/// `text` with every `find` replaced; `None` if there was none.
+fn replace_bytes(text: &[u8], find: &[u8], replace: &[u8]) -> Option<Vec<u8>> {
+    let mut matches = memchr::memmem::find_iter(text, find).peekable();
+    matches.peek()?;
+    let mut out = Vec::with_capacity(text.len());
+    let mut last = 0;
+    for at in matches {
+        out.extend_from_slice(&text[last..at]);
+        out.extend_from_slice(replace);
+        last = at + find.len();
+    }
+    out.extend_from_slice(&text[last..]);
+    Some(out)
+}
+
 /// The file's columns as the user sees them, after inserts and removes.
 ///
 /// A row is an unbounded sequence of fields, empty past its own length (the
@@ -249,11 +320,16 @@ struct ColumnMap {
     entries: Vec<ColSource>,
     tail_start: usize,
     len: LenFn,
+    /// Replace-all rules, oldest first.
+    rules: Vec<Rule>,
 }
 
 impl ColumnMap {
     fn is_identity(&self) -> bool {
-        self.entries.is_empty() && self.tail_start == 0 && self.len.is_identity()
+        self.entries.is_empty()
+            && self.tail_start == 0
+            && self.len.is_identity()
+            && self.rules.is_empty()
     }
 
     /// Memory this map keeps alive. (An `Added` column's value table is shared
@@ -263,14 +339,64 @@ impl ColumnMap {
         std::mem::size_of::<Self>()
             + self.entries.capacity() * std::mem::size_of::<ColSource>()
             + self.len.flat.capacity() * std::mem::size_of::<usize>()
+            + self
+                .rules
+                .iter()
+                .map(|r| {
+                    std::mem::size_of::<Rule>()
+                        + r.sources.capacity() * std::mem::size_of::<SrcKey>()
+                        + r.find.capacity()
+                        + r.replace.capacity()
+                        + match &r.rows {
+                            RuleRows::All => 0,
+                            RuleRows::Ids(ids) => ids.capacity() * std::mem::size_of::<usize>(),
+                        }
+                })
+                .sum::<usize>()
     }
 
-    /// Some added column carries values that are not in the file's bytes, so a
-    /// search of the bytes cannot rule a row out.
-    fn has_added_values(&self) -> bool {
-        self.entries
-            .iter()
-            .any(|e| matches!(e, ColSource::Added(v) if !v.is_empty()))
+    /// Some field's text is not what the file's bytes say (an added column
+    /// with values, or a replace-all rule), so a search of the bytes cannot
+    /// rule a row out.
+    fn bytes_do_not_tell_the_whole_story(&self) -> bool {
+        !self.rules.is_empty()
+            || self
+                .entries
+                .iter()
+                .any(|e| matches!(e, ColSource::Added(_, v) if !v.is_empty()))
+    }
+
+    /// Identity of the source at logical column `col`.
+    fn source_key(&self, col: usize) -> SrcKey {
+        match self.entries.get(col) {
+            Some(source) => source.key(),
+            None => SrcKey::Original(self.tail_start + (col - self.entries.len())),
+        }
+    }
+
+    /// Add a replace-all rule for the sources currently at logical `cols`.
+    fn add_rule(&mut self, rows: RuleRows, cols: &[usize], find: &str, replace: &str) {
+        let mut sources: Vec<SrcKey> = cols.iter().map(|&c| self.source_key(c)).collect();
+        sources.dedup();
+        self.rules.push(Rule {
+            rows,
+            sources,
+            find: find.as_bytes().to_vec(),
+            replace: replace.as_bytes().to_vec(),
+        });
+    }
+
+    /// `base`, the text a source has in row `id`, after the rules.
+    fn apply_rules<'a>(&self, id: usize, key: SrcKey, base: &'a [u8]) -> Cow<'a, [u8]> {
+        let mut text = Cow::Borrowed(base);
+        for rule in &self.rules {
+            if rule.rows.covers(id) && rule.sources.contains(&key) {
+                if let Some(new) = replace_bytes(&text, &rule.find, &rule.replace) {
+                    text = Cow::Owned(new);
+                }
+            }
+        }
+        text
     }
 
     /// Spell out the first `upto` logical columns in `entries`.
@@ -308,26 +434,37 @@ impl ColumnMap {
         self.len.then_insert(col);
     }
 
-    fn field<'a>(&'a self, id: usize, raw: &[&'a [u8]], col: usize) -> &'a [u8] {
-        match self.entries.get(col) {
-            Some(ColSource::Original(i)) => raw.get(*i).copied().unwrap_or(b""),
-            Some(ColSource::Added(values)) => values.get(&id).map_or(&b""[..], |v| v.as_bytes()),
-            None => raw
-                .get(self.tail_start + (col - self.entries.len()))
-                .copied()
-                .unwrap_or(b""),
-        }
+    fn field<'a>(&'a self, id: usize, raw: &[&'a [u8]], col: usize) -> Cow<'a, [u8]> {
+        let (key, base): (SrcKey, &'a [u8]) = match self.entries.get(col) {
+            Some(source @ ColSource::Original(i)) => {
+                (source.key(), raw.get(*i).copied().unwrap_or(b""))
+            }
+            Some(source @ ColSource::Added(_, values)) => (
+                source.key(),
+                values.get(&id).map_or(&b""[..], |v| v.as_bytes()),
+            ),
+            None => {
+                let i = self.tail_start + (col - self.entries.len());
+                (SrcKey::Original(i), raw.get(i).copied().unwrap_or(b""))
+            }
+        };
+        self.apply_rules(id, key, base)
     }
 
     /// The row's fields as the user sees it, given its stored fields.
-    fn logical<'a>(&'a self, id: usize, raw: &[&'a [u8]]) -> Vec<&'a [u8]> {
+    fn logical<'a>(&'a self, id: usize, raw: &[&'a [u8]]) -> Vec<Cow<'a, [u8]>> {
         (0..self.len.apply(raw.len()))
             .map(|col| self.field(id, raw, col))
             .collect()
     }
 
     /// Just field `col` of the row (`None` where the row has no such field).
-    fn logical_field<'a>(&'a self, id: usize, raw: &[&'a [u8]], col: usize) -> Option<&'a [u8]> {
+    fn logical_field<'a>(
+        &'a self,
+        id: usize,
+        raw: &[&'a [u8]],
+        col: usize,
+    ) -> Option<Cow<'a, [u8]>> {
         (col < self.len.apply(raw.len())).then(|| self.field(id, raw, col))
     }
 }
@@ -340,6 +477,14 @@ struct FileColumn {
     before: ColumnMap,
     source: ColSource,
     edited: Vec<(usize, Option<String>)>,
+}
+
+/// What a file-backed `replace_all` hands back for `undo_replace_all`: the
+/// column map before it (rules are part of the map) and the previous record of
+/// every row held in memory that it rewrote.
+struct FileReplace {
+    before: ColumnMap,
+    edited: Vec<(usize, StringRecord)>,
 }
 
 /// What a file-backed `insert_column` hands back for `undo_insert_column`: the
@@ -545,7 +690,7 @@ impl FileSheet {
             if mapped && !self.columns.is_identity() {
                 let stored: Vec<&[u8]> = fields.iter().collect();
                 for f in self.columns.logical(file_row, &stored) {
-                    raw.push_field(f);
+                    raw.push_field(&f);
                 }
             } else {
                 for f in fields.iter() {
@@ -631,6 +776,54 @@ impl FileSheet {
         self.row_by_id(self.id_at(position)?)
     }
 
+    /// Visit the rows that come from the file (present in the sheet and not held
+    /// in memory) in display order, or just those with the given ids, with their
+    /// fields as the user sees them. With a `prefilter`, rows whose bytes do not
+    /// contain it are skipped unparsed; only sound when no field's text can differ
+    /// from the file's bytes (see `bytes_do_not_tell_the_whole_story`).
+    fn visit_file_rows(
+        &self,
+        ids: Option<&[usize]>,
+        prefilter: Option<&memchr::memmem::Finder<'_>>,
+        mut f: impl FnMut(usize, &[Cow<'_, [u8]>]),
+    ) {
+        let file_rows = self.index.len();
+        let mut window = ScanWindow::new();
+        let mut parser = LeanParser::new(self.delimiter);
+        let mut visit = |id: usize| {
+            if self.edited.contains_key(&id) {
+                return;
+            }
+            let Some(bytes) = self.index.row_range(id).and_then(|r| window.get(self, r)) else {
+                return;
+            };
+            if prefilter.is_some_and(|p| p.find(bytes).is_none()) {
+                return;
+            }
+            let Some(fields) = parser.parse(bytes) else {
+                return;
+            };
+            let stored: Vec<&[u8]> = fields.iter().collect();
+            f(id, &self.columns.logical(id, &stored));
+        };
+        match ids {
+            None => {
+                for (_, run) in self.pieces.runs() {
+                    for id in run.first..(run.first + run.len).min(file_rows) {
+                        visit(id);
+                    }
+                }
+            }
+            Some(ids) => {
+                for &id in ids {
+                    if id < file_rows && self.pieces.position_of(id).is_some() {
+                        visit(id);
+                    }
+                }
+            }
+        }
+    }
+
     /// Remember `record` as the content of row `id`, unless it is exactly what
     /// the file gives for that row (through the column map): then the row is
     /// just the file's again and nothing needs to stay in memory. This is what
@@ -648,14 +841,17 @@ impl FileSheet {
     /// The value a file column has in row `id`, as it was in the file (what a
     /// restored column puts back into rows that were copied into memory
     /// after the column was removed).
-    fn stored_value(&self, source: &ColSource, id: usize) -> Option<String> {
-        match source {
+    fn stored_value(&self, before: &ColumnMap, source: &ColSource, id: usize) -> Option<String> {
+        let text = match source {
             ColSource::Original(i) if id < self.index.len() => {
-                self.read_stored_row(id)?.get(*i).map(str::to_string)
+                self.read_stored_row(id)?.get(*i)?.to_string()
             }
-            ColSource::Original(_) => None,
-            ColSource::Added(values) => Some(values.get(&id).cloned().unwrap_or_default()),
-        }
+            ColSource::Original(_) => return None,
+            ColSource::Added(_, values) => values.get(&id).cloned().unwrap_or_default(),
+        };
+        // The rules in force when the column was removed apply to its text.
+        let ruled = before.apply_rules(id, source.key(), text.as_bytes());
+        Some(String::from_utf8_lossy(&ruled).into_owned())
     }
 }
 
@@ -786,7 +982,7 @@ impl Sheet for FileSheet {
             // earlier state by the undo stack) takes it from the file.
             let value = match remembered.get(&id) {
                 Some(v) => (*v).clone(),
-                None => self.stored_value(&token.source, id),
+                None => self.stored_value(&token.before, &token.source, id),
             };
             if let (Some(value), Some(row)) = (value, self.edited.get_mut(&id)) {
                 *row = Arc::new(record_with(row, col, &value));
@@ -810,7 +1006,7 @@ impl Sheet for FileSheet {
                 values.get(id).map_or("", String::as_str),
             ));
         }
-        Arc::make_mut(&mut self.columns).insert(col, ColSource::Added(Arc::new(values)));
+        Arc::make_mut(&mut self.columns).insert(col, ColSource::added(values));
         self.col_version += 1;
         let size = before.size_bytes()
             + std::mem::size_of::<FileInsert>()
@@ -869,7 +1065,8 @@ impl Sheet for FileSheet {
         // a quote (stored doubled), so a needle without one can rule out a row
         // by searching bytes alone, no parsing. Added columns hold values that
         // are not in the bytes at all.
-        let prefilter = !needle.as_bytes().contains(&b'"') && !self.columns.has_added_values();
+        let prefilter =
+            !needle.as_bytes().contains(&b'"') && !self.columns.bytes_do_not_tell_the_whole_story();
         // One search per window of many rows is sound when a match cannot span
         // two rows, i.e. the needle has no line break.
         let by_window = prefilter && !needle.as_bytes().iter().any(|&b| b == b'\n' || b == b'\r');
@@ -971,13 +1168,13 @@ impl Sheet for FileSheet {
                             .and_then(|bytes| parser.parse(bytes));
                         if let Some(fields) = fields {
                             let cell = if self.columns.is_identity() {
-                                fields.get(sort_by.0)
+                                fields.get(sort_by.0).map(Cow::Borrowed)
                             } else {
                                 let stored: Vec<&[u8]> = fields.iter().collect();
                                 self.columns.logical_field(id, &stored, sort_by.0)
                             };
                             if let Some(cell) = cell {
-                                arena.push_str(&String::from_utf8_lossy(cell));
+                                arena.push_str(&String::from_utf8_lossy(&cell));
                             }
                         }
                     }
@@ -989,6 +1186,112 @@ impl Sheet for FileSheet {
             spans.iter().map(|&(a, b, p)| (&arena[a..b], p)).collect(),
             sort_by.1,
         )
+    }
+
+    fn replace_all(
+        &mut self,
+        rows: RowScope<'_>,
+        cols: &[usize],
+        find: &str,
+        replace: &str,
+    ) -> (usize, ReplacedAll) {
+        let before = (*self.columns).clone();
+        let mut cols = cols.to_vec();
+        cols.sort_unstable();
+        cols.dedup();
+        let mut changed = 0;
+        let mut rewritten: Vec<(usize, StringRecord)> = Vec::new();
+        if !find.is_empty() && find != replace && !cols.is_empty() {
+            let ids: Option<Vec<usize>> = match rows {
+                RowScope::All => None,
+                RowScope::Ids(ids) => {
+                    let mut ids = ids.to_vec();
+                    ids.sort_unstable();
+                    ids.dedup();
+                    Some(ids)
+                }
+            };
+            let covers = |id: usize| ids.as_ref().is_none_or(|v| v.binary_search(&id).is_ok());
+
+            // Rows held in memory are rewritten now; the token keeps their old text.
+            for (id, row) in self.edited.iter_mut() {
+                if !covers(*id) {
+                    continue;
+                }
+                let mut fields: Option<Vec<String>> = None;
+                for &col in &cols {
+                    let Some(old) = row.get(col) else { continue };
+                    let new = old.replace(find, replace);
+                    if new != old {
+                        fields.get_or_insert_with(|| row.iter().map(str::to_string).collect())
+                            [col] = new;
+                        changed += 1;
+                    }
+                }
+                if let Some(fields) = fields {
+                    rewritten.push((*id, (**row).clone()));
+                    *row = Arc::new(fields.iter().map(String::as_str).collect());
+                }
+            }
+
+            // Everything else comes from the file: count what would change in
+            // one streaming pass, and if anything would, record the rule.
+            let finder = memchr::memmem::Finder::new(find.as_bytes());
+            let prefilter = !find.as_bytes().contains(&b'"')
+                && !self.columns.bytes_do_not_tell_the_whole_story();
+            let mut from_file = 0;
+            self.visit_file_rows(ids.as_deref(), prefilter.then_some(&finder), |_, fields| {
+                for &col in &cols {
+                    if let Some(cell) = fields.get(col) {
+                        if replace_bytes(cell, find.as_bytes(), replace.as_bytes())
+                            .is_some_and(|new| new != **cell)
+                        {
+                            from_file += 1;
+                        }
+                    }
+                }
+            });
+            if from_file > 0 {
+                let rule_rows = match ids {
+                    None => RuleRows::All,
+                    Some(ids) => RuleRows::Ids(Arc::new(ids)),
+                };
+                Arc::make_mut(&mut self.columns).add_rule(rule_rows, &cols, find, replace);
+                changed += from_file;
+            }
+        }
+        self.col_version += 1;
+        let size = before.size_bytes()
+            + std::mem::size_of::<FileReplace>()
+            + rewritten.capacity() * std::mem::size_of::<(usize, StringRecord)>()
+            + rewritten
+                .iter()
+                .map(|(_, r)| 96 + r.as_slice().len() + (r.len() + 1) * 8)
+                .sum::<usize>();
+        (
+            changed,
+            ReplacedAll::new(
+                FileReplace {
+                    before,
+                    edited: rewritten,
+                },
+                size,
+            ),
+        )
+    }
+
+    fn undo_replace_all(&mut self, replaced: &ReplacedAll) {
+        let Some(token) = replaced.payload::<FileReplace>() else {
+            return;
+        };
+        // Under the undo-stack discipline the map is as the replace-all left
+        // it, so the old one (rules included) is the exact inverse; the rows
+        // that were in memory get their old text back.
+        self.columns = Arc::new(token.before.clone());
+        for (id, old) in &token.edited {
+            self.edited.insert(*id, Arc::new(old.clone()));
+        }
+        self.col_version += 1;
     }
 
     fn edit_bytes(&self) -> usize {
@@ -1702,6 +2005,8 @@ mod tests {
     enum MapOp {
         Remove(usize),
         Insert(usize, Option<String>),
+        /// Replace `find` by `replace` in these columns of every row.
+        Replace(Vec<usize>, String, String),
     }
 
     fn naive(raw: &[&str], ops: &[MapOp]) -> Vec<String> {
@@ -1718,6 +2023,16 @@ mod tests {
                         row.push(String::new());
                     }
                     row.insert(*c, v.clone().unwrap_or_default());
+                }
+                MapOp::Replace(cols, find, replace) => {
+                    let mut cols = cols.clone();
+                    cols.sort_unstable();
+                    cols.dedup();
+                    for c in cols {
+                        if let Some(cell) = row.get_mut(c) {
+                            *cell = cell.replace(find.as_str(), replace);
+                        }
+                    }
                 }
             }
         }
@@ -1741,7 +2056,10 @@ mod tests {
                 }
                 MapOp::Insert(c, v) => {
                     let values: HashMap<usize, String> = v.iter().map(|v| (0, v.clone())).collect();
-                    map.insert(*c, ColSource::Added(Arc::new(values)));
+                    map.insert(*c, ColSource::added(values));
+                }
+                MapOp::Replace(cols, find, replace) => {
+                    map.add_rule(RuleRows::All, cols, find, replace);
                 }
             }
         }
@@ -1752,6 +2070,12 @@ mod tests {
         let op = prop_oneof![
             (0usize..7).prop_map(MapOp::Remove),
             (0usize..7, prop::option::of("[a-c]{0,2}")).prop_map(|(c, v)| MapOp::Insert(c, v)),
+            (
+                prop::collection::vec(0usize..7, 0..4),
+                "[a-c]{1,2}",
+                "[a-c0-9]{0,2}"
+            )
+                .prop_map(|(cols, find, replace)| MapOp::Replace(cols, find, replace)),
         ];
         prop::collection::vec(op, 0..10)
     }
@@ -1767,7 +2091,7 @@ mod tests {
     #[test]
     fn inserting_then_removing_column_zero_returns_to_the_identity() {
         let mut map = ColumnMap::default();
-        map.insert(0, ColSource::Added(Default::default()));
+        map.insert(0, ColSource::added(HashMap::new()));
         assert!(!map.is_identity());
         map.remove(0);
         assert!(map.is_identity(), "so scans can skip the mapping again");
@@ -1778,7 +2102,7 @@ mod tests {
         // A row shorter than the column is padded by the insert; removing the
         // new column does not un-pad it. The map must keep saying so.
         let mut map = ColumnMap::default();
-        map.insert(3, ColSource::Added(Default::default()));
+        map.insert(3, ColSource::added(HashMap::new()));
         map.remove(3);
         assert_eq!(mapped(&map, &[]), ["", "", ""]);
         assert_eq!(mapped(&map, &["a"]), ["a", "", ""]);
@@ -1787,6 +2111,61 @@ mod tests {
             ["a", "b", "c", "d"],
             "long rows are unchanged"
         );
+    }
+
+    #[test]
+    fn a_rule_follows_its_column_when_columns_move() {
+        let mut map = ColumnMap::default();
+        map.add_rule(RuleRows::All, &[2], "a", "Q");
+        assert_eq!(mapped(&map, &["a", "a", "a"]), ["a", "a", "Q"]);
+        map.insert(0, ColSource::added(HashMap::new()));
+        assert_eq!(
+            mapped(&map, &["a", "a", "a"]),
+            ["", "a", "a", "Q"],
+            "the replaced column is now index 3"
+        );
+        map.remove(1);
+        assert_eq!(mapped(&map, &["a", "a", "a"]), ["", "a", "Q"]);
+    }
+
+    #[test]
+    fn a_rule_never_reaches_a_column_added_after_its_own_column_was_removed() {
+        // Found by the property test: identifying an added column by the address
+        // of its values let a freed address be reused, so this rule (meant for
+        // the first column) reached the second.
+        let mut map = ColumnMap::default();
+        map.insert(0, ColSource::added(HashMap::new()));
+        map.add_rule(RuleRows::All, &[0], "b", "");
+        map.remove(0);
+        for _ in 0..50 {
+            let mut m = map.clone();
+            m.insert(0, ColSource::added(HashMap::from([(0, "b".to_string())])));
+            assert_eq!(
+                mapped(&m, &[]),
+                ["b"],
+                "the new column was added after the rule"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rule_covers_only_its_rows() {
+        let mut map = ColumnMap::default();
+        map.add_rule(RuleRows::Ids(Arc::new(vec![2, 5])), &[0], "a", "Q");
+        let raw: Vec<&[u8]> = vec![b"a"];
+        let show = |id| String::from_utf8(map.logical(id, &raw)[0].to_vec()).unwrap();
+        assert_eq!(
+            (show(1), show(2), show(5), show(6)),
+            ("a".into(), "Q".into(), "Q".into(), "a".into())
+        );
+    }
+
+    #[test]
+    fn rules_make_the_map_not_the_identity_and_the_bytes_untrustworthy() {
+        let mut map = ColumnMap::default();
+        assert!(map.is_identity() && !map.bytes_do_not_tell_the_whole_story());
+        map.add_rule(RuleRows::All, &[0], "a", "b");
+        assert!(!map.is_identity() && map.bytes_do_not_tell_the_whole_story());
     }
 
     #[test]
@@ -1799,7 +2178,7 @@ mod tests {
             ["a"],
             "a row that doesn't reach the column is untouched"
         );
-        map.insert(3, ColSource::Added(Default::default()));
+        map.insert(3, ColSource::added(HashMap::new()));
         assert_eq!(
             mapped(&map, &["a", "b", "c"]),
             ["a", "c", "", ""],

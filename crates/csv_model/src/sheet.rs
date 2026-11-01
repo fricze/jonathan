@@ -59,6 +59,21 @@ undo_token! {
     InsertedColumn
 }
 
+undo_token! {
+    /// What `replace_all` hands back so it can be undone exactly with
+    /// `undo_replace_all`.
+    ReplacedAll
+}
+
+/// Which rows a bulk operation covers.
+#[derive(Clone, Copy, Debug)]
+pub enum RowScope<'a> {
+    /// Every row the sheet has now.
+    All,
+    /// Only the rows with these ids (ids the sheet doesn't have are ignored).
+    Ids(&'a [usize]),
+}
+
 pub trait Sheet: Send + Sync {
     /// Number of rows.
     fn len(&self) -> usize;
@@ -127,6 +142,23 @@ pub trait Sheet: Send + Sync {
 
     /// `view` sorted by column `sort_by.0` (stable; numbers by value).
     fn sort(&self, view: View, sort_by: (usize, SortOrder)) -> View;
+
+    /// In the rows of `rows` (as they are now), replace every occurrence of
+    /// `find` with `replace` in the fields at the columns `cols` (a row with no
+    /// field there is skipped; a repeated column counts once). Returns how many
+    /// cells changed. An empty `find`, or `replace == find`, changes nothing.
+    /// Done in one pass: text produced by a replacement is not searched again.
+    /// The token undoes it exactly under the same precondition as
+    /// `restore_column` (everything since has been undone, in reverse order).
+    fn replace_all(
+        &mut self,
+        rows: RowScope<'_>,
+        cols: &[usize],
+        find: &str,
+        replace: &str,
+    ) -> (usize, ReplacedAll);
+
+    fn undo_replace_all(&mut self, replaced: &ReplacedAll);
 
     /// Memory held because of changes since the file was opened: rows copied
     /// in for editing, the row order, the column map. Read caches are not
@@ -275,6 +307,77 @@ impl Sheet for MemorySheet {
                 fields.truncate(old_len);
             }
             *record = fields.into_iter().collect();
+        }
+    }
+
+    fn replace_all(
+        &mut self,
+        rows: RowScope<'_>,
+        cols: &[usize],
+        find: &str,
+        replace: &str,
+    ) -> (usize, ReplacedAll) {
+        // (row id, column, the text it had)
+        let mut changed: Vec<(usize, usize, String)> = Vec::new();
+        if !find.is_empty() && find != replace {
+            let wanted: Option<std::collections::HashSet<usize>> = match rows {
+                RowScope::All => None,
+                RowScope::Ids(ids) => Some(ids.iter().copied().collect()),
+            };
+            let mut cols = cols.to_vec();
+            cols.sort_unstable();
+            cols.dedup();
+            for (id, record) in self.rows.iter_mut() {
+                if wanted.as_ref().is_some_and(|w| !w.contains(id)) {
+                    continue;
+                }
+                let mut rewritten: Option<Vec<String>> = None;
+                for &col in &cols {
+                    let Some(old) = record.get(col) else { continue };
+                    if !old.contains(find) {
+                        continue;
+                    }
+                    let new = old.replace(find, replace);
+                    if new == old {
+                        continue;
+                    }
+                    changed.push((*id, col, old.to_string()));
+                    rewritten.get_or_insert_with(|| record.iter().map(str::to_string).collect())
+                        [col] = new;
+                }
+                if let Some(fields) = rewritten {
+                    *record = fields.iter().map(String::as_str).collect();
+                }
+            }
+        }
+        let size = std::mem::size_of::<Vec<(usize, usize, String)>>()
+            + changed.capacity() * std::mem::size_of::<(usize, usize, String)>()
+            + changed
+                .iter()
+                .map(|(_, _, old)| old.capacity())
+                .sum::<usize>();
+        (changed.len(), ReplacedAll::new(changed, size))
+    }
+
+    fn undo_replace_all(&mut self, replaced: &ReplacedAll) {
+        let Some(changed) = replaced.payload::<Vec<(usize, usize, String)>>() else {
+            return;
+        };
+        let mut by_row: std::collections::HashMap<usize, Vec<(usize, &str)>> =
+            std::collections::HashMap::new();
+        for (id, col, old) in changed {
+            by_row.entry(*id).or_default().push((*col, old.as_str()));
+        }
+        for (id, record) in self.rows.iter_mut() {
+            if let Some(cells) = by_row.get(id) {
+                let mut fields: Vec<&str> = record.iter().collect();
+                for &(col, old) in cells {
+                    if col < fields.len() {
+                        fields[col] = old;
+                    }
+                }
+                *record = fields.into_iter().collect();
+            }
         }
     }
 

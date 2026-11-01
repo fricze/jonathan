@@ -13,7 +13,9 @@
 use csv::StringRecord;
 use proptest::prelude::*;
 
-use crate::{InsertedColumn, RemovedColumn, Sheet, SheetRow, SheetVec, SortOrder};
+use crate::{
+    InsertedColumn, RemovedColumn, ReplacedAll, RowScope, Sheet, SheetRow, SheetVec, SortOrder,
+};
 
 pub type Make = dyn Fn(SheetVec) -> Box<dyn Sheet>;
 
@@ -99,6 +101,7 @@ pub fn run_edits(make: &Make) {
     run_cell_edits(make);
     run_row_edits(make);
     run_column_edits(make);
+    run_bulk_edits(make);
     snapshot_is_isolated_from_later_edits(make);
 }
 
@@ -419,6 +422,194 @@ fn snapshot_is_isolated_from_row_edits(make: &Make) {
     assert_eq!(snap.position_of(5), None);
 }
 
+// ------------------------------------------------------------ bulk edits
+
+pub fn run_bulk_edits(make: &Make) {
+    replace_all_counts_cells_and_replaces_every_occurrence(make);
+    replace_all_respects_the_row_scope_and_ignores_what_does_not_exist(make);
+    replace_all_does_nothing_when_nothing_would_change(make);
+    replace_all_is_a_single_pass(make);
+    replace_all_undoes_exactly_with_edits_made_and_undone_in_between(make);
+    replace_all_follows_columns_that_move(make);
+    replace_all_is_seen_by_filter_and_sort(make);
+    replace_all_interacts_with_row_operations(make);
+    replace_all_is_isolated_from_snapshots(make);
+}
+
+fn all_fields(s: &dyn Sheet) -> Vec<Vec<String>> {
+    (0..s.len()).map(|p| fields(s, p).unwrap()).collect()
+}
+
+fn replace_all_counts_cells_and_replaces_every_occurrence(make: &Make) {
+    let mut s = make(rows_of(&[&["ab", "abab", "x"], &["b", "a"], &["abc"]]));
+    let (changed, _token) = s.replace_all(RowScope::All, &[0, 1], "ab", "Z");
+    assert_eq!(
+        changed, 3,
+        "row0 col0, row0 col1 (two occurrences, one cell), row2 col0"
+    );
+    assert_eq!(
+        fields(s.as_ref(), 0),
+        Some(vec!["Z".into(), "ZZ".into(), "x".into()])
+    );
+    assert_eq!(fields(s.as_ref(), 1), Some(vec!["b".into(), "a".into()]));
+    assert_eq!(fields(s.as_ref(), 2), Some(vec!["Zc".into()]));
+    let (again, _t) = s.replace_all(RowScope::All, &[0, 1, 2], "Z", "");
+    assert_eq!(again, 3);
+    assert_eq!(
+        fields(s.as_ref(), 0),
+        Some(vec!["".into(), "".into(), "x".into()])
+    );
+}
+
+fn replace_all_respects_the_row_scope_and_ignores_what_does_not_exist(make: &Make) {
+    let mut s = make(rows_of(&[&["a", "a"], &["a"], &["a", "a"], &["a"]]));
+    let (changed, _t) = s.replace_all(RowScope::Ids(&[1, 3, 77]), &[0, 1, 9], "a", "b");
+    assert_eq!(
+        changed, 2,
+        "rows 1 and 3, column 0 only (they have no column 1; 9 and id 77 do not exist)"
+    );
+    assert_eq!(
+        all_fields(s.as_ref()),
+        vec![vec!["a", "a"], vec!["b"], vec!["a", "a"], vec!["b"]]
+    );
+    // a removed row is not in the sheet any more, so it is not covered
+    let gone = s.remove_row(0).unwrap();
+    let (changed, _t) = s.replace_all(RowScope::All, &[0], "a", "c");
+    assert_eq!(changed, 1, "only the one remaining row that still says 'a'");
+    s.insert_row(0, gone);
+    assert_eq!(
+        fields(s.as_ref(), 0),
+        Some(vec!["a".into(), "a".into()]),
+        "put back as it was removed"
+    );
+}
+
+fn replace_all_does_nothing_when_nothing_would_change(make: &Make) {
+    let mut s = make(rows_of(&[&["ab"], &["cd"]]));
+    let before = all_fields(s.as_ref());
+    for (find, replace, cols) in [
+        ("", "x", vec![0]),
+        ("ab", "ab", vec![0]),
+        ("zz", "y", vec![0]),
+        ("ab", "y", vec![5]),
+        ("ab", "y", vec![]),
+    ] {
+        let (changed, token) = s.replace_all(RowScope::All, &cols, find, replace);
+        assert_eq!(changed, 0, "{find:?} -> {replace:?} in {cols:?}");
+        s.undo_replace_all(&token);
+        assert_eq!(all_fields(s.as_ref()), before);
+    }
+    let (changed, _t) = s.replace_all(RowScope::All, &[0, 0, 0], "ab", "y");
+    assert_eq!(changed, 1, "a column named three times is one cell");
+}
+
+fn replace_all_is_a_single_pass(make: &Make) {
+    let mut s = make(rows_of(&[&["a", "aa"]]));
+    let (changed, _t) = s.replace_all(RowScope::All, &[0, 1], "a", "aa");
+    assert_eq!(changed, 2);
+    assert_eq!(
+        fields(s.as_ref(), 0),
+        Some(vec!["aa".into(), "aaaa".into()]),
+        "the new text is not searched again"
+    );
+}
+
+fn replace_all_undoes_exactly_with_edits_made_and_undone_in_between(make: &Make) {
+    let original: [&[&str]; 4] = [&["a1", "b1"], &["a2", "b2"], &["a3"], &["x", "a4"]];
+    let mut s = make(rows_of(&original));
+    s.set_cell(1, 1, "a-edited"); // already edited when the replace-all comes
+    let before: Vec<Vec<String>> = all_fields(s.as_ref());
+    let (changed, token) = s.replace_all(RowScope::All, &[0, 1], "a", "Q");
+    assert_eq!(changed, 5);
+    assert_eq!(
+        fields(s.as_ref(), 1),
+        Some(vec!["Q2".into(), "Q-edited".into()]),
+        "an edited row is replaced too"
+    );
+    // more work, undone in reverse order (the app's undo stack)
+    assert!(s.set_cell(3, 0, "other"));
+    assert!(s.set_cell(3, 0, "x"));
+    let row = s.remove_row(2).unwrap();
+    s.insert_row(2, row);
+    s.undo_replace_all(&token);
+    assert_eq!(
+        all_fields(s.as_ref()),
+        before,
+        "exactly as before the replace-all"
+    );
+}
+
+fn replace_all_follows_columns_that_move(make: &Make) {
+    let mut s = make(rows_of(&[&["a", "a", "a"], &["a", "a", "a"]]));
+    // replace in the column that is at index 2 now
+    s.replace_all(RowScope::All, &[2], "a", "Q");
+    // then insert a column in front and remove another: the replaced column moves
+    let ins = s.insert_column(0, &[]);
+    let rem = s.remove_column(1);
+    assert_eq!(
+        fields(s.as_ref(), 0),
+        Some(vec!["".into(), "a".into(), "Q".into()])
+    );
+    s.restore_column(1, &rem);
+    s.undo_insert_column(0, &ins);
+    assert_eq!(
+        fields(s.as_ref(), 1),
+        Some(vec!["a".into(), "a".into(), "Q".into()])
+    );
+}
+
+fn replace_all_is_seen_by_filter_and_sort(make: &Make) {
+    let mut s = make(rows_of(&[&["b", "10"], &["a", "9"], &["c", "x9"]]));
+    s.replace_all(RowScope::All, &[1], "9", "100");
+    assert_eq!(s.filter("100"), vec![1, 2], "the new text can be found");
+    assert_eq!(s.filter("x9"), Vec::<u32>::new(), "the old text can not");
+    assert_eq!(s.filter("c"), vec![2]);
+    // 10 < 100 numerically; 'x100' is text and sorts after the numbers
+    assert_eq!(s.sort(vec![0, 1, 2], (1, SortOrder::Asc)), vec![0, 1, 2]);
+    s.replace_all(RowScope::All, &[0], "a", "zzz");
+    assert_eq!(s.sort(vec![0, 1, 2], (0, SortOrder::Asc)), vec![0, 2, 1]);
+}
+
+fn replace_all_interacts_with_row_operations(make: &Make) {
+    let mut s = make(rows_of(&[&["a"], &["a"], &["a"]]));
+    s.replace_all(RowScope::All, &[0], "a", "Q");
+    // a row put back, one inserted afterwards, an edit: none is changed again
+    let row = s.remove_row(1).unwrap();
+    s.insert_row(1, row);
+    s.insert_row(3, (9, StringRecord::from(vec!["a"])));
+    assert!(s.set_cell(0, 0, "a"));
+    assert_eq!(
+        all_fields(s.as_ref()),
+        vec![vec!["a"], vec!["Q"], vec!["Q"], vec!["a"]]
+    );
+    // rows added after the rule are untouched by a later, different replace-all
+    let (changed, _t) = s.replace_all(RowScope::All, &[0], "Q", "R");
+    assert_eq!(changed, 2);
+    assert_eq!(
+        all_fields(s.as_ref()),
+        vec![vec!["a"], vec!["R"], vec!["R"], vec!["a"]]
+    );
+}
+
+fn replace_all_is_isolated_from_snapshots(make: &Make) {
+    let mut s = make(rows_of(&[&["a", "b"], &["a", "c"]]));
+    let before = s.snapshot();
+    let (_, token) = s.replace_all(RowScope::All, &[0], "a", "Q");
+    let during = s.snapshot();
+    s.undo_replace_all(&token);
+    assert_eq!(
+        fields(before.as_ref(), 0),
+        Some(vec!["a".into(), "b".into()])
+    );
+    assert_eq!(
+        fields(during.as_ref(), 0),
+        Some(vec!["Q".into(), "b".into()]),
+        "frozen while the rule was in force"
+    );
+    assert_eq!(fields(s.as_ref(), 0), Some(vec!["a".into(), "b".into()]));
+    assert_eq!(during.filter("Q"), vec![0, 1]);
+}
+
 fn empty_sheet(make: &Make) {
     let s = make(vec![]);
     assert_eq!(s.len(), 0);
@@ -633,6 +824,40 @@ impl RefModel {
         out
     }
 
+    /// The contract's `replace_all`, done the obvious way.
+    fn replace_all(
+        &mut self,
+        ids: Option<&[usize]>,
+        cols: &[usize],
+        find: &str,
+        replace: &str,
+    ) -> usize {
+        let mut cols = cols.to_vec();
+        cols.sort_unstable();
+        cols.dedup();
+        let mut changed = 0;
+        if find.is_empty() || find == replace {
+            return 0;
+        }
+        for (id, f) in self.rows.iter_mut() {
+            if ids.is_some_and(|ids| !ids.contains(id)) {
+                continue;
+            }
+            for &col in &cols {
+                if let Some(cell) = f.get_mut(col) {
+                    if cell.contains(find) {
+                        let new = cell.replace(find, replace);
+                        if new != *cell {
+                            *cell = new;
+                            changed += 1;
+                        }
+                    }
+                }
+            }
+        }
+        changed
+    }
+
     /// Exact inverse of `remove_column`: only rows that had a value get one back.
     fn restore_column(&mut self, col: usize, values: &[(usize, String)]) {
         for (id, f) in self.rows.iter_mut() {
@@ -704,6 +929,21 @@ pub enum Op {
         col: usize,
         with_values: bool,
     },
+    /// Replace in some columns of some rows (`pick` chooses ids by index into
+    /// the current rows; empty = every row).
+    Replace {
+        picks: Vec<usize>,
+        cols: Vec<usize>,
+        find: String,
+        replace: String,
+    },
+    /// Replace and immediately undo: a no-op overall, from any state.
+    ReplaceThenUndo {
+        picks: Vec<usize>,
+        cols: Vec<usize>,
+        find: String,
+        replace: String,
+    },
     /// Insert a column and immediately undo it: from any state this must leave
     /// the sheet exactly as it was.
     InsertThenUndo {
@@ -724,6 +964,15 @@ fn text() -> impl Strategy<Value = String> {
     "[a-c0-9,\" \\n]{0,4}"
 }
 
+fn replace_op() -> impl Strategy<Value = (Vec<usize>, Vec<usize>, String, String)> {
+    (
+        prop::collection::vec(any::<usize>(), 0..4),
+        prop::collection::vec(0usize..6, 0..4),
+        "[a-c0-9,\" ]{1,2}",
+        "[a-c0-9,\" ]{0,2}",
+    )
+}
+
 pub fn ops() -> impl Strategy<Value = Vec<Op>> {
     let op = prop_oneof![
         3 => (any::<usize>(), 0usize..5, text()).prop_map(|(pick, col, value)| Op::SetCell { pick, col, value }),
@@ -737,6 +986,8 @@ pub fn ops() -> impl Strategy<Value = Vec<Op>> {
         2 => Just(Op::RestoreColumn),
         2 => (0usize..7, any::<bool>()).prop_map(|(col, with_values)| Op::InsertThenUndo { col, with_values }),
         2 => (0usize..7).prop_map(|col| Op::RemoveThenRestore { col }),
+        3 => replace_op().prop_map(|(picks, cols, find, replace)| Op::Replace { picks, cols, find, replace }),
+        2 => replace_op().prop_map(|(picks, cols, find, replace)| Op::ReplaceThenUndo { picks, cols, find, replace }),
         1 => Just(Op::Snapshot),
     ];
     prop::collection::vec(op, 0..40)
@@ -817,10 +1068,28 @@ pub fn assert_same(sheet: &dyn Sheet, model: &RefModel, ctx: &str) {
     );
 }
 
+/// Row ids chosen by index from the model's current rows (`None` = every row).
+fn chosen_ids(model: &RefModel, picks: &[usize]) -> Option<Vec<usize>> {
+    (!picks.is_empty() && !model.rows.is_empty()).then(|| {
+        picks
+            .iter()
+            .map(|p| model.rows[p % model.rows.len()].0)
+            .collect()
+    })
+}
+
+fn scope(ids: &Option<Vec<usize>>) -> RowScope<'_> {
+    match ids {
+        None => RowScope::All,
+        Some(ids) => RowScope::Ids(ids),
+    }
+}
+
 /// The last column operation, while it can still be undone exactly.
 enum Undoable {
     Removed(usize, RemovedColumn, Vec<(usize, String)>),
     Inserted(usize, InsertedColumn, Vec<(usize, usize)>),
+    Replaced(ReplacedAll, RefModel),
 }
 
 /// Apply `ops` to a backend built from `initial` and to a [`RefModel`],
@@ -915,6 +1184,36 @@ pub fn check_ops(make: &Make, initial: &[Vec<String>], ops: &[Op]) {
                     "the model's own remove/restore is an exact inverse: {ctx}"
                 );
             }
+            Op::Replace {
+                picks,
+                cols,
+                find,
+                replace,
+            } => {
+                let ids = chosen_ids(&model, picks);
+                let before = model.clone();
+                let (n, token) = sheet.replace_all(scope(&ids), cols, find, replace);
+                let want = model.replace_all(ids.as_deref(), cols, find, replace);
+                assert_eq!(n, want, "cells changed by {ctx}");
+                undoable = Some(Undoable::Replaced(token, before));
+            }
+            Op::ReplaceThenUndo {
+                picks,
+                cols,
+                find,
+                replace,
+            } => {
+                let ids = chosen_ids(&model, picks);
+                let before = model.clone();
+                let (n, token) = sheet.replace_all(scope(&ids), cols, find, replace);
+                assert_eq!(
+                    n,
+                    model.replace_all(ids.as_deref(), cols, find, replace),
+                    "cells changed by {ctx}"
+                );
+                sheet.undo_replace_all(&token);
+                model = before;
+            }
             Op::RestoreColumn => match undoable.take() {
                 Some(Undoable::Removed(col, token, values)) => {
                     sheet.restore_column(col, &token);
@@ -923,6 +1222,10 @@ pub fn check_ops(make: &Make, initial: &[Vec<String>], ops: &[Op]) {
                 Some(Undoable::Inserted(col, token, padded)) => {
                     sheet.undo_insert_column(col, &token);
                     model.undo_insert_column(col, &padded);
+                }
+                Some(Undoable::Replaced(token, before)) => {
+                    sheet.undo_replace_all(&token);
+                    model = before;
                 }
                 None => {}
             },

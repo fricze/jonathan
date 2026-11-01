@@ -13,7 +13,7 @@ mod sheet;
 pub mod testing;
 pub use file_sheet::{ByteSource, FileSheet, VecSource};
 pub use row_index::{RowIndex, RowIndexBuilder};
-pub use sheet::{InsertedColumn, MemorySheet, RemovedColumn, Sheet};
+pub use sheet::{InsertedColumn, MemorySheet, RemovedColumn, ReplacedAll, RowScope, Sheet};
 
 #[cfg(test)]
 pub(crate) mod conformance;
