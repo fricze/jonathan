@@ -300,6 +300,34 @@ creates a `Batch` of millions of old values. Cap history by bytes (default
 256 MB); when exceeded, drop the oldest entries and tell the user once. A
 column delete stores an O(1) token (4.4), not per-row values.
 
+### 4.10 Bulk edits: a replace-all is a rule, not a million edits
+
+**Problem (measured, 7.3).** Every edited row costs ~400 B in memory plus
+~180 B per changed cell in the undo stack. A replace-all that changes 10% of a
+62.5M-row file needs ~3.5 GB; one that touches every row ~35 GB and cannot
+work. Bulk edits are common on big files ("NULL" -> "" everywhere).
+
+**Design.** `Sheet::replace_all(rows, cols, find, replace)` returns the number
+of cells changed and an undo token. A memory-backed sheet applies it eagerly
+(its token holds the old values). A file-backed sheet stores it as a **rule**
+attached to the *source* columns of the column map (so it follows a column when
+columns are inserted, removed or restored) with a row scope: every row, or the
+sorted list of ids that were selected (8 B per row, not 580). Reading a field
+that comes from the file applies the rules that cover its source and row. Rows
+already held in memory are rewritten eagerly, and the token keeps their old
+records. Undo puts the previous column map back (rules are part of it) and the
+old records of those rows.
+
+* Memory for "replace in every row": a few hundred bytes, whatever the file.
+* The number of cells changed is found by one streaming scan.
+* Filter on a sheet with rules cannot search raw bytes (the visible text is
+  not in the file), so it parses every row (5-6M rows/s instead of 5 GB/s) -
+  the price of not materialising the edit.
+* Save streams through the same mapping, so a replace-all on a 10 GB file is
+  a streaming rewrite, not an in-memory edit.
+* Rules are applied per field read, in order. Many rules cost time per read; a
+  cap (and merging rules that name the same column) is a follow-up.
+
 ## 5. Trait changes this implies
 
 * `remove_column` returns a token; add `restore_column` (or make insert accept
@@ -420,43 +448,37 @@ edits).
 column operations, undo, redo) over a file-backed sheet on a 62.5M-row, 5 GB
 *virtual* file (`csv_model::testing::SyntheticSource`: rows are computed when
 read, so no disk is needed), next to the same scenarios on 1M rows. Memory is
-counted exactly by the test allocator. One run, release build:
+counted exactly by the test allocator. Release build, after the piece table and
+dropping unchanged rows (the first measurement is in the git history):
 
 | Operation | Undo stack | Process memory | Same at 1M and 62.5M rows? |
 |---|---|---|---|
 | Delete a column, nothing edited | 275 B | 0.9 KB | yes, identical |
 | Insert a column, nothing edited | 255 B | 0.4 KB | yes |
-| Single-cell edit | 117 B | **943 B** | yes |
-| Replace-all, per cell (Batch) | 178 B | **548 B** | yes |
+| Single-cell edit | 117 B | 514 B (so ~400 B for the row copied in) | yes |
+| Replace-all, per cell (Batch) | 178 B | 538 B | yes |
 | Delete a column with 15k rows in memory | 630 KB (42 B/row) | 0.3 MB | yes |
-| Delete a row | 341 B | **498 MB the first time**, then 0 | no - grows with the file |
+| Delete a row | 341 B | **0** (was 498 MB the first time) | yes (20 deletes: 0.01 s, was 1.6 s) |
 | Insert a row | 103 B | ~0 | yes |
 | Index of the opened file | - | **537 MB** (8.59 B/row) | no - grows with the file |
+
+Memory the sheet holds for changes (`Sheet::edit_bytes`): 4.2 MB at the peak of
+15k edited rows, **144 B after undoing every edit** (was 13.5 MB before rows
+equal to the file were dropped).
 
 What this shows:
 
 * **The undo stack is bounded by the edits, not the file.** Every entry costs
-  exactly the same on a 5 GB file as on an 80 MB one. Tokens for columns are a
-  few hundred bytes when nothing is in memory.
-* **The real memory cost of editing is the overlay, not the undo stack.** A
-  cell edit costs 117 B of undo but 943 B of process memory: the row is
-  copied into memory (about 830 B for an 8-field row). A replace-all that
-  touches 1% of this file (625k rows) needs ~340 MB; one that touches 10%
-  needs ~3.4 GB; one that touches every row (62.5M) would need ~34 GB and
-  cannot work. **Risk, not yet designed for:** bulk edits scale memory by
-  ~0.5-1 KB per edited row. Options: a cell-granular overlay (a changed cell
-  is ~60 B, not a whole row), edits stored column-wise for bulk operations,
-  or running replace-all as a streaming rewrite to a new file instead of an
-  in-memory edit.
-* **Undoing does not give the overlay's memory back.** After undoing every
-  edit the process still holds ~13.5 MB, the rows that were copied in and now
-  equal the file again. Pending test: `undoing_every_edit_gives_the_memory_back`.
-* **Row insert/remove still builds the 500 MB order list** at the first
-  operation and costs ~80 ms per operation at this size (1.6 s for 20
-  deletes): the piece table's reason for existing (pending budgets).
+  exactly the same on a 5 GB file as on an 80 MB one.
+* **Structural edits no longer cost anything proportional to the file** (piece
+  table, 4.2).
+* **Edits cost ~400 B per edited row in memory, plus ~180 B per changed cell
+  of undo.** Fine for edits typed by a person; not for bulk edits: a
+  replace-all over 10% of this file would need ~3.5 GB, over every row ~35 GB.
+  Bulk edits therefore become rules, not edits (4.10).
 * **The dense index** is 537 MB for 5 GB; the sparse index brings it to 16 MB
   (pending budget).
-* The sheet took 59 s end to end, mostly indexing and synthesising 5 GB.
+* The test takes ~90 s end to end, mostly indexing and synthesising 5 GB.
 
 Sizes reported by `UndoEntry::approx_bytes` and by tokens are checked against
 the allocator in `crates/csv_model/tests/budgets.rs`.
