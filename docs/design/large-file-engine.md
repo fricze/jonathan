@@ -198,9 +198,25 @@ This needed a decision on ragged rows (D1), because the old contract clamped
 `insert_column` to each row's own length, which a column map cannot express.
 **Decided: a row shorter than the insertion column is treated as padded with
 empty fields**, so the new column lines up in every row; removing a column
-from a row that doesn't reach it is a no-op. The contract, `MemorySheet`,
-`RefModel` and the current `FileSheet` already implement this; the column map
-is now a pure internal optimisation that the existing tests guard.
+from a row that doesn't reach it is a no-op.
+
+**Padding is real, which the map has to know (found by testing it against a
+naive per-row model).** Inserting a column at 3 into a 0-field row leaves three
+empty fields behind even if that column is later removed. So a row's length
+depends on the order of operations and on its stored length `k`. The map keeps
+a small length function `f(k)` (a base plus a short list of breakpoints, since
+every operation grows the length by 0 or 1 when `k` grows by 1) next to the
+column list. Both stay as small as the widest column ever touched.
+
+**Undo token.** `remove_column` returns the map as it was before the removal
+(small, independent of file size), the removed column's source, and the removed
+column's value in each row that had been copied into memory. `restore_column`
+puts the old map back and reinserts the value into those in-memory rows; a row
+copied in after the removal (and returned to its earlier state by the undo
+stack) takes the value from the file. The contract: restore is an exact
+inverse **provided everything done since the removal has been undone in
+reverse order** (the app's undo stack), and never panics otherwise. Deleting a
+column on a file of any size reads nothing from it.
 
 ### 4.5 Reading and scanning
 * One reusable `csv_core` reader and buffers per thread; no allocation per row.
@@ -392,9 +408,11 @@ filter, arena-based sort-key extraction. Measured against the first red run
 | First touch, 60 rows x 8 cells | 1.7 ms | 0.19 ms |
 | Random row read | 27.5 us | 2.1 us |
 
+Column delete now reads 0 bytes of the file (column map + undo token, 4.4).
+
 Still red (pending): sparse index (10.4 B/row now), persistent piece table
 (row edits scale with file size), persistent overlay (snapshot cost grows with
-edits), column map (column delete still scans the file).
+edits).
 
 ## 8. Plan
 

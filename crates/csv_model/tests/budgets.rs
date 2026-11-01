@@ -360,7 +360,6 @@ fn io_a_visible_window_costs_a_couple_of_reads_independent_of_file_size() {
 }
 
 #[test]
-#[ignore = "pending: column map + undo token (design 4.4)"]
 fn io_deleting_a_column_never_touches_the_file() {
     let _g = serial();
     for n in [20_000usize, 100_000] {

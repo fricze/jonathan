@@ -163,50 +163,188 @@ thread_local! {
     static PARSER: RefCell<Option<(u8, LeanParser)>> = const { RefCell::new(None) };
 }
 
-/// A column insert or remove, replayed lazily on every row read from the
-/// file. (To be replaced by a column map now that short rows are padded
-/// rather than clamped; see docs/design/large-file-engine.md, 4.4.)
-#[derive(Clone)]
-enum ColOp {
-    Remove(usize),
-    /// Undo of a `Remove`: put the value back, but only into rows that had one.
-    Restore {
-        col: usize,
-        values: Arc<HashMap<usize, String>>,
-    },
-    Insert {
-        col: usize,
-        values: Arc<HashMap<usize, String>>,
-    },
+/// Where a logical column's data comes from.
+#[derive(Clone, Debug)]
+enum ColSource {
+    /// Field `i` of the row as stored in the file.
+    Original(usize),
+    /// A column added since load; the value for each row id (empty if absent).
+    Added(Arc<HashMap<usize, String>>),
 }
 
-impl ColOp {
-    fn apply(&self, id: usize, row: &StringRecord) -> StringRecord {
-        match self {
-            ColOp::Remove(col) => row
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| i != col)
-                .map(|(_, f)| f)
-                .collect(),
-            ColOp::Restore { col, values } => match values.get(&id) {
-                None => row.clone(),
-                Some(value) => {
-                    let mut fields: Vec<&str> = row.iter().collect();
-                    fields.resize(fields.len().max(*col), "");
-                    fields.insert(*col, value);
-                    fields.into_iter().collect()
-                }
-            },
-            ColOp::Insert { col, values } => {
-                let mut fields: Vec<&str> = row.iter().collect();
-                // Pad a short row so the new column lines up with the rest.
-                fields.resize(fields.len().max(*col), "");
-                fields.insert(*col, values.get(&id).map_or("", String::as_str));
-                fields.into_iter().collect()
+/// How the length of a row changes under the column operations so far, as a
+/// function of its stored length `k`: `f(k) = base + k - |{z in flat : z < k}|`.
+///
+/// Needed because padding is real: inserting a column at 3 into a 0-field row
+/// leaves 3 empty fields behind even if that column is later removed, so the
+/// length a row ends up with depends on the order of operations and on how
+/// long the row was. Each operation is a monotone step function (the length
+/// grows by 0 or 1 when `k` grows by 1), and so are their compositions;
+/// `flat` lists the `k` where it grows by 0. It stays as small as the widest
+/// column ever touched.
+#[derive(Clone, Debug, Default)]
+struct LenFn {
+    base: usize,
+    flat: Vec<usize>,
+}
+
+impl LenFn {
+    fn is_identity(&self) -> bool {
+        self.base == 0 && self.flat.is_empty()
+    }
+
+    fn apply(&self, k: usize) -> usize {
+        self.base + k - self.flat.partition_point(|&z| z < k)
+    }
+
+    /// Follow with "insert a column at `c`": `x -> max(x, c) + 1`, which grows
+    /// by 0 where `x < c`.
+    fn then_insert(&mut self, c: usize) {
+        let mut flat = self.flat.clone();
+        let mut k = 0;
+        while self.apply(k) < c {
+            if self.apply(k + 1) > self.apply(k) {
+                flat.push(k);
             }
+            k += 1;
+        }
+        flat.sort_unstable();
+        flat.dedup();
+        self.base = self.base.max(c) + 1;
+        self.flat = flat;
+    }
+
+    /// Follow with "remove column `c`": `x -> x - (x > c)`, which grows by 0
+    /// where `x == c`.
+    fn then_remove(&mut self, c: usize) {
+        let mut flat = self.flat.clone();
+        let mut k = 0;
+        while self.apply(k) <= c {
+            if self.apply(k) == c && self.apply(k + 1) > c {
+                flat.push(k);
+            }
+            k += 1;
+        }
+        flat.sort_unstable();
+        flat.dedup();
+        self.base -= usize::from(self.base > c);
+        self.flat = flat;
+    }
+}
+
+/// The file's columns as the user sees them, after inserts and removes.
+///
+/// A row is an unbounded sequence of fields, empty past its own length (the
+/// contract's "short rows are padded"). `entries` describes logical columns
+/// `0..entries.len()`; every column after those is the file's own, continuing
+/// from original column `tail_start` (so removing column 3 of a 10-column file
+/// is `entries = [O0, O1, O2]`, `tail_start = 4`: O4.. follow). `len` says how
+/// long each row is. Reading a field is a lookup, whatever number of columns
+/// were added or removed. The whole map is small (it grows with the widest
+/// column touched, not with the file), so undo keeps a copy of it.
+#[derive(Clone, Debug, Default)]
+struct ColumnMap {
+    entries: Vec<ColSource>,
+    tail_start: usize,
+    len: LenFn,
+}
+
+impl ColumnMap {
+    fn is_identity(&self) -> bool {
+        self.entries.is_empty() && self.tail_start == 0 && self.len.is_identity()
+    }
+
+    /// Some added column carries values that are not in the file's bytes, so a
+    /// search of the bytes cannot rule a row out.
+    fn has_added_values(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|e| matches!(e, ColSource::Added(v) if !v.is_empty()))
+    }
+
+    /// Spell out the first `upto` logical columns in `entries`.
+    fn materialize(&mut self, upto: usize) {
+        while self.entries.len() < upto {
+            self.entries.push(ColSource::Original(self.tail_start));
+            self.tail_start += 1;
         }
     }
+
+    /// Trailing entries that are just the file's own next columns carry no
+    /// information; dropping them keeps the map as small as it can be.
+    fn normalize(&mut self) {
+        while let Some(ColSource::Original(i)) = self.entries.last() {
+            if *i + 1 != self.tail_start {
+                break;
+            }
+            self.entries.pop();
+            self.tail_start -= 1;
+        }
+    }
+
+    fn remove(&mut self, col: usize) -> ColSource {
+        self.materialize(col + 1);
+        let removed = self.entries.remove(col);
+        self.normalize();
+        self.len.then_remove(col);
+        removed
+    }
+
+    fn insert(&mut self, col: usize, source: ColSource) {
+        self.materialize(col);
+        self.entries.insert(col, source);
+        self.normalize();
+        self.len.then_insert(col);
+    }
+
+    fn field<'a>(&'a self, id: usize, raw: &[&'a [u8]], col: usize) -> &'a [u8] {
+        match self.entries.get(col) {
+            Some(ColSource::Original(i)) => raw.get(*i).copied().unwrap_or(b""),
+            Some(ColSource::Added(values)) => values.get(&id).map_or(&b""[..], |v| v.as_bytes()),
+            None => raw
+                .get(self.tail_start + (col - self.entries.len()))
+                .copied()
+                .unwrap_or(b""),
+        }
+    }
+
+    /// The row's fields as the user sees it, given its stored fields.
+    fn logical<'a>(&'a self, id: usize, raw: &[&'a [u8]]) -> Vec<&'a [u8]> {
+        (0..self.len.apply(raw.len()))
+            .map(|col| self.field(id, raw, col))
+            .collect()
+    }
+
+    /// Just field `col` of the row (`None` where the row has no such field).
+    fn logical_field<'a>(&'a self, id: usize, raw: &[&'a [u8]], col: usize) -> Option<&'a [u8]> {
+        (col < self.len.apply(raw.len())).then(|| self.field(id, raw, col))
+    }
+}
+
+/// What a file-backed `remove_column` hands back for `restore_column`: the
+/// column map as it was before the removal (small, whatever the file's
+/// length), the removed column's source, and the column's value in each row
+/// that had been copied into memory (those rows do not read it from the file).
+struct FileColumn {
+    before: ColumnMap,
+    source: ColSource,
+    edited: Vec<(usize, Option<String>)>,
+}
+
+fn record_without(row: &StringRecord, col: usize) -> StringRecord {
+    row.iter()
+        .enumerate()
+        .filter(|(i, _)| *i != col)
+        .map(|(_, f)| f)
+        .collect()
+}
+
+/// `row` with `value` inserted at `col`, padding a shorter row first.
+fn record_with(row: &StringRecord, col: usize, value: &str) -> StringRecord {
+    let mut fields: Vec<&str> = row.iter().collect();
+    fields.resize(fields.len().max(col), "");
+    fields.insert(col, value);
+    fields.into_iter().collect()
 }
 
 #[derive(Clone)]
@@ -229,10 +367,13 @@ pub struct FileSheet {
     order: Option<Arc<Vec<usize>>>,
     /// File rows (ids below the row count) that have been removed.
     removed: HashSet<usize>,
-    /// Column operations since load, oldest first. Rows read from the file
-    /// have all of them applied; rows in `edited` already do (they are
-    /// updated when an operation is added). Shared with snapshots.
-    col_ops: Arc<Vec<ColOp>>,
+    /// The columns as the user sees them. Rows read from the file are mapped
+    /// through it; rows in `edited` already are (updated when a column is
+    /// added or removed). Shared with snapshots.
+    columns: Arc<ColumnMap>,
+    /// Bumped on every column change; part of the row cache key, because the
+    /// cache is shared with snapshots that may see an older column layout.
+    col_version: usize,
 }
 
 impl FileSheet {
@@ -297,7 +438,8 @@ impl FileSheet {
             edited: HashMap::new(),
             order: None,
             removed: HashSet::new(),
-            col_ops: Arc::new(Vec::new()),
+            columns: Arc::new(ColumnMap::default()),
+            col_version: 0,
         })
     }
 
@@ -358,9 +500,19 @@ impl FileSheet {
         Some(RowBytes::Owned(out))
     }
 
-    /// Read and parse file row `file_row` into a record. `None` if there is no
-    /// such row or its bytes can no longer be read.
+    /// Read and parse file row `file_row` into a record, as the user sees it
+    /// (columns mapped). `None` if there is no such row or its bytes can no
+    /// longer be read.
     fn read_row(&self, file_row: usize) -> Option<StringRecord> {
+        self.read_row_with(file_row, true)
+    }
+
+    /// Like `read_row`, but with the fields exactly as stored in the file.
+    fn read_stored_row(&self, file_row: usize) -> Option<StringRecord> {
+        self.read_row_with(file_row, false)
+    }
+
+    fn read_row_with(&self, file_row: usize, mapped: bool) -> Option<StringRecord> {
         let bytes = self.row_bytes(self.index.row_range(file_row)?)?;
         PARSER.with(|cell| {
             let mut slot = cell.borrow_mut();
@@ -370,8 +522,15 @@ impl FileSheet {
             let parser = &mut slot.as_mut()?.1;
             let fields = parser.parse(bytes.as_slice())?;
             let mut raw = csv::ByteRecord::new();
-            for f in fields.iter() {
-                raw.push_field(f);
+            if mapped && !self.columns.is_identity() {
+                let stored: Vec<&[u8]> = fields.iter().collect();
+                for f in self.columns.logical(file_row, &stored) {
+                    raw.push_field(f);
+                }
+            } else {
+                for f in fields.iter() {
+                    raw.push_field(f);
+                }
             }
             Some(match StringRecord::from_byte_record(raw) {
                 Ok(record) => record,
@@ -380,10 +539,32 @@ impl FileSheet {
         })
     }
 
-    /// True while positions are file rows in file order with the original
-    /// columns, which lets scans read the file front to back.
+    /// Whether any field of file row `id` (columns mapped), parsed from
+    /// `bytes`, contains what `finder` looks for.
+    fn fields_contain(
+        &self,
+        parser: &mut LeanParser,
+        bytes: &[u8],
+        id: usize,
+        finder: &memchr::memmem::Finder<'_>,
+    ) -> bool {
+        let Some(fields) = parser.parse(bytes) else {
+            return false;
+        };
+        if self.columns.is_identity() {
+            return fields.iter().any(|c| finder.find(c).is_some());
+        }
+        let stored: Vec<&[u8]> = fields.iter().collect();
+        self.columns
+            .logical(id, &stored)
+            .iter()
+            .any(|c| finder.find(c).is_some())
+    }
+
+    /// True while positions are file rows in file order, which lets scans
+    /// read the file front to back (column changes are handled per row).
     fn scan_is_streamable(&self) -> bool {
-        self.order.is_none() && self.col_ops.is_empty()
+        self.order.is_none()
     }
 
     /// Row id at display `position`.
@@ -409,10 +590,7 @@ impl FileSheet {
         if !self.is_live_file_row(id) {
             return None;
         }
-        let raw = self.read_row(id)?;
-        Some(Cow::Owned(
-            self.col_ops.iter().fold(raw, |row, op| op.apply(id, &row)),
-        ))
+        self.read_row(id).map(Cow::Owned)
     }
 
     fn load_row(&self, position: usize) -> Option<Cow<'_, StringRecord>> {
@@ -428,13 +606,12 @@ impl FileSheet {
         if !self.is_live_file_row(id) {
             return None;
         }
-        let key = (id, self.col_ops.len());
+        let key = (id, self.col_version);
         let lock = || self.cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(hit) = lock().rows.get(&key) {
             return Some(hit.clone());
         }
-        let raw = self.read_row(id)?;
-        let row = Arc::new(self.col_ops.iter().fold(raw, |row, op| op.apply(id, &row)));
+        let row = Arc::new(self.read_row(id)?);
         lock().insert(key, row.clone());
         Some(row)
     }
@@ -443,13 +620,17 @@ impl FileSheet {
         self.row_by_id(self.id_at(position)?)
     }
 
-    /// Record a column operation: future file reads replay it, and rows
-    /// already copied into `edited` are updated now.
-    fn push_col_op(&mut self, op: ColOp) {
-        for (id, row) in self.edited.iter_mut() {
-            *row = Arc::new(op.apply(*id, row));
+    /// The value a file column has in row `id`, as it was in the file (what a
+    /// restored column puts back into rows that were copied into memory
+    /// after the column was removed).
+    fn stored_value(&self, source: &ColSource, id: usize) -> Option<String> {
+        match source {
+            ColSource::Original(i) if id < self.index.len() => {
+                self.read_stored_row(id)?.get(*i).map(str::to_string)
+            }
+            ColSource::Original(_) => None,
+            ColSource::Added(values) => Some(values.get(&id).cloned().unwrap_or_default()),
         }
-        Arc::make_mut(&mut self.col_ops).push(op);
     }
 
     /// The order list, built as `0..n` on first use and copied if a
@@ -541,33 +722,63 @@ impl Sheet for FileSheet {
     }
 
     fn remove_column(&mut self, col: usize) -> RemovedColumn {
-        // Collect first, from the rows as they are now. Rows that cannot be
-        // read from the file are skipped (they have no value to hand back).
-        let removed: Vec<(usize, String)> = (0..self.len())
-            .filter_map(|position| {
-                let id = self.id_at(position)?;
-                let row = self.load_by_id(id)?;
-                row.get(col).map(|value| (id, value.to_string()))
-            })
-            .collect();
-        self.push_col_op(ColOp::Remove(col));
-        RemovedColumn::new(removed)
+        // Rows copied into memory are updated now (remembering their value);
+        // every other row reads through the column map, so nothing in the
+        // file is touched, however large it is.
+        let mut edited = Vec::with_capacity(self.edited.len());
+        for (id, row) in self.edited.iter_mut() {
+            let value = row.get(col).map(str::to_string);
+            if value.is_some() {
+                *row = Arc::new(record_without(row, col));
+            }
+            edited.push((*id, value));
+        }
+        let before = (*self.columns).clone();
+        let source = Arc::make_mut(&mut self.columns).remove(col);
+        self.col_version += 1;
+        RemovedColumn::new(FileColumn {
+            before,
+            source,
+            edited,
+        })
     }
 
     fn restore_column(&mut self, col: usize, removed: &RemovedColumn) {
-        let Some(values) = removed.payload::<Vec<(usize, String)>>() else {
+        let Some(token) = removed.payload::<FileColumn>() else {
             return;
         };
-        let values = Arc::new(values.iter().cloned().collect());
-        self.push_col_op(ColOp::Restore { col, values });
+        let remembered: HashMap<usize, &Option<String>> =
+            token.edited.iter().map(|(id, v)| (*id, v)).collect();
+        let ids: Vec<usize> = self.edited.keys().copied().collect();
+        for id in ids {
+            // A row that was already in memory when the column was removed
+            // remembers its value; one copied in since (and returned to its
+            // earlier state by the undo stack) takes it from the file.
+            let value = match remembered.get(&id) {
+                Some(v) => (*v).clone(),
+                None => self.stored_value(&token.source, id),
+            };
+            if let (Some(value), Some(row)) = (value, self.edited.get_mut(&id)) {
+                *row = Arc::new(record_with(row, col, &value));
+            }
+        }
+        // Under the undo-stack discipline the map is exactly as it was right
+        // after the removal, so putting the old one back is the exact inverse.
+        self.columns = Arc::new(token.before.clone());
+        self.col_version += 1;
     }
 
     fn insert_column(&mut self, col: usize, values_by_row: &[(usize, String)]) {
-        let values = values_by_row.iter().cloned().collect();
-        self.push_col_op(ColOp::Insert {
-            col,
-            values: Arc::new(values),
-        });
+        let values: HashMap<usize, String> = values_by_row.iter().cloned().collect();
+        for (id, row) in self.edited.iter_mut() {
+            *row = Arc::new(record_with(
+                row,
+                col,
+                values.get(id).map_or("", String::as_str),
+            ));
+        }
+        Arc::make_mut(&mut self.columns).insert(col, ColSource::Added(Arc::new(values)));
+        self.col_version += 1;
     }
 
     // Scans bypass the shared caches so they cannot evict what the table is
@@ -592,7 +803,7 @@ impl Sheet for FileSheet {
         // A field's text appears verbatim in the row's bytes unless it contains
         // a quote (stored doubled), so a needle without one can rule out a row
         // by searching bytes alone, no parsing.
-        let prefilter = !needle.as_bytes().contains(&b'"');
+        let prefilter = !needle.as_bytes().contains(&b'"') && !self.columns.has_added_values();
         let mut parser = LeanParser::new(self.delimiter);
         let mut hits = View::new();
         if prefilter && !needle.as_bytes().iter().any(|&b| b == b'\n' || b == b'\r') {
@@ -628,10 +839,7 @@ impl Sheet for FileSheet {
                     if !self.edited.contains_key(&r) {
                         let bytes = &buf[(range.start - first.start) as usize
                             ..(range.end - first.start) as usize];
-                        if parser
-                            .parse(bytes)
-                            .is_some_and(|f| f.iter().any(|c| finder.find(c).is_some()))
-                        {
+                        if self.fields_contain(&mut parser, bytes, r, &finder) {
                             hits.push(r as u32);
                         }
                     }
@@ -655,9 +863,9 @@ impl Sheet for FileSheet {
             let hit = match self.edited.get(&p) {
                 Some(row) => row.iter().any(|c| c.contains(needle)),
                 None => match self.index.row_range(p).and_then(|r| window.get(self, r)) {
-                    Some(bytes) if !prefilter || finder.find(bytes).is_some() => parser
-                        .parse(bytes)
-                        .is_some_and(|f| f.iter().any(|c| finder.find(c).is_some())),
+                    Some(bytes) if !prefilter || finder.find(bytes).is_some() => {
+                        self.fields_contain(&mut parser, bytes, p, &finder)
+                    }
                     _ => false,
                 },
             };
@@ -696,14 +904,21 @@ impl Sheet for FileSheet {
             match self.edited.get(&(p as usize)) {
                 Some(row) => arena.push_str(row.get(sort_by.0).unwrap_or("")),
                 None => {
-                    let cell = self
+                    let fields = self
                         .index
                         .row_range(p as usize)
                         .and_then(|r| window.get(self, r))
-                        .and_then(|bytes| parser.parse(bytes))
-                        .and_then(|f| f.get(sort_by.0));
-                    if let Some(cell) = cell {
-                        arena.push_str(&String::from_utf8_lossy(cell));
+                        .and_then(|bytes| parser.parse(bytes));
+                    if let Some(fields) = fields {
+                        let cell = if self.columns.is_identity() {
+                            fields.get(sort_by.0)
+                        } else {
+                            let stored: Vec<&[u8]> = fields.iter().collect();
+                            self.columns.logical_field(p as usize, &stored, sort_by.0)
+                        };
+                        if let Some(cell) = cell {
+                            arena.push_str(&String::from_utf8_lossy(cell));
+                        }
                     }
                 }
             }
@@ -1363,6 +1578,145 @@ mod tests {
         for (i, want) in rows.iter().enumerate() {
             assert_eq!(strs(&sheet, i).as_ref(), Some(want), "row {i}");
         }
+    }
+
+    // ---- ColumnMap, tested on its own against a naive per-row model ----
+
+    /// One column operation, as applied to a single row by the padded
+    /// semantics of the contract: insert pads a short row up to the column;
+    /// removing a column a row doesn't reach changes nothing.
+    #[derive(Clone, Debug)]
+    enum MapOp {
+        Remove(usize),
+        Insert(usize, Option<String>),
+    }
+
+    fn naive(raw: &[&str], ops: &[MapOp]) -> Vec<String> {
+        let mut row: Vec<String> = raw.iter().map(|s| s.to_string()).collect();
+        for op in ops {
+            match op {
+                MapOp::Remove(c) => {
+                    if *c < row.len() {
+                        row.remove(*c);
+                    }
+                }
+                MapOp::Insert(c, v) => {
+                    while row.len() < *c {
+                        row.push(String::new());
+                    }
+                    row.insert(*c, v.clone().unwrap_or_default());
+                }
+            }
+        }
+        row
+    }
+
+    fn mapped(map: &ColumnMap, raw: &[&str]) -> Vec<String> {
+        let raw: Vec<&[u8]> = raw.iter().map(|s| s.as_bytes()).collect();
+        map.logical(0, &raw)
+            .iter()
+            .map(|f| String::from_utf8(f.to_vec()).unwrap())
+            .collect()
+    }
+
+    fn build(ops: &[MapOp]) -> ColumnMap {
+        let mut map = ColumnMap::default();
+        for op in ops {
+            match op {
+                MapOp::Remove(c) => {
+                    map.remove(*c);
+                }
+                MapOp::Insert(c, v) => {
+                    let values: HashMap<usize, String> = v.iter().map(|v| (0, v.clone())).collect();
+                    map.insert(*c, ColSource::Added(Arc::new(values)));
+                }
+            }
+        }
+        map
+    }
+
+    fn map_ops() -> impl Strategy<Value = Vec<MapOp>> {
+        let op = prop_oneof![
+            (0usize..7).prop_map(MapOp::Remove),
+            (0usize..7, prop::option::of("[a-c]{0,2}")).prop_map(|(c, v)| MapOp::Insert(c, v)),
+        ];
+        prop::collection::vec(op, 0..10)
+    }
+
+    #[test]
+    fn an_untouched_column_map_is_the_identity() {
+        let map = ColumnMap::default();
+        assert!(map.is_identity());
+        assert_eq!(mapped(&map, &["a", "b", "c"]), ["a", "b", "c"]);
+        assert_eq!(mapped(&map, &[]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn inserting_then_removing_column_zero_returns_to_the_identity() {
+        let mut map = ColumnMap::default();
+        map.insert(0, ColSource::Added(Default::default()));
+        assert!(!map.is_identity());
+        map.remove(0);
+        assert!(map.is_identity(), "so scans can skip the mapping again");
+    }
+
+    #[test]
+    fn padding_left_by_an_insert_survives_removing_that_column() {
+        // A row shorter than the column is padded by the insert; removing the
+        // new column does not un-pad it. The map must keep saying so.
+        let mut map = ColumnMap::default();
+        map.insert(3, ColSource::Added(Default::default()));
+        map.remove(3);
+        assert_eq!(mapped(&map, &[]), ["", "", ""]);
+        assert_eq!(mapped(&map, &["a"]), ["a", "", ""]);
+        assert_eq!(
+            mapped(&map, &["a", "b", "c", "d"]),
+            ["a", "b", "c", "d"],
+            "long rows are unchanged"
+        );
+    }
+
+    #[test]
+    fn column_map_examples() {
+        let mut map = ColumnMap::default();
+        map.remove(1);
+        assert_eq!(mapped(&map, &["a", "b", "c"]), ["a", "c"]);
+        assert_eq!(
+            mapped(&map, &["a"]),
+            ["a"],
+            "a row that doesn't reach the column is untouched"
+        );
+        map.insert(3, ColSource::Added(Default::default()));
+        assert_eq!(
+            mapped(&map, &["a", "b", "c"]),
+            ["a", "c", "", ""],
+            "padded up to the new column"
+        );
+        assert_eq!(
+            mapped(&map, &["a", "b", "c", "d", "e"]),
+            ["a", "c", "d", "", "e"]
+        );
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(2000))]
+
+        #[test]
+        fn column_map_matches_applying_the_operations_to_each_row(
+            ops in map_ops(), raw in prop::collection::vec("[a-z]{0,2}", 0..6),
+        ) {
+            let raw: Vec<&str> = raw.iter().map(String::as_str).collect();
+            let map = build(&ops);
+            prop_assert_eq!(mapped(&map, &raw), naive(&raw, &ops));
+            // one logical field at a time agrees with the whole row
+            let want = naive(&raw, &ops);
+            let raw_b: Vec<&[u8]> = raw.iter().map(|s| s.as_bytes()).collect();
+            for col in 0..9 {
+                let got = map.logical_field(0, &raw_b, col).map(|f| String::from_utf8(f.to_vec()).unwrap()).unwrap_or_default();
+                prop_assert_eq!(got, want.get(col).cloned().unwrap_or_default(), "col {}", col);
+            }
+        }
+
     }
 
     #[test]

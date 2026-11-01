@@ -114,6 +114,8 @@ pub fn run_row_edits(make: &Make) {
 }
 
 pub fn run_column_edits(make: &Make) {
+    column_restore_survives_edits_made_and_undone_in_between(make);
+    filter_and_sort_see_the_values_of_added_columns(make);
     column_remove_insert_round_trip(make);
     short_rows_are_padded_so_inserted_columns_line_up(make);
     removing_a_column_past_a_short_rows_end_leaves_it_alone(make);
@@ -124,6 +126,62 @@ pub fn run_column_edits(make: &Make) {
 
 /// A row shorter than the insertion point is treated as padded with empty
 /// fields, so the new column lines up with every other row.
+/// Rows touched between the removal and the restore (and put back as they
+/// were by the undo stack) must still get their column back.
+fn column_restore_survives_edits_made_and_undone_in_between(make: &Make) {
+    let mut s = make(rows_of(&[
+        &["a", "b", "c"],
+        &["d", "e", "f"],
+        &["g", "h", "i"],
+        &["j"],
+    ]));
+    s.set_cell(1, 1, "E"); // already edited when the column goes
+    let tok = s.remove_column(1);
+
+    assert!(s.set_cell(0, 0, "A")); // touched after the removal...
+    assert!(s.set_cell(0, 0, "a")); // ...and set back by its undo
+    let gone = s.remove_row(2).unwrap(); // removed after the removal...
+    s.insert_row(2, gone); // ...and put back by its undo
+    s.insert_row(4, (9, StringRecord::from(vec!["new"]))); // inserted after...
+    s.remove_row(4); // ...and removed again by its undo
+
+    s.restore_column(1, &tok);
+    assert_eq!(
+        fields(s.as_ref(), 0),
+        Some(vec!["a".into(), "b".into(), "c".into()])
+    );
+    assert_eq!(
+        fields(s.as_ref(), 1),
+        Some(vec!["d".into(), "E".into(), "f".into()]),
+        "its earlier edit survives"
+    );
+    assert_eq!(
+        fields(s.as_ref(), 2),
+        Some(vec!["g".into(), "h".into(), "i".into()])
+    );
+    assert_eq!(fields(s.as_ref(), 3), Some(vec!["j".into()]));
+    assert_eq!(s.len(), 4);
+}
+
+/// Values that exist only in a column added since load are not in any file
+/// bytes, but filter and sort must see them.
+fn filter_and_sort_see_the_values_of_added_columns(make: &Make) {
+    let mut s = make(rows_of(&[&["a"], &["b"], &["c"]]));
+    s.insert_column(1, &[(0, "zebra".to_string()), (2, "apple".to_string())]);
+    assert_eq!(s.filter("zebra"), vec![0]);
+    assert_eq!(s.filter("apple"), vec![2]);
+    assert_eq!(
+        s.filter("a"),
+        vec![0, 2],
+        "the stored 'a', and the added values with an 'a' in them"
+    );
+    assert_eq!(
+        s.sort(vec![0, 1, 2], (1, SortOrder::Asc)),
+        vec![1, 2, 0],
+        "empty, apple, zebra"
+    );
+}
+
 fn short_rows_are_padded_so_inserted_columns_line_up(make: &Make) {
     let mut s = make(rows_of(&[
         &["a", "b", "c"],
