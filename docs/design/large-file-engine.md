@@ -300,7 +300,7 @@ creates a `Batch` of millions of old values. Cap history by bytes (default
 256 MB); when exceeded, drop the oldest entries and tell the user once. A
 column delete stores an O(1) token (4.4), not per-row values.
 
-### 4.10 Bulk edits: a replace-all is a rule, not a million edits
+### 4.10 Bulk edits: a replace-all is a rule, not a million edits (implemented)
 
 **Problem (measured, 7.3).** Every edited row costs ~400 B in memory plus
 ~180 B per changed cell in the undo stack. A replace-all that changes 10% of a
@@ -456,7 +456,8 @@ dropping unchanged rows (the first measurement is in the git history):
 | Delete a column, nothing edited | 275 B | 0.9 KB | yes, identical |
 | Insert a column, nothing edited | 255 B | 0.4 KB | yes |
 | Single-cell edit | 117 B | 514 B (so ~400 B for the row copied in) | yes |
-| Replace-all, per cell (Batch) | 178 B | 538 B | yes |
+| Replace-all over a filtered view of 5,000 cells | 13 B per cell | 21 B per cell (was 178 / 538) | yes |
+| **Replace-all over every row** (62.5M cells) | **2.7 MB** (the old text of the 10,000 rows already in memory) | **3 MB** (was ~35 GB, i.e. impossible) | yes, identical |
 | Delete a column with 15k rows in memory | 630 KB (42 B/row) | 0.3 MB | yes |
 | Delete a row | 341 B | **0** (was 498 MB the first time) | yes (20 deletes: 0.01 s, was 1.6 s) |
 | Insert a row | 103 B | ~0 | yes |
@@ -472,10 +473,18 @@ What this shows:
   exactly the same on a 5 GB file as on an 80 MB one.
 * **Structural edits no longer cost anything proportional to the file** (piece
   table, 4.2).
-* **Edits cost ~400 B per edited row in memory, plus ~180 B per changed cell
-  of undo.** Fine for edits typed by a person; not for bulk edits: a
-  replace-all over 10% of this file would need ~3.5 GB, over every row ~35 GB.
-  Bulk edits therefore become rules, not edits (4.10).
+* **Edits cost ~400 B per edited row in memory, plus ~120 B of undo.** Fine for
+  edits typed by a person. Bulk edits are rules (4.10, implemented): a
+  replace-all costs memory in proportion to the rows already in memory, never
+  to the cells it changes, however large the file.
+* **The price of a rule is time, paid twice.** Finding out how many cells a
+  replace-all changes is one streaming pass over the rows it covers: 79 s for
+  all 62.5M rows here (about 30 s of that is the test file synthesising its own
+  bytes; a real 5 GB file will be bound by the disk). The app currently runs
+  this on the UI thread, so it freezes for that long. **It must become a
+  background job with progress and cancel** (4.8, not yet built). After that,
+  reads cost an extra substring search per covered field, and filter must parse
+  every row instead of searching raw bytes (5-6M rows/s instead of GB/s).
 * **The dense index** is 537 MB for 5 GB; the sparse index brings it to 16 MB
   (pending budget).
 * The test takes ~90 s end to end, mostly indexing and synthesising 5 GB.
