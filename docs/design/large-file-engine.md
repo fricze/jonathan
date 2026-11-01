@@ -483,9 +483,14 @@ What this shows:
 * **The price of a rule is time, paid twice.** Finding out how many cells a
   replace-all changes is one streaming pass over the rows it covers: 79 s for
   all 62.5M rows here (about 30 s of that is the test file synthesising its own
-  bytes; a real 5 GB file will be bound by the disk). The app currently runs
-  this on the UI thread, so it freezes for that long. **It must become a
-  background job with progress and cancel** (4.8, not yet built). After that,
+  bytes; a real 5 GB file will be bound by the disk). **This is now a
+  background job (4.8, built for replace-all):** `Sheet::plan_replace_all` runs
+  on a snapshot, reports rows done through a `JobControl`, and stops when
+  cancelled; the app shows a progress window with Cancel, and applying the plan
+  (`replace_all_planned`) reads nothing. Redo (`replace_all_again`) reuses the
+  count stored in the undo token, so it does not rescan either. A plan made
+  before the sheet changed is detected (change stamp) and ignored, so an edit
+  made while counting costs a second pass, never a wrong result. After that,
   reads cost an extra substring search per covered field, and filter must parse
   every row instead of searching raw bytes (5-6M rows/s instead of GB/s).
 * **The dense index** was 537 MB for 5 GB; the sparse index brings it to

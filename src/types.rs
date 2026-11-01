@@ -1,4 +1,4 @@
-pub use csv_model::{ColumnId, FileHeader, InsertedColumn, MemorySheet, RemovedColumn, ReplacedAll, RowScope, Sheet, SheetRow, SortOrder, View};
+pub use csv_model::{ColumnId, FileHeader, InsertedColumn, JobControl, MemorySheet, RemovedColumn, ReplacePlan, ReplacedAll, RowScope, Sheet, SheetRow, SortOrder, View};
 pub use selection::SelectionState;
 pub use undo_history::UndoHistory;
 #[cfg(test)]
@@ -53,6 +53,11 @@ pub enum UiMessage {
     PasteCells(Filename, TabId, u64, ColumnId, Vec<Vec<String>>),
     /// filename, tab_id, text to find, replacement text, scope
     ReplaceAll(Filename, TabId, String, String, ReplaceScope),
+    /// A background replace-all finished counting: file, job id, the plan
+    /// (None if it was cancelled).
+    ReplacePlanned(Filename, u64, Option<ReplacePlan>),
+    /// Stop the replace-all running on this file.
+    CancelReplace(Filename),
     /// filename, tab_id, row_nr (in displayed data) to delete
     DeleteRow(Filename, TabId, u64),
     /// filename, tab_id, (anchor row_nr in displayed data, Before/After) --
@@ -184,6 +189,22 @@ pub struct ReplaceDone {
     pub token: ReplacedAll,
 }
 
+/// An undone replace-all, kept for redo: what to do again, and the token the
+/// sheet made the first time (it remembers what it need not work out again).
+#[derive(Clone)]
+pub struct ReplaceRedo {
+    pub spec: ReplaceSpec,
+    pub token: ReplacedAll,
+}
+
+/// A replace-all being worked out in the background (counting what it changes
+/// takes a pass over the file). The owner watches `control` and may cancel.
+pub struct ReplaceJob {
+    pub id: u64,
+    pub spec: ReplaceSpec,
+    pub control: JobControl,
+}
+
 impl ReplaceSpec {
     fn heap_bytes(&self) -> usize {
         self.filename.capacity()
@@ -238,7 +259,7 @@ pub enum UndoEntry {
     /// (Boxed: this is a big entry, and every entry pays for the biggest.)
     ReplaceAll(Box<ReplaceDone>),
     /// Run that replace-all again (the reverse of `ReplaceAll`, i.e. a redo).
-    ReplaceAgain(Box<ReplaceSpec>),
+    ReplaceAgain(Box<ReplaceRedo>),
     /// Multiple entries that should undo/redo as one action (e.g. every
     /// cell changed by a single paste or replace-all). Reversing a batch
     /// reverses each entry in reverse order (so entries that depend on
@@ -267,7 +288,9 @@ impl UndoEntry {
             UndoEntry::ReplaceAll(done) => {
                 std::mem::size_of::<ReplaceDone>() + done.spec.heap_bytes() + done.token.size_bytes()
             }
-            UndoEntry::ReplaceAgain(spec) => std::mem::size_of::<ReplaceSpec>() + spec.heap_bytes(),
+            UndoEntry::ReplaceAgain(redo) => {
+                std::mem::size_of::<ReplaceRedo>() + redo.spec.heap_bytes() + redo.token.size_bytes()
+            }
             UndoEntry::Batch(entries) => {
                 entries.capacity() * std::mem::size_of::<UndoEntry>() + entries.iter().map(Self::heap_bytes).sum::<usize>()
             }
@@ -303,6 +326,9 @@ pub struct MyApp {
     /// Bumped each time a sort/filter is requested for a (filename, tab_id);
     /// used to drop results from superseded background requests.
     pub request_epoch: HashMap<(Filename, TabId), u64>,
+    /// Replace-alls being counted in the background, one per file.
+    pub replace_jobs: HashMap<Filename, ReplaceJob>,
+    pub next_job_id: u64,
     /// Next master_row id to assign when inserting a row into a file. Seeded
     /// from max(existing master_row) + 1 when the file loads.
     pub next_row_id: HashMap<Filename, usize>,

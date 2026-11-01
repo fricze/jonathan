@@ -5,9 +5,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
 
-use csv_model::{InsertedColumn, LoadStats, MemorySheet, RemovedColumn, ReplacedAll, RowScope, open_csv_file, read_rows, write_csv};
+use csv_model::{InsertedColumn, JobControl, ReplacePlan, LoadStats, MemorySheet, RemovedColumn, ReplacedAll, RowScope, open_csv_file, read_rows, write_csv};
 use crate::menu::{COPY_AS_CSV_ID, OPEN_FILE_ID};
-use crate::types::{ReplaceDone, ReplaceSpec, 
+use crate::types::{ReplaceDone, ReplaceJob, ReplaceRedo, ReplaceSpec, 
     ColumnId, CsvTabViewer, FileHeader, InsertPosition, MyApp, ReplaceScope, SendUiMessage, SheetTab,
     SortOrder, TabId, UiMessage, UndoEntry, View, SheetRow, active_sheet_data, column_position,
 };
@@ -15,6 +15,16 @@ use crate::ui::drop::preview_files_being_dropped;
 
 #[cfg(target_os = "macos")]
 use muda::MenuEvent;
+
+/// How a replace-all gets its numbers.
+enum ReplaceHow<'a> {
+    /// Work everything out now.
+    Fresh,
+    /// Use a plan made in the background.
+    Planned(&'a ReplacePlan),
+    /// A redo: the token of the undone replace-all remembers the count.
+    Again(&'a ReplacedAll),
+}
 
 /// Outcome of a successful `apply_undo`/`apply_redo`, enough to describe the
 /// change in a toast: which row/column, what it had, what it's now. `row` is
@@ -326,18 +336,18 @@ impl MyApp {
                     restored: format!("{changed} cell{}", if changed == 1 { "" } else { "s" }),
                     overwritten: "".to_string(),
                 };
-                Some((UndoEntry::ReplaceAgain(Box::new(spec)), result))
+                Some((UndoEntry::ReplaceAgain(Box::new(ReplaceRedo { spec, token })), result))
             }
-            UndoEntry::ReplaceAgain(spec) => {
-                let (changed, token) =
-                    self.run_replace_all(&spec.filename, spec.rows.as_deref(), &spec.col_ids, &spec.find, &spec.replace)?;
+            UndoEntry::ReplaceAgain(redo) => {
+                let ReplaceRedo { spec, token: old } = *redo;
+                let (changed, token) = self.run_replace_all(&spec, ReplaceHow::Again(&old))?;
                 let result = UndoRedoResult {
                     row: None,
                     column: None,
                     restored: format!("{changed} cell{}", if changed == 1 { "" } else { "s" }),
                     overwritten: "".to_string(),
                 };
-                let done = ReplaceDone { spec: *spec, changed, token };
+                let done = ReplaceDone { spec, changed, token };
                 Some((UndoEntry::ReplaceAll(Box::new(done)), result))
             }
             UndoEntry::Batch(entries) => {
@@ -448,18 +458,9 @@ impl MyApp {
         pasted_count
     }
 
-    fn apply_replace_all(
-        &mut self,
-        filename: &str,
-        tab_id: TabId,
-        find: &str,
-        replace: &str,
-        scope: ReplaceScope,
-    ) -> usize {
-        if find.is_empty() {
-            return 0;
-        }
-        // The rows this tab shows (its filtered view), as stable ids, or every row.
+    /// What a replace-all in this tab covers: the rows its filtered view shows
+    /// (as stable ids) or every row, and the columns by stable id.
+    fn replace_spec(&self, filename: &str, tab_id: TabId, find: &str, replace: &str, scope: ReplaceScope) -> ReplaceSpec {
         let rows: Option<Arc<Vec<usize>>> = match (self.sheets_data.get(filename), self.filtered_data.get(&(filename.to_string(), tab_id))) {
             (Some(sheet), Some(view)) => Some(Arc::new(view.iter().filter_map(|&p| sheet.row_id(p as usize)).collect())),
             _ => None,
@@ -472,39 +473,148 @@ impl MyApp {
                 .find_map(|(_, tab)| tab.columns.get(filename))
                 .map_or(vec![], |headers| headers.iter().map(|h| h.id).collect()),
         };
-        let Some((changed, token)) = self.run_replace_all(filename, rows.as_deref(), &col_ids, find, replace) else {
+        ReplaceSpec { filename: filename.to_string(), rows, col_ids, find: find.to_string(), replace: replace.to_string() }
+    }
+
+    /// Replace now, on this thread (reads the whole file if the sheet must).
+    /// The app itself goes through `start_replace_all`; this is for callers
+    /// that can wait.
+    fn apply_replace_all(
+        &mut self,
+        filename: &str,
+        tab_id: TabId,
+        find: &str,
+        replace: &str,
+        scope: ReplaceScope,
+    ) -> usize {
+        if find.is_empty() {
+            return 0;
+        }
+        let spec = self.replace_spec(filename, tab_id, find, replace, scope);
+        self.finish_replace_all(spec, None)
+    }
+
+    /// Do the replace-all and put it on the undo stack. With a plan from a
+    /// background count the file is not read again.
+    fn finish_replace_all(&mut self, spec: ReplaceSpec, plan: Option<&ReplacePlan>) -> usize {
+        let how = plan.map_or(ReplaceHow::Fresh, ReplaceHow::Planned);
+        let Some((changed, token)) = self.run_replace_all(&spec, how) else {
             return 0;
         };
         if changed > 0 {
-            let spec = ReplaceSpec {
-                filename: filename.to_string(),
-                rows,
-                col_ids,
-                find: find.to_string(),
-                replace: replace.to_string(),
-            };
-            self.push_undo(filename, UndoEntry::ReplaceAll(Box::new(ReplaceDone { spec, changed, token })));
+            let filename = spec.filename.clone();
+            self.push_undo(&filename, UndoEntry::ReplaceAll(Box::new(ReplaceDone { spec, changed, token })));
         }
         changed
+    }
+
+    /// Replace-all in the background: count on a snapshot (progress, cancel),
+    /// then `ReplacePlanned` brings the plan back and the change is made in an
+    /// instant. At most one per file.
+    fn start_replace_all(
+        &mut self,
+        ctx: &egui::Context,
+        filename: &str,
+        tab_id: TabId,
+        find: &str,
+        replace: &str,
+        scope: ReplaceScope,
+    ) {
+        if find.is_empty() {
+            return;
+        }
+        if self.replace_jobs.contains_key(filename) {
+            crate::toast::show(ctx, "A replace is already running on this file");
+            return;
+        }
+        let Some(sheet) = self.sheets_data.get(filename) else {
+            return;
+        };
+        let spec = self.replace_spec(filename, tab_id, find, replace, scope);
+        let positions: Vec<usize> = spec.col_ids.iter().filter_map(|&id| self.column_position(filename, id)).collect();
+        let snapshot = sheet.snapshot();
+        let id = self.next_job_id;
+        self.next_job_id += 1;
+        let control = JobControl::new();
+        self.replace_jobs.insert(filename.to_string(), ReplaceJob { id, spec: spec.clone(), control: control.clone() });
+        let chan = self.worker_chan.0.clone();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let scope = match spec.rows.as_deref() {
+                Some(ids) => RowScope::Ids(ids),
+                None => RowScope::All,
+            };
+            let plan = snapshot.plan_replace_all(scope, &positions, &spec.find, &spec.replace, &control);
+            chan.send_msg(UiMessage::ReplacePlanned(spec.filename.clone(), id, plan));
+            ctx.request_repaint();
+        });
+    }
+
+    /// A small window per running replace-all with its progress and a Cancel button.
+    fn show_replace_progress(&mut self, ctx: &egui::Context) {
+        if self.replace_jobs.is_empty() {
+            return;
+        }
+        let mut cancel: Vec<String> = vec![];
+        for (filename, job) in &self.replace_jobs {
+            let (done, total) = job.control.progress();
+            let fraction = if total == 0 { 0.0 } else { (done as f32 / total as f32).min(1.0) };
+            egui::Window::new(format!("Replacing in {filename}"))
+                .id(egui::Id::new(("replace-progress", job.id)))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("\"{}\" -> \"{}\"", job.spec.find, job.spec.replace));
+                    ui.add(egui::ProgressBar::new(fraction).show_percentage());
+                    ui.label(format!("{done} of {total} rows"));
+                    if ui.button("Cancel").clicked() {
+                        cancel.push(filename.clone());
+                    }
+                });
+        }
+        for filename in cancel {
+            if let Some(job) = self.replace_jobs.get(&filename) {
+                job.control.cancel();
+            }
+        }
+        // Progress is read from another thread, so keep drawing until it is done.
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
+
+    /// A background count came back: make the change, or drop a cancelled job.
+    fn replace_planned(&mut self, ctx: &egui::Context, filename: &str, job_id: u64, plan: Option<ReplacePlan>) {
+        if self.replace_jobs.get(filename).is_none_or(|j| j.id != job_id) {
+            return;
+        }
+        let Some(job) = self.replace_jobs.remove(filename) else {
+            return;
+        };
+        match plan {
+            None => crate::toast::show(ctx, "Replace cancelled"),
+            Some(plan) => {
+                let changed = self.finish_replace_all(job.spec, Some(&plan));
+                let plural = if changed == 1 { "" } else { "s" };
+                crate::toast::show(ctx, format!("Replaced in {changed} cell{plural}"));
+            }
+        }
     }
 
     /// Ask the sheet to replace `find` by `replace` in the columns with these
     /// ids (those still present) of these rows (None = all). The sheet decides
     /// how: edit every cell, or remember a rule.
-    fn run_replace_all(
-        &mut self,
-        filename: &str,
-        rows: Option<&Vec<usize>>,
-        col_ids: &[ColumnId],
-        find: &str,
-        replace: &str,
-    ) -> Option<(usize, ReplacedAll)> {
-        let positions: Vec<usize> = col_ids.iter().filter_map(|&id| self.column_position(filename, id)).collect();
-        let scope = match rows {
+    fn run_replace_all(&mut self, spec: &ReplaceSpec, how: ReplaceHow<'_>) -> Option<(usize, ReplacedAll)> {
+        let positions: Vec<usize> = spec.col_ids.iter().filter_map(|&id| self.column_position(&spec.filename, id)).collect();
+        let scope = match spec.rows.as_deref() {
             Some(ids) => RowScope::Ids(ids),
             None => RowScope::All,
         };
-        Some(self.sheets_data.get_mut(filename)?.replace_all(scope, &positions, find, replace))
+        let sheet = self.sheets_data.get_mut(&spec.filename)?;
+        Some(match how {
+            ReplaceHow::Fresh => sheet.replace_all(scope, &positions, &spec.find, &spec.replace),
+            ReplaceHow::Planned(plan) => sheet.replace_all_planned(scope, &positions, &spec.find, &spec.replace, plan),
+            ReplaceHow::Again(old) => sheet.replace_all_again(scope, &positions, &spec.find, &spec.replace, old),
+        })
     }
 
     /// Delete the row at `row_nr` in the currently displayed view for
@@ -906,9 +1016,15 @@ impl MyApp {
                     }
                 }
                 UiMessage::ReplaceAll(filename, tab_id, find, replace, scope) => {
-                    let changed = self.apply_replace_all(&filename, tab_id, &find, &replace, scope);
-                    let plural = if changed == 1 { "" } else { "s" };
-                    crate::toast::show(ctx, format!("Replaced in {changed} cell{plural}"));
+                    self.start_replace_all(ctx, &filename, tab_id, &find, &replace, scope);
+                }
+                UiMessage::ReplacePlanned(filename, job_id, plan) => {
+                    self.replace_planned(ctx, &filename, job_id, plan);
+                }
+                UiMessage::CancelReplace(filename) => {
+                    if let Some(job) = self.replace_jobs.get(&filename) {
+                        job.control.cancel();
+                    }
                 }
                 UiMessage::DeleteRow(filename, tab_id, row_nr) => {
                     if self.apply_delete_row(&filename, tab_id, row_nr) {
@@ -1019,6 +1135,7 @@ impl MyApp {
             }
         }
 
+        self.show_replace_progress(ctx);
         crate::toast::render(ctx);
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |_ui| {
@@ -1131,6 +1248,8 @@ mod tests {
             global_filter: "".to_string(),
             filters: HashMap::new(),
             request_epoch: HashMap::new(),
+            replace_jobs: HashMap::new(),
+            next_job_id: 0,
             history: Default::default(),
             next_row_id: HashMap::new(),
             next_col_id: HashMap::new(),
@@ -1544,6 +1663,84 @@ mod tests {
         assert_eq!(app.read_cell(BIG, 123_456, 1), Some(format!("user{:010}", 123_456)));
         app.apply_redo(BIG);
         assert_eq!(app.read_cell(BIG, 123_456, 1), Some(format!("USER{:010}", 123_456)));
+    }
+
+    /// Open a file-backed sheet of `rows` synthetic rows as BIG.
+    fn open_big(app: &mut MyApp, rows: usize) {
+        let sheet = FileSheet::new(Arc::new(SyntheticSource::new(rows as u64)), b',', false).unwrap();
+        app.next_row_id.insert(BIG.to_string(), sheet.next_row_id());
+        app.sheets_data.insert(BIG.to_string(), Box::new(sheet));
+        set_columns(app, BIG, 8);
+    }
+
+    /// Run the background replace-all and feed its messages back, as the
+    /// frame loop does, until the job is gone.
+    fn pump_replace(app: &mut MyApp, ctx: &egui::Context) {
+        let started = std::time::Instant::now();
+        while !app.replace_jobs.is_empty() {
+            assert!(started.elapsed().as_secs() < 60, "job never finished");
+            if let Ok(UiMessage::ReplacePlanned(f, id, plan)) = app.worker_chan.1.recv_timeout(std::time::Duration::from_millis(50)) {
+                app.replace_planned(ctx, &f, id, plan);
+            }
+        }
+    }
+
+    #[test]
+    fn a_background_replace_all_changes_the_sheet_once_and_undoes_exactly() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        open_big(&mut app, 50_000);
+        app.start_replace_all(&ctx, BIG, 1, "user", "USER", ReplaceScope::CurrentColumn(1));
+        assert_eq!(app.replace_jobs.len(), 1, "running in the background");
+        assert_eq!(app.read_cell(BIG, 7, 1), Some(format!("user{:010}", 7)), "nothing changes until the count is in");
+        pump_replace(&mut app, &ctx);
+        assert_eq!(app.read_cell(BIG, 7, 1), Some(format!("USER{:010}", 7)));
+        assert_eq!(undo_len(&app, BIG), 1);
+        app.apply_undo(BIG);
+        assert_eq!(app.read_cell(BIG, 7, 1), Some(format!("user{:010}", 7)));
+        app.apply_redo(BIG);
+        assert_eq!(app.read_cell(BIG, 7, 1), Some(format!("USER{:010}", 7)));
+    }
+
+    #[test]
+    fn a_cancelled_replace_all_changes_nothing_and_leaves_no_undo_entry() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        open_big(&mut app, 50_000);
+        app.start_replace_all(&ctx, BIG, 1, "user", "USER", ReplaceScope::CurrentColumn(1));
+        app.replace_jobs[BIG].control.cancel();
+        pump_replace(&mut app, &ctx);
+        assert_eq!(app.read_cell(BIG, 7, 1), Some(format!("user{:010}", 7)));
+        assert_eq!(undo_len(&app, BIG), 0);
+        // And a new one can start afterwards.
+        app.start_replace_all(&ctx, BIG, 1, "user", "USER", ReplaceScope::CurrentColumn(1));
+        pump_replace(&mut app, &ctx);
+        assert_eq!(app.read_cell(BIG, 7, 1), Some(format!("USER{:010}", 7)));
+    }
+
+    #[test]
+    fn only_one_replace_all_runs_per_file() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        open_big(&mut app, 50_000);
+        app.start_replace_all(&ctx, BIG, 1, "user", "USER", ReplaceScope::CurrentColumn(1));
+        let first = app.replace_jobs[BIG].id;
+        app.start_replace_all(&ctx, BIG, 1, "city", "CITY", ReplaceScope::CurrentColumn(2));
+        assert_eq!(app.replace_jobs[BIG].id, first, "the second request is refused");
+        pump_replace(&mut app, &ctx);
+        assert_eq!(undo_len(&app, BIG), 1);
+    }
+
+    #[test]
+    fn an_edit_made_while_the_count_runs_is_not_lost_or_double_counted() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        open_big(&mut app, 50_000);
+        app.start_replace_all(&ctx, BIG, 1, "user", "USER", ReplaceScope::CurrentColumn(1));
+        app.apply_edit_cell(BIG, 1, 3, 1, "user-edited");
+        pump_replace(&mut app, &ctx);
+        assert_eq!(app.read_cell(BIG, 3, 1), Some("USER-edited".to_string()), "the edited row is replaced too");
+        assert_eq!(app.read_cell(BIG, 4, 1), Some(format!("USER{:010}", 4)));
     }
 
     #[test]

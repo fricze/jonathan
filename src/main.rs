@@ -91,6 +91,8 @@ fn main() -> eframe::Result {
                     global_filter: "".to_string(),
                     filters: HashMap::new(),
                     request_epoch: HashMap::new(),
+                    replace_jobs: HashMap::new(),
+                    next_job_id: 0,
                     history: Default::default(),
                     next_row_id: HashMap::new(),
                     next_col_id: HashMap::new(),
