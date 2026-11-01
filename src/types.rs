@@ -1,4 +1,4 @@
-pub use csv_model::{ColumnId, FileHeader, InsertedColumn, MemorySheet, RemovedColumn, Sheet, SheetRow, SortOrder, View};
+pub use csv_model::{ColumnId, FileHeader, InsertedColumn, MemorySheet, RemovedColumn, ReplacedAll, RowScope, Sheet, SheetRow, SortOrder, View};
 pub use selection::SelectionState;
 pub use undo_history::UndoHistory;
 #[cfg(test)]
@@ -7,6 +7,7 @@ use egui::Context;
 use egui_dock::{DockState, NodeIndex, SurfaceIndex};
 use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -163,6 +164,36 @@ pub fn column_id_at(headers: &[FileHeader], position: usize) -> Option<ColumnId>
     headers.get(position).map(|h| h.id)
 }
 
+/// What a replace-all was asked to do: the rows (None = every row), the
+/// columns by stable id, and the text.
+#[derive(Clone)]
+pub struct ReplaceSpec {
+    pub filename: Filename,
+    pub rows: Option<Arc<Vec<usize>>>,
+    pub col_ids: Vec<ColumnId>,
+    pub find: String,
+    pub replace: String,
+}
+
+/// A replace-all that changed `changed` cells; `token` undoes it (a rule for a
+/// file-backed sheet, the old values for an in-memory one).
+#[derive(Clone)]
+pub struct ReplaceDone {
+    pub spec: ReplaceSpec,
+    pub changed: usize,
+    pub token: ReplacedAll,
+}
+
+impl ReplaceSpec {
+    fn heap_bytes(&self) -> usize {
+        self.filename.capacity()
+            + self.rows.as_ref().map_or(0, |r| r.capacity() * std::mem::size_of::<usize>())
+            + self.col_ids.capacity() * std::mem::size_of::<ColumnId>()
+            + self.find.capacity()
+            + self.replace.capacity()
+    }
+}
+
 /// One undoable/redoable change. Applying the reverse of an entry (see
 /// MyApp::apply_undo/apply_redo) always produces another UndoEntry describing
 /// how to reverse *that* -- e.g. undoing a CellEdit produces a CellEdit
@@ -203,6 +234,11 @@ pub enum UndoEntry {
     /// Insert an empty column `header` at `position` (the reverse of
     /// `ColumnUninsert`, i.e. a redo of the user's insert).
     ColumnAdd { filename: Filename, position: usize, header: FileHeader },
+    /// A replace-all happened. Undoing hands its token back to the sheet.
+    /// (Boxed: this is a big entry, and every entry pays for the biggest.)
+    ReplaceAll(Box<ReplaceDone>),
+    /// Run that replace-all again (the reverse of `ReplaceAll`, i.e. a redo).
+    ReplaceAgain(Box<ReplaceSpec>),
     /// Multiple entries that should undo/redo as one action (e.g. every
     /// cell changed by a single paste or replace-all). Reversing a batch
     /// reverses each entry in reverse order (so entries that depend on
@@ -228,6 +264,10 @@ impl UndoEntry {
             }
             UndoEntry::ColumnUninsert { filename, inserted, .. } => filename.capacity() + inserted.size_bytes(),
             UndoEntry::ColumnAdd { filename, header, .. } => filename.capacity() + header.name.capacity(),
+            UndoEntry::ReplaceAll(done) => {
+                std::mem::size_of::<ReplaceDone>() + done.spec.heap_bytes() + done.token.size_bytes()
+            }
+            UndoEntry::ReplaceAgain(spec) => std::mem::size_of::<ReplaceSpec>() + spec.heap_bytes(),
             UndoEntry::Batch(entries) => {
                 entries.capacity() * std::mem::size_of::<UndoEntry>() + entries.iter().map(Self::heap_bytes).sum::<usize>()
             }
@@ -365,5 +405,12 @@ mod tests {
 
         let after_delete = vec![header(5, "a"), header(9, "c")];
         assert_eq!(column_position(&after_delete, 9), Some(1));
+    }
+
+    #[test]
+    fn an_undo_entry_stays_small() {
+        // Every entry on the stack is this big whatever it holds, so a variant
+        // that grows it costs every cell edit. Box big payloads.
+        assert!(std::mem::size_of::<UndoEntry>() <= 112, "{}", std::mem::size_of::<UndoEntry>());
     }
 }

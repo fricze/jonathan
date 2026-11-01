@@ -2,11 +2,12 @@ use csv::StringRecord;
 use egui::Key;
 use egui_dock::{DockArea, Style};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread;
 
-use csv_model::{InsertedColumn, LoadStats, MemorySheet, RemovedColumn, open_csv_file, read_rows, write_csv};
+use csv_model::{InsertedColumn, LoadStats, MemorySheet, RemovedColumn, ReplacedAll, RowScope, open_csv_file, read_rows, write_csv};
 use crate::menu::{COPY_AS_CSV_ID, OPEN_FILE_ID};
-use crate::types::{
+use crate::types::{ReplaceDone, ReplaceSpec, 
     ColumnId, CsvTabViewer, FileHeader, InsertPosition, MyApp, ReplaceScope, SendUiMessage, SheetTab,
     SortOrder, TabId, UiMessage, UndoEntry, View, SheetRow, active_sheet_data, column_position,
 };
@@ -316,6 +317,29 @@ impl MyApp {
                 };
                 Some((reverse, result))
             }
+            UndoEntry::ReplaceAll(done) => {
+                let ReplaceDone { spec, changed, token } = *done;
+                self.sheets_data.get_mut(&spec.filename)?.undo_replace_all(&token);
+                let result = UndoRedoResult {
+                    row: None,
+                    column: None,
+                    restored: format!("{changed} cell{}", if changed == 1 { "" } else { "s" }),
+                    overwritten: "".to_string(),
+                };
+                Some((UndoEntry::ReplaceAgain(Box::new(spec)), result))
+            }
+            UndoEntry::ReplaceAgain(spec) => {
+                let (changed, token) =
+                    self.run_replace_all(&spec.filename, spec.rows.as_deref(), &spec.col_ids, &spec.find, &spec.replace)?;
+                let result = UndoRedoResult {
+                    row: None,
+                    column: None,
+                    restored: format!("{changed} cell{}", if changed == 1 { "" } else { "s" }),
+                    overwritten: "".to_string(),
+                };
+                let done = ReplaceDone { spec: *spec, changed, token };
+                Some((UndoEntry::ReplaceAll(Box::new(done)), result))
+            }
             UndoEntry::Batch(entries) => {
                 let count = entries.len();
                 // Reverse in reverse order: if entry B in the batch somehow
@@ -424,12 +448,6 @@ impl MyApp {
         pasted_count
     }
 
-    /// Replace every occurrence of `find` with `replace` across the rows
-    /// currently displayed for (filename, tab_id) -- the filtered/sorted view
-    /// if one exists, otherwise all of master -- within `scope`. Empty `find`
-    /// matches nothing (avoids replacing every cell boundary). Pushes one
-    /// UndoEntry::Batch covering every changed cell, so the whole replace
-    /// undoes/redoes as a single action. Returns the count of cells changed.
     fn apply_replace_all(
         &mut self,
         filename: &str,
@@ -441,58 +459,52 @@ impl MyApp {
         if find.is_empty() {
             return 0;
         }
-
-        let master_rows: Vec<usize> = match (
-            self.sheets_data.get(filename),
-            self.filtered_data.get(&(filename.to_string(), tab_id)),
-        ) {
-            (Some(master), Some(view)) => view.iter().filter_map(|&i| master.row_id(i as usize)).collect(),
-            (Some(master), None) => (0..master.len()).filter_map(|i| master.row_id(i)).collect(),
-            _ => vec![],
+        // The rows this tab shows (its filtered view), as stable ids, or every row.
+        let rows: Option<Arc<Vec<usize>>> = match (self.sheets_data.get(filename), self.filtered_data.get(&(filename.to_string(), tab_id))) {
+            (Some(sheet), Some(view)) => Some(Arc::new(view.iter().filter_map(|&p| sheet.row_id(p as usize)).collect())),
+            _ => None,
         };
-
-        let all_col_ids: Vec<ColumnId> = self
-            .tree
-            .iter_all_tabs()
-            .find_map(|(_, tab)| tab.columns.get(filename))
-            .map_or(vec![], |headers| headers.iter().map(|h| h.id).collect());
-
         let col_ids: Vec<ColumnId> = match scope {
             ReplaceScope::CurrentColumn(col_id) => vec![col_id],
-            ReplaceScope::AllColumns => all_col_ids,
+            ReplaceScope::AllColumns => self
+                .tree
+                .iter_all_tabs()
+                .find_map(|(_, tab)| tab.columns.get(filename))
+                .map_or(vec![], |headers| headers.iter().map(|h| h.id).collect()),
         };
-
-        let mut batch: Vec<UndoEntry> = Vec::new();
-
-        for master_row in master_rows {
-            for &col_id in &col_ids {
-                let Some(old_value) = self.read_cell(filename, master_row, col_id) else {
-                    continue;
-                };
-                if !old_value.contains(find) {
-                    continue;
-                }
-                let new_value = old_value.replace(find, replace);
-                if new_value == old_value {
-                    continue;
-                }
-
-                batch.push(UndoEntry::CellEdit {
-                    filename: filename.to_string(),
-                    master_row,
-                    col_id,
-                    old_value,
-                });
-                self.write_cell(filename, master_row, col_id, &new_value);
-            }
+        let Some((changed, token)) = self.run_replace_all(filename, rows.as_deref(), &col_ids, find, replace) else {
+            return 0;
+        };
+        if changed > 0 {
+            let spec = ReplaceSpec {
+                filename: filename.to_string(),
+                rows,
+                col_ids,
+                find: find.to_string(),
+                replace: replace.to_string(),
+            };
+            self.push_undo(filename, UndoEntry::ReplaceAll(Box::new(ReplaceDone { spec, changed, token })));
         }
+        changed
+    }
 
-        let changed_count = batch.len();
-        if changed_count > 0 {
-            self.push_undo(filename, UndoEntry::Batch(batch));
-        }
-
-        changed_count
+    /// Ask the sheet to replace `find` by `replace` in the columns with these
+    /// ids (those still present) of these rows (None = all). The sheet decides
+    /// how: edit every cell, or remember a rule.
+    fn run_replace_all(
+        &mut self,
+        filename: &str,
+        rows: Option<&Vec<usize>>,
+        col_ids: &[ColumnId],
+        find: &str,
+        replace: &str,
+    ) -> Option<(usize, ReplacedAll)> {
+        let positions: Vec<usize> = col_ids.iter().filter_map(|&id| self.column_position(filename, id)).collect();
+        let scope = match rows {
+            Some(ids) => RowScope::Ids(ids),
+            None => RowScope::All,
+        };
+        Some(self.sheets_data.get_mut(filename)?.replace_all(scope, &positions, find, replace))
     }
 
     /// Delete the row at `row_nr` in the currently displayed view for
@@ -1502,12 +1514,36 @@ mod tests {
         assert_eq!(app.read_cell("f.csv", 0, 1), Some("bar".to_string()));
         assert_eq!(app.read_cell("f.csv", 1, 0), Some("Xbar".to_string()));
         assert_eq!(app.read_cell("f.csv", 1, 1), Some("baz".to_string()));
-        // The whole replace-all is one undoable action.
+        // The whole replace-all is one undoable action, and undoing and redoing
+        // it is exact.
         assert_eq!(undo_len(&app, "f.csv"), 1);
-        match app.history.peek_undo(&"f.csv".to_string()).unwrap() {
-            UndoEntry::Batch(entries) => assert_eq!(entries.len(), 2),
-            other => panic!("expected a Batch, got {:?}", std::mem::discriminant(other)),
-        }
+        app.apply_undo("f.csv");
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("foo".to_string()));
+        assert_eq!(app.read_cell("f.csv", 1, 0), Some("foobar".to_string()));
+        assert_eq!(undo_len(&app, "f.csv"), 0);
+        app.apply_redo("f.csv");
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("X".to_string()));
+        assert_eq!(app.read_cell("f.csv", 1, 0), Some("Xbar".to_string()));
+        assert_eq!(undo_len(&app, "f.csv"), 1);
+    }
+
+    #[test]
+    fn replace_all_on_a_file_backed_sheet_is_a_rule_and_undoes_exactly() {
+        let mut app = test_app();
+        let sheet = FileSheet::new(Arc::new(SyntheticSource::new(200_000)), b',', false).unwrap();
+        app.next_row_id.insert(BIG.to_string(), sheet.next_row_id());
+        app.sheets_data.insert(BIG.to_string(), Box::new(sheet));
+        set_columns(&mut app, BIG, 8);
+        let (changed, mem) = measure(|| app.apply_replace_all(BIG, 1, "user", "USER", ReplaceScope::CurrentColumn(1)));
+        assert_eq!(changed, 200_000, "every row's name column");
+        assert!(app.sheets_data[BIG].edit_bytes() < 4096, "a rule, not 200k edited rows: {}", app.sheets_data[BIG].edit_bytes());
+        assert!(mem.retained < 64 * 1024, "{}", mem.retained);
+        assert_eq!(app.read_cell(BIG, 123_456, 1), Some(format!("USER{:010}", 123_456)));
+        assert_eq!(undo_len(&app, BIG), 1);
+        app.apply_undo(BIG);
+        assert_eq!(app.read_cell(BIG, 123_456, 1), Some(format!("user{:010}", 123_456)));
+        app.apply_redo(BIG);
+        assert_eq!(app.read_cell(BIG, 123_456, 1), Some(format!("USER{:010}", 123_456)));
     }
 
     #[test]
@@ -2098,6 +2134,8 @@ mod tests {
         /// and after every edit had been undone (`Sheet::edit_bytes`).
         edit_bytes_peak: usize,
         edit_bytes_after_undo_all: usize,
+        /// Memory the sheet held for a replace-all over every row.
+        every_row_replace_bytes: usize,
     }
 
     /// Run every scenario on a file of `rows` rows. Asserts exactness (undo
@@ -2137,6 +2175,7 @@ mod tests {
         // memory left behind by undoing is visible.
         let mut edit_rows: Vec<usize> = Vec::new();
         let mut edit_bytes_peak = 0;
+        let mut every_row_extra = 0;
         let ((), whole) = measure(|| {
             // Single-cell edits spread over the file. The read caches are filled
             // first (they are a constant size), so what is measured is the edits.
@@ -2155,11 +2194,20 @@ mod tests {
             let view_stride = (n / selected).max(1);
             let view: Vec<u32> = (0..selected).map(|k| (k * view_stride + 1) as u32).collect();
             app.filtered_data.insert((BIG.to_string(), 1), view);
-            steps.push(step(&mut app, "replace-all over a filtered view (one Batch)", selected, |a| {
+            steps.push(step(&mut app, "replace-all over a filtered view (one rule)", selected, |a| {
                 assert_eq!(a.apply_replace_all(BIG, 1, "user", "USER", ReplaceScope::CurrentColumn(1)), selected);
             }));
             app.filtered_data.clear();
             assert!(cell(&app, 1, 1).starts_with("USER"));
+
+            // Replace-all over EVERY row: a rule, so it costs nothing per row.
+            let held_before = app.sheets_data[BIG].edit_bytes();
+            steps.push(step(&mut app, "replace-all over every row", n, |a| {
+                assert_eq!(a.apply_replace_all(BIG, 1, "city", "CITY", ReplaceScope::CurrentColumn(2)), n);
+            }));
+            every_row_extra = app.sheets_data[BIG].edit_bytes() - held_before;
+            assert!(cell(&app, n / 2, 2).starts_with("CITY"));
+            assert!(cell(&app, 7, 2).starts_with("CITY"));
 
             // Delete a column while many rows are in memory, then undo it.
             let col3_before = cell(&app, edit_rows[1], 3);
@@ -2181,6 +2229,7 @@ mod tests {
             assert_eq!(app.history.undo_len(&BIG.to_string()), 0);
             assert_eq!(cell(&app, 1, 1), format!("user{:010}", 1), "everything undone: the original text is back");
             assert_eq!(cell(&app, 0, 1), format!("user{:010}", 0));
+            assert!(cell(&app, n / 2, 2).starts_with("city"), "the replace-all over every row is undone too");
         });
         let _ = whole;
         let edit_bytes_after_undo_all = app.sheets_data[BIG].edit_bytes();
@@ -2216,7 +2265,7 @@ mod tests {
         eprintln!(
             "UNDO-MEM {rows:>11} rows | memory held for changes: {edit_bytes_peak} B at the peak of the edits, {edit_bytes_after_undo_all} B after undoing every one",
         );
-        Report { steps, edit_bytes_peak, edit_bytes_after_undo_all }
+        Report { steps, edit_bytes_peak, edit_bytes_after_undo_all, every_row_replace_bytes: every_row_extra }
     }
 
     fn per_op(steps: &[Step], what: &str) -> f64 {
@@ -2225,12 +2274,17 @@ mod tests {
     }
 
     /// The budgets every file size must meet (bytes of undo stack per operation).
-    fn assert_undo_budgets(steps: &[Step]) {
+    fn assert_undo_budgets(steps: &[Step], rows_in_memory: usize) {
         assert!(per_op(steps, "delete a column (nothing edited)") <= 4096.0);
         assert!(per_op(steps, "insert a column at the end (nothing edited)") <= 4096.0);
         assert!(per_op(steps, "single-cell edits") <= 250.0, "a CellEdit entry: {}", per_op(steps, "single-cell edits"));
-        let batch = per_op(steps, "replace-all over a filtered view (one Batch)");
-        assert!(batch <= 250.0, "a cell inside a Batch: {batch}");
+        let scoped = per_op(steps, "replace-all over a filtered view (one rule)");
+        assert!(scoped <= 64.0, "a scoped replace-all costs its row ids, not its cells: {scoped} B/cell");
+        let every = steps.iter().find(|s| s.what == "replace-all over every row").unwrap();
+        // The old text of the rows already in memory has to be kept to undo
+        // exactly; nothing else is proportional to anything.
+        let bound = 4096 + 300 * rows_in_memory as i64;
+        assert!(every.history <= bound, "undo entry for a replace-all over every row: {} B (bound {bound})", every.history);
         assert!(per_op(steps, "delete rows") <= 600.0, "a RowDelete entry: {}", per_op(steps, "delete rows"));
         let with_memory = steps.iter().find(|s| s.what == "delete a column (rows are in memory)").unwrap();
         assert!(with_memory.history <= 4096 + 100 * 15_000, "token for rows in memory: {}", with_memory.history);
@@ -2240,10 +2294,15 @@ mod tests {
     fn undo_stack_memory_on_a_one_million_row_file() {
         let _g = serial();
         let report = undo_memory_scenarios(1_000_000, 10_000, 5_000, 20);
-        assert_undo_budgets(&report.steps);
+        assert_undo_budgets(&report.steps, 10_000);
         // Undoing every edit gives the sheet's memory back (rows that equal the
         // file again are dropped), instead of leaving a copy of each.
-        assert!(report.edit_bytes_peak > 3_000_000, "the edits were held in memory: {}", report.edit_bytes_peak);
+        assert!(report.edit_bytes_peak > 1_500_000, "the edits were held in memory: {}", report.edit_bytes_peak);
+        assert!(
+            report.every_row_replace_bytes <= 4096,
+            "a replace-all over every row must not copy rows into memory: {} B",
+            report.every_row_replace_bytes
+        );
         assert!(
             report.edit_bytes_after_undo_all <= 64 * 1024,
             "after undoing everything the sheet still holds {} B for changes",
@@ -2257,9 +2316,9 @@ mod tests {
         let _g = serial();
         let small = undo_memory_scenarios(1_000_000, 10_000, 5_000, 20);
         let big = undo_memory_scenarios(62_500_000, 10_000, 5_000, 20);
-        assert_undo_budgets(&big.steps);
+        assert_undo_budgets(&big.steps, 10_000);
         // The claim: an undo entry's size depends on the edit, not on the file.
-        for what in ["single-cell edits", "replace-all over a filtered view (one Batch)", "delete rows", "delete a column (nothing edited)"] {
+        for what in ["single-cell edits", "replace-all over a filtered view (one rule)", "replace-all over every row", "delete rows", "delete a column (nothing edited)"] {
             let (a, b) = (per_op(&small.steps, what), per_op(&big.steps, what));
             assert!((a - b).abs() <= 0.05 * a.max(b) + 8.0, "{what}: {a:.1} B/op on 1M rows vs {b:.1} B/op on 62.5M rows");
         }
