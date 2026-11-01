@@ -200,7 +200,6 @@ fn memory_row_cache_never_exceeds_its_byte_cap() {
 }
 
 #[test]
-#[ignore = "pending: sparse index (design 4.1)"]
 fn memory_index_is_at_most_a_quarter_byte_per_row() {
     let _g = serial();
     for n in [100_000usize, 500_000] {

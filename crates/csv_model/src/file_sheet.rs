@@ -1,6 +1,6 @@
 //! A [`Sheet`] backed by the file itself instead of rows in memory.
 //!
-//! Loading builds a [`RowIndex`] (8 bytes/row); a row is read and parsed only
+//! Loading builds a [`RowIndex`] (one sample per 64 rows); a row is read and parsed only
 //! when something asks for it. This step is the read-only half: reads,
 //! filter, sort, snapshot. Edits arrive in the next steps.
 
@@ -14,11 +14,11 @@ use std::sync::{Arc, Mutex};
 
 use csv::StringRecord;
 
-use crate::lean::LeanParser;
+use crate::lean::{Fields, LeanParser};
 use crate::pieces::Pieces;
 use crate::{
-    InsertedColumn, RemovedColumn, ReplacedAll, RowIndex, RowIndexBuilder, RowScope, Sheet,
-    SheetRow, SortOrder, View, sort_cells,
+    InsertedColumn, RemovedColumn, ReplacedAll, RowIndex, RowIndexBuilder, RowScanner, RowScope,
+    RowWalker, Sheet, SheetRow, SortOrder, View, sort_cells,
 };
 
 /// Random-access bytes. Positional reads (not mmap) so that a file shrinking
@@ -122,48 +122,61 @@ impl RowBytes {
     }
 }
 
-/// A window onto the file for one scan. Rows are requested in increasing
-/// position, so it reads large chunks (`SCAN_WINDOW`) and serves many rows from
-/// each; if the scan jumps ahead (a sparse view) it falls back to small reads.
-/// Bypasses the shared caches so a scan cannot evict what the table shows.
-struct ScanWindow {
-    start: u64,
-    data: Vec<u8>,
+/// Reads through a sheet's block cache, so the many small reads that locate a
+/// row (a sample plus a few rows after it) cost one cached block, not a read of
+/// the file each.
+struct CachedSource<'a>(&'a FileSheet);
+
+impl ByteSource for CachedSource<'_> {
+    fn len(&self) -> u64 {
+        self.0.source.len()
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        let total = self.0.source.len();
+        let mut done = 0;
+        while done < buf.len() && offset + (done as u64) < total {
+            let at = offset + done as u64;
+            let no = at / BLOCK;
+            let block = self
+                .0
+                .block(no)
+                .ok_or_else(|| io::Error::other("unreadable block"))?;
+            let within = (at - no * BLOCK) as usize;
+            let n = block.len().saturating_sub(within).min(buf.len() - done);
+            if n == 0 {
+                break;
+            }
+            buf[done..done + n].copy_from_slice(&block[within..within + n]);
+            done += n;
+        }
+        Ok(done)
+    }
 }
 
-impl ScanWindow {
-    fn new() -> Self {
-        ScanWindow {
-            start: 0,
-            data: Vec::new(),
-        }
+/// Run `f` on the walker's current row's fields: the ones the scan that
+/// delimited it already produced, or, when it did not (a very large row, an
+/// unterminated last row), the ones parsed from its bytes.
+fn with_row_fields<R>(
+    walker: &mut RowWalker<'_>,
+    parser: &mut LeanParser,
+    f: impl FnOnce(&Fields<'_>) -> R,
+) -> Option<R> {
+    if let Some(fields) = walker.row_fields() {
+        return Some(f(&fields));
     }
-
-    fn get(&mut self, sheet: &FileSheet, range: Range<u64>) -> Option<&[u8]> {
-        let end = self.start + self.data.len() as u64;
-        if self.data.is_empty() || range.start < self.start || range.end > end {
-            let total = sheet.source.len();
-            let sequential =
-                !self.data.is_empty() && range.start >= self.start && range.start <= end + BLOCK;
-            let want = (range.end - range.start).max(if sequential { SCAN_WINDOW } else { BLOCK });
-            let len = want.min(total.saturating_sub(range.start)) as usize;
-            self.data.resize(len, 0);
-            self.start = range.start;
-            if !sheet.read_exact_at(range.start, &mut self.data) {
-                self.data.clear();
-                return None;
-            }
-        }
-        let lo = (range.start - self.start) as usize;
-        let hi = (range.end - self.start) as usize;
-        self.data.get(lo..hi)
-    }
+    let bytes = walker.row_bytes()?;
+    let fields = parser.parse(bytes)?;
+    Some(f(&fields))
 }
 
 thread_local! {
     /// One parser per thread, reused for every row read; rebuilt only if the
     /// delimiter changes.
     static PARSER: RefCell<Option<(u8, LeanParser)>> = const { RefCell::new(None) };
+    /// The scanner and buffer a row lookup uses, kept between lookups (building
+    /// a scanner compiles a state machine, which costs more than the lookup).
+    static LOCATOR: RefCell<Option<(RowScanner, Vec<u8>)>> = const { RefCell::new(None) };
 }
 
 /// Where a logical column's data comes from.
@@ -569,7 +582,43 @@ impl FileSheet {
         row_capacity: usize,
         block_capacity: usize,
     ) -> io::Result<Self> {
-        let mut builder = RowIndexBuilder::new(delimiter, has_header);
+        Self::build(
+            source,
+            delimiter,
+            has_header,
+            row_capacity,
+            block_capacity,
+            crate::DEFAULT_STRIDE,
+        )
+    }
+
+    /// Like `new`, with one index sample per `stride` rows (the default, 64, is
+    /// right for real files; a small stride lets tests exercise many samples).
+    pub fn with_stride(
+        source: Arc<dyn ByteSource>,
+        delimiter: u8,
+        has_header: bool,
+        stride: usize,
+    ) -> io::Result<Self> {
+        Self::build(
+            source,
+            delimiter,
+            has_header,
+            DEFAULT_CACHE_ROWS,
+            DEFAULT_CACHE_BLOCKS,
+            stride,
+        )
+    }
+
+    fn build(
+        source: Arc<dyn ByteSource>,
+        delimiter: u8,
+        has_header: bool,
+        row_capacity: usize,
+        block_capacity: usize,
+        stride: usize,
+    ) -> io::Result<Self> {
+        let mut builder = RowIndexBuilder::new(delimiter, has_header).with_stride(stride);
         let mut buf = vec![0u8; INDEX_CHUNK];
         let total = source.len();
         let mut at = 0u64;
@@ -665,6 +714,21 @@ impl FileSheet {
         Some(RowBytes::Owned(out))
     }
 
+    /// Byte range of file row `id`: reads a little of the file near its sample
+    /// (through the block cache) and scans forward to the row.
+    fn locate(&self, id: usize) -> Option<Range<u64>> {
+        let source = CachedSource(self);
+        let (scanner, buf) = LOCATOR
+            .with(|slot| slot.borrow_mut().take())
+            .filter(|(scanner, _)| scanner.delimiter() == self.delimiter)
+            .unwrap_or_else(|| (RowScanner::new(self.delimiter), Vec::new()));
+        let mut walker = RowWalker::reusing(&self.index, &source, 8 * 1024, scanner, buf);
+        let range = walker.seek_id(id).and_then(|_| walker.row_range());
+        let recycled = walker.recycle();
+        LOCATOR.with(|slot| *slot.borrow_mut() = Some(recycled));
+        range
+    }
+
     /// Read and parse file row `file_row` into a record, as the user sees it
     /// (columns mapped). `None` if there is no such row or its bytes can no
     /// longer be read.
@@ -678,7 +742,7 @@ impl FileSheet {
     }
 
     fn read_row_with(&self, file_row: usize, mapped: bool) -> Option<StringRecord> {
-        let bytes = self.row_bytes(self.index.row_range(file_row)?)?;
+        let bytes = self.row_bytes(self.locate(file_row)?)?;
         PARSER.with(|cell| {
             let mut slot = cell.borrow_mut();
             if slot.as_ref().is_none_or(|(d, _)| *d != self.delimiter) {
@@ -704,18 +768,14 @@ impl FileSheet {
         })
     }
 
-    /// Whether any field of file row `id` (columns mapped), parsed from
-    /// `bytes`, contains what `finder` looks for.
+    /// Whether any field of file row `id` (columns mapped) contains what
+    /// `finder` looks for.
     fn fields_contain(
         &self,
-        parser: &mut LeanParser,
-        bytes: &[u8],
+        fields: &Fields<'_>,
         id: usize,
         finder: &memchr::memmem::Finder<'_>,
     ) -> bool {
-        let Some(fields) = parser.parse(bytes) else {
-            return false;
-        };
         if self.columns.is_identity() {
             return fields.iter().any(|c| finder.find(c).is_some());
         }
@@ -776,6 +836,74 @@ impl FileSheet {
         self.row_by_id(self.id_at(position)?)
     }
 
+    /// Search the bytes of the file rows `first..end` (a stretch of the file) for
+    /// `finder` in windows, and check the rows that contain a match. Reads each
+    /// byte once; only rows with a match are located and parsed.
+    fn search_run_bytes(
+        &self,
+        walker: &mut RowWalker<'_>,
+        parser: &mut LeanParser,
+        finder: &memchr::memmem::Finder<'_>,
+        first: usize,
+        end: usize,
+        position: &dyn Fn(usize) -> u32,
+        hits: &mut View,
+    ) {
+        let (Some(()), Some(from)) = (walker.seek_id(first), walker.row_range().map(|r| r.start))
+        else {
+            return;
+        };
+        let Some(to) = walker
+            .seek_id(end - 1)
+            .and_then(|_| walker.row_range())
+            .map(|r| r.end)
+        else {
+            return;
+        };
+        let overlap = finder.needle().len().saturating_sub(1);
+        let mut buf = Vec::new();
+        let mut at = from;
+        while at < to {
+            // A window of whole bytes plus enough of the next to catch a match
+            // that starts inside this window and runs past its end.
+            let window_end = (at + SCAN_WINDOW).min(to);
+            let read_end = (window_end + overlap as u64).min(to);
+            buf.resize((read_end - at) as usize, 0);
+            if !self.read_exact_at(at, &mut buf) {
+                return; // the file went away; report what was found so far
+            }
+            let mut next = window_end;
+            let mut from_byte = 0usize;
+            while let Some(found) = finder.find(&buf[from_byte..]) {
+                let offset = at + (from_byte + found) as u64;
+                if offset >= window_end {
+                    break;
+                }
+                let Some(id) = walker.seek_offset(offset) else {
+                    break;
+                };
+                let Some(range) = walker.row_range() else {
+                    break;
+                };
+                if !self.edited.contains_key(&id)
+                    && with_row_fields(walker, parser, |fields| {
+                        self.fields_contain(fields, id, finder)
+                    })
+                    .unwrap_or(false)
+                {
+                    hits.push(position(id));
+                }
+                // Carry on after this row.
+                next = next.max(range.end);
+                if range.end >= read_end {
+                    break;
+                }
+                from_byte = (range.end - at) as usize;
+            }
+            at = next;
+        }
+    }
+
     /// Visit the rows that come from the file (present in the sheet and not held
     /// in memory) in display order, or just those with the given ids, with their
     /// fields as the user sees them. With a `prefilter`, rows whose bytes do not
@@ -788,36 +916,47 @@ impl FileSheet {
         mut f: impl FnMut(usize, &[Cow<'_, [u8]>]),
     ) {
         let file_rows = self.index.len();
-        let mut window = ScanWindow::new();
+        let mut walker = RowWalker::new(&self.index, &*self.source, SCAN_WINDOW as usize);
         let mut parser = LeanParser::new(self.delimiter);
-        let mut visit = |id: usize| {
-            if self.edited.contains_key(&id) {
-                return;
+        let mut handle = |walker: &mut RowWalker<'_>, id: usize| {
+            if let Some(p) = prefilter {
+                if walker
+                    .row_bytes()
+                    .is_none_or(|bytes| p.find(bytes).is_none())
+                {
+                    return;
+                }
             }
-            let Some(bytes) = self.index.row_range(id).and_then(|r| window.get(self, r)) else {
-                return;
-            };
-            if prefilter.is_some_and(|p| p.find(bytes).is_none()) {
-                return;
-            }
-            let Some(fields) = parser.parse(bytes) else {
-                return;
-            };
-            let stored: Vec<&[u8]> = fields.iter().collect();
-            f(id, &self.columns.logical(id, &stored));
+            with_row_fields(walker, &mut parser, |fields| {
+                let stored: Vec<&[u8]> = fields.iter().collect();
+                f(id, &self.columns.logical(id, &stored));
+            });
         };
         match ids {
             None => {
                 for (_, run) in self.pieces.runs() {
-                    for id in run.first..(run.first + run.len).min(file_rows) {
-                        visit(id);
+                    let end = (run.first + run.len).min(file_rows);
+                    if run.first >= end || walker.seek_id(run.first).is_none() {
+                        continue;
+                    }
+                    for id in run.first..end {
+                        if !self.edited.contains_key(&id) {
+                            handle(&mut walker, id);
+                        }
+                        if id + 1 < end && !walker.advance() {
+                            break;
+                        }
                     }
                 }
             }
             Some(ids) => {
                 for &id in ids {
-                    if id < file_rows && self.pieces.position_of(id).is_some() {
-                        visit(id);
+                    if id < file_rows
+                        && !self.edited.contains_key(&id)
+                        && self.pieces.position_of(id).is_some()
+                        && walker.seek_id(id).is_some()
+                    {
+                        handle(&mut walker, id);
                     }
                 }
             }
@@ -1063,8 +1202,8 @@ impl Sheet for FileSheet {
         let finder = memchr::memmem::Finder::new(needle.as_bytes());
         // A field's text appears verbatim in the row's bytes unless it contains
         // a quote (stored doubled), so a needle without one can rule out a row
-        // by searching bytes alone, no parsing. Added columns hold values that
-        // are not in the bytes at all.
+        // by searching bytes alone, no parsing. Added columns and replace-all
+        // rules hold text that is not in the bytes at all.
         let prefilter =
             !needle.as_bytes().contains(&b'"') && !self.columns.bytes_do_not_tell_the_whole_story();
         // One search per window of many rows is sound when a match cannot span
@@ -1074,63 +1213,42 @@ impl Sheet for FileSheet {
         edited_ids.sort_unstable();
         let file_rows = self.index.len();
         let mut parser = LeanParser::new(self.delimiter);
+        let mut walker = RowWalker::new(&self.index, &*self.source, SCAN_WINDOW as usize);
         let mut hits = View::new();
         for (start, run) in self.pieces.runs() {
             let first_hit = hits.len();
             let position = |id: usize| (start + id - run.first) as u32;
             let file_end = (run.first + run.len).min(file_rows);
-            if by_window {
-                let mut buf = Vec::new();
-                let mut row = run.first;
-                while row < file_end {
-                    // The window: whole rows from `row` up to about SCAN_WINDOW bytes.
-                    let first = self.index.row_range(row).unwrap();
-                    let target = first.start + SCAN_WINDOW;
-                    let last = match self
-                        .index
-                        .row_at_offset(target.min(self.index.total_len() - 1))
-                    {
-                        Some(last) if target < self.index.total_len() => last,
-                        _ => file_rows - 1,
-                    };
-                    let last = last.clamp(row, file_end - 1);
-                    let end = self.index.row_range(last).unwrap().end;
-                    buf.resize((end - first.start) as usize, 0);
-                    if !self.read_exact_at(first.start, &mut buf) {
-                        break; // the file went away; report what was found so far
-                    }
-                    let mut at = 0usize;
-                    while let Some(found) = finder.find(&buf[at..]) {
-                        let offset = first.start + (at + found) as u64;
-                        let Some(id) = self.index.row_at_offset(offset) else {
-                            break;
-                        };
-                        let range = self.index.row_range(id).unwrap();
+            if run.first < file_end {
+                if by_window {
+                    self.search_run_bytes(
+                        &mut walker,
+                        &mut parser,
+                        &finder,
+                        run.first,
+                        file_end,
+                        &position,
+                        &mut hits,
+                    );
+                } else if walker.seek_id(run.first).is_some() {
+                    for id in run.first..file_end {
                         if !self.edited.contains_key(&id) {
-                            let bytes = &buf[(range.start - first.start) as usize
-                                ..(range.end - first.start) as usize];
-                            if self.fields_contain(&mut parser, bytes, id, &finder) {
+                            let ruled_out = prefilter
+                                && walker
+                                    .row_bytes()
+                                    .is_none_or(|bytes| finder.find(bytes).is_none());
+                            let hit = !ruled_out
+                                && with_row_fields(&mut walker, &mut parser, |fields| {
+                                    self.fields_contain(fields, id, &finder)
+                                })
+                                .unwrap_or(false);
+                            if hit {
                                 hits.push(position(id));
                             }
                         }
-                        at = (range.end - first.start) as usize; // next row onward
-                    }
-                    row = last + 1;
-                }
-            } else {
-                let mut window = ScanWindow::new();
-                for id in run.first..file_end {
-                    if self.edited.contains_key(&id) {
-                        continue;
-                    }
-                    let hit = match self.index.row_range(id).and_then(|r| window.get(self, r)) {
-                        Some(bytes) if !prefilter || finder.find(bytes).is_some() => {
-                            self.fields_contain(&mut parser, bytes, id, &finder)
+                        if id + 1 < file_end && !walker.advance() {
+                            break;
                         }
-                        _ => false,
-                    };
-                    if hit {
-                        hits.push(position(id));
                     }
                 }
             }
@@ -1151,7 +1269,7 @@ impl Sheet for FileSheet {
     fn sort(&self, view: View, sort_by: (usize, SortOrder)) -> View {
         // Copy the sort column's text into one arena (one allocation, not one
         // per row), then sort `(text, position)` pairs borrowed from it.
-        let mut window = ScanWindow::new();
+        let mut walker = RowWalker::new(&self.index, &*self.source, SCAN_WINDOW as usize);
         let mut parser = LeanParser::new(self.delimiter);
         let mut arena = String::new();
         let mut spans = Vec::with_capacity(view.len());
@@ -1161,21 +1279,18 @@ impl Sheet for FileSheet {
                 match self.edited.get(&id) {
                     Some(row) => arena.push_str(row.get(sort_by.0).unwrap_or("")),
                     None => {
-                        let fields = self
-                            .index
-                            .row_range(id)
-                            .and_then(|r| window.get(self, r))
-                            .and_then(|bytes| parser.parse(bytes));
-                        if let Some(fields) = fields {
-                            let cell = if self.columns.is_identity() {
-                                fields.get(sort_by.0).map(Cow::Borrowed)
-                            } else {
-                                let stored: Vec<&[u8]> = fields.iter().collect();
-                                self.columns.logical_field(id, &stored, sort_by.0)
-                            };
-                            if let Some(cell) = cell {
-                                arena.push_str(&String::from_utf8_lossy(&cell));
-                            }
+                        if id < self.index.len() && walker.seek_id(id).is_some() {
+                            with_row_fields(&mut walker, &mut parser, |fields| {
+                                let cell = if self.columns.is_identity() {
+                                    fields.get(sort_by.0).map(Cow::Borrowed)
+                                } else {
+                                    let stored: Vec<&[u8]> = fields.iter().collect();
+                                    self.columns.logical_field(id, &stored, sort_by.0)
+                                };
+                                if let Some(cell) = cell {
+                                    arena.push_str(&String::from_utf8_lossy(&cell));
+                                }
+                            });
                         }
                     }
                 }
@@ -1476,30 +1591,37 @@ mod tests {
         ));
         let s = FileSheet::with_cache_capacity(src.clone(), b',', false, 2).unwrap();
         let after_index = src.1.load(Relaxed);
+        // With no block cache, a row that is not in the row cache costs two
+        // source reads: one to find where it ends, one for its bytes.
+        const MISS: usize = 2;
 
-        // Every cell of one row costs a single source read.
+        // Every cell of one row costs a single miss.
         for col in 0..3 {
             let _ = s.cell(0, col);
         }
-        assert_eq!(src.1.load(Relaxed), after_index + 1);
+        assert_eq!(src.1.load(Relaxed), after_index + MISS);
 
         s.cell(1, 0);
         s.cell(0, 0);
         s.cell(1, 0);
         assert_eq!(
             src.1.load(Relaxed),
-            after_index + 2,
+            after_index + 2 * MISS,
             "rows 0 and 1 both cached"
         );
 
         s.cell(2, 0); // evicts row 0, the oldest
-        assert_eq!(src.1.load(Relaxed), after_index + 3);
+        assert_eq!(src.1.load(Relaxed), after_index + 3 * MISS);
         s.cell(1, 0);
-        assert_eq!(src.1.load(Relaxed), after_index + 3, "row 1 survived");
+        assert_eq!(
+            src.1.load(Relaxed),
+            after_index + 3 * MISS,
+            "row 1 survived"
+        );
         s.cell(0, 0);
         assert_eq!(
             src.1.load(Relaxed),
-            after_index + 4,
+            after_index + 4 * MISS,
             "row 0 was evicted, read again"
         );
     }
@@ -1597,9 +1719,8 @@ mod tests {
         assert_eq!(strs(&s, 1), Some(vec!["3".into()]));
         let before = src.1.load(Relaxed);
         s.cell(1, 0);
-        assert_eq!(
-            src.1.load(Relaxed),
-            before + 1,
+        assert!(
+            src.1.load(Relaxed) > before,
             "row 1 still comes from the file"
         );
     }

@@ -438,9 +438,12 @@ filter, arena-based sort-key extraction. Measured against the first red run
 
 Column delete now reads 0 bytes of the file (column map + undo token, 4.4).
 
-Still red (pending): sparse index (10.4 B/row now), persistent piece table
-(row edits scale with file size), persistent overlay (snapshot cost grows with
-edits).
+Sparse index is built (1 sample per 64 rows): 0.084 B/row at 100k rows, 0.117 at
+500k (was 10.4 B/row), random row read 6.7 us, first touch 0.44 ms, parse
+filter ~4.5 M rows/s (the scanner hands out the fields it parsed while
+delimiting the row, so a row is parsed once).
+
+Still red (pending): persistent overlay (snapshot cost grows with edits).
 
 ## 7.3 Undo-stack memory (measured on a 5 GB file)
 
@@ -461,7 +464,7 @@ dropping unchanged rows (the first measurement is in the git history):
 | Delete a column with 15k rows in memory | 630 KB (42 B/row) | 0.3 MB | yes |
 | Delete a row | 341 B | **0** (was 498 MB the first time) | yes (20 deletes: 0.01 s, was 1.6 s) |
 | Insert a row | 103 B | ~0 | yes |
-| Index of the opened file | - | **537 MB** (8.59 B/row) | no - grows with the file |
+| Index of the opened file | - | **537 MB** (8.59 B/row) *(measured before the sparse index; now ~0.1 B/row, ~7 MB for 5 GB - re-run `scripts/big.sh` to confirm)* | no - grows with the file |
 
 Memory the sheet holds for changes (`Sheet::edit_bytes`): 4.2 MB at the peak of
 15k edited rows, **144 B after undoing every edit** (was 13.5 MB before rows
@@ -485,8 +488,8 @@ What this shows:
   background job with progress and cancel** (4.8, not yet built). After that,
   reads cost an extra substring search per covered field, and filter must parse
   every row instead of searching raw bytes (5-6M rows/s instead of GB/s).
-* **The dense index** is 537 MB for 5 GB; the sparse index brings it to 16 MB
-  (pending budget).
+* **The dense index** was 537 MB for 5 GB; the sparse index brings it to
+  ~16 MB or less (budget met in `budgets.rs`).
 * The test takes ~90 s end to end, mostly indexing and synthesising 5 GB.
 
 Sizes reported by `UndoEntry::approx_bytes` and by tokens are checked against

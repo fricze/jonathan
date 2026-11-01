@@ -15,6 +15,10 @@ pub struct Fields<'a> {
 }
 
 impl<'a> Fields<'a> {
+    pub(crate) fn new(out: &'a [u8], ends: &'a [usize]) -> Self {
+        Fields { out, ends }
+    }
+
     pub fn len(&self) -> usize {
         self.ends.len()
     }
