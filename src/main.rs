@@ -6,6 +6,12 @@ use std::sync::mpsc;
 
 mod app;
 mod menu;
+
+// Memory tests count allocations exactly (see app.rs, `big` tests).
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: csv_model::testing::CountingAlloc = csv_model::testing::CountingAlloc;
+
 mod new_table;
 mod tabs;
 mod toast;

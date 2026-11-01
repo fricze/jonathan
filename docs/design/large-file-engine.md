@@ -414,6 +414,53 @@ Still red (pending): sparse index (10.4 B/row now), persistent piece table
 (row edits scale with file size), persistent overlay (snapshot cost grows with
 edits).
 
+## 7.3 Undo-stack memory (measured on a 5 GB file)
+
+`scripts/big.sh` drives the app's real code paths (edit, replace-all, row and
+column operations, undo, redo) over a file-backed sheet on a 62.5M-row, 5 GB
+*virtual* file (`csv_model::testing::SyntheticSource`: rows are computed when
+read, so no disk is needed), next to the same scenarios on 1M rows. Memory is
+counted exactly by the test allocator. One run, release build:
+
+| Operation | Undo stack | Process memory | Same at 1M and 62.5M rows? |
+|---|---|---|---|
+| Delete a column, nothing edited | 275 B | 0.9 KB | yes, identical |
+| Insert a column, nothing edited | 255 B | 0.4 KB | yes |
+| Single-cell edit | 117 B | **943 B** | yes |
+| Replace-all, per cell (Batch) | 178 B | **548 B** | yes |
+| Delete a column with 15k rows in memory | 630 KB (42 B/row) | 0.3 MB | yes |
+| Delete a row | 341 B | **498 MB the first time**, then 0 | no - grows with the file |
+| Insert a row | 103 B | ~0 | yes |
+| Index of the opened file | - | **537 MB** (8.59 B/row) | no - grows with the file |
+
+What this shows:
+
+* **The undo stack is bounded by the edits, not the file.** Every entry costs
+  exactly the same on a 5 GB file as on an 80 MB one. Tokens for columns are a
+  few hundred bytes when nothing is in memory.
+* **The real memory cost of editing is the overlay, not the undo stack.** A
+  cell edit costs 117 B of undo but 943 B of process memory: the row is
+  copied into memory (about 830 B for an 8-field row). A replace-all that
+  touches 1% of this file (625k rows) needs ~340 MB; one that touches 10%
+  needs ~3.4 GB; one that touches every row (62.5M) would need ~34 GB and
+  cannot work. **Risk, not yet designed for:** bulk edits scale memory by
+  ~0.5-1 KB per edited row. Options: a cell-granular overlay (a changed cell
+  is ~60 B, not a whole row), edits stored column-wise for bulk operations,
+  or running replace-all as a streaming rewrite to a new file instead of an
+  in-memory edit.
+* **Undoing does not give the overlay's memory back.** After undoing every
+  edit the process still holds ~13.5 MB, the rows that were copied in and now
+  equal the file again. Pending test: `undoing_every_edit_gives_the_memory_back`.
+* **Row insert/remove still builds the 500 MB order list** at the first
+  operation and costs ~80 ms per operation at this size (1.6 s for 20
+  deletes): the piece table's reason for existing (pending budgets).
+* **The dense index** is 537 MB for 5 GB; the sparse index brings it to 16 MB
+  (pending budget).
+* The sheet took 59 s end to end, mostly indexing and synthesising 5 GB.
+
+Sizes reported by `UndoEntry::approx_bytes` and by tokens are checked against
+the allocator in `crates/csv_model/tests/budgets.rs`.
+
 ## 8. Plan
 
 1. **Spikes** - DONE for pread vs mmap, parallel scaling, sort, CPU cost of

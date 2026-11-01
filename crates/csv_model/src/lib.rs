@@ -9,6 +9,7 @@ mod file_sheet;
 mod lean;
 mod row_index;
 mod sheet;
+pub mod testing;
 pub use file_sheet::{ByteSource, FileSheet, VecSource};
 pub use row_index::{RowIndex, RowIndexBuilder};
 pub use sheet::{InsertedColumn, MemorySheet, RemovedColumn, Sheet};

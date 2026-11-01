@@ -340,6 +340,25 @@ impl MyApp {
         }
     }
 
+    /// Set one cell, recording the old value for undo. `row_nr` is an index
+    /// into the currently displayed (filtered/sorted) view; it is resolved to
+    /// a stable master row first and the write always goes through to master
+    /// (the filtered view is just a cache). Returns whether a cell changed.
+    fn apply_edit_cell(&mut self, filename: &str, tab_id: TabId, row_nr: u64, col_id: ColumnId, new_value: &str) -> bool {
+        let Some(master_row) = self.master_row_at(filename, tab_id, row_nr) else {
+            return false;
+        };
+        let Some(old_value) = self.read_cell(filename, master_row, col_id) else {
+            return false;
+        };
+        self.write_cell(filename, master_row, col_id, new_value);
+        self.push_undo(
+            filename,
+            UndoEntry::CellEdit { filename: filename.to_string(), master_row, col_id, old_value },
+        );
+        true
+    }
+
     /// Write a pasted grid into master starting at (anchor_row, anchor_col_id)
     /// in the currently displayed view for (filename, tab_id), growing
     /// right/down through display *positions* from the anchor's current
@@ -865,18 +884,7 @@ impl MyApp {
                 }
                 UiMessage::OpenFile(file, tab) => self.load_file(ctx, file, tab),
                 UiMessage::EditCell(filename, tab_id, row_nr, col_id, new_value) => {
-                    // row_nr is an index into the currently displayed (filtered/sorted)
-                    // view. Resolve it to a stable master row index first, then always
-                    // write through to master -- the filtered view is just a cache.
-                    if let Some(master_row) = self.master_row_at(&filename, tab_id, row_nr) {
-                        if let Some(old_value) = self.read_cell(&filename, master_row, col_id) {
-                            self.write_cell(&filename, master_row, col_id, &new_value);
-                            self.push_undo(
-                                &filename,
-                                UndoEntry::CellEdit { filename: filename.clone(), master_row, col_id, old_value },
-                            );
-                        }
-                    }
+                    self.apply_edit_cell(&filename, tab_id, row_nr, col_id, &new_value);
                 }
                 UiMessage::PasteCells(filename, tab_id, anchor_row, anchor_col, rows) => {
                     let pasted_count = self.apply_paste(&filename, tab_id, anchor_row, anchor_col, &rows);
@@ -2021,5 +2029,238 @@ mod tests {
         assert_eq!(app.read_cell("f.csv", 1, 0), Some("z".to_string()));
         assert_eq!(app.read_cell("f.csv", 1, 1), Some("w".to_string()));
         assert!(app.apply_redo("f.csv").is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // Undo-stack memory on big files. The same scenarios run on a 1M-row
+    // file (always) and on a 5 GB virtual file (`#[ignore]`, scripts/big.sh):
+    // an undo entry's size must depend on the edit, never on the file.
+    // ---------------------------------------------------------------------
+
+    use csv_model::testing::{SyntheticSource, measure, serial};
+    use csv_model::{FileSheet, Sheet};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    const BIG: &str = "big.csv";
+
+    fn file_app(rows: u64) -> (MyApp, usize) {
+        let mut app = test_app();
+        let (sheet, mem) = measure(|| FileSheet::new(Arc::new(SyntheticSource::new(rows)), b',', false).unwrap());
+        app.next_row_id.insert(BIG.to_string(), sheet.next_row_id());
+        app.sheets_data.insert(BIG.to_string(), Box::new(sheet));
+        set_columns(&mut app, BIG, 8);
+        app.next_col_id.insert(BIG.to_string(), 8);
+        (app, mem.retained as usize)
+    }
+
+    /// Memory held by the undo stack alone (the redo branch is dropped by any
+    /// new edit, which would hide growth).
+    fn history_bytes(app: &MyApp) -> i64 {
+        app.history.undo_entries(&BIG.to_string()).iter().map(UndoEntry::approx_bytes).sum::<usize>() as i64
+    }
+
+    fn cell(app: &MyApp, row: usize, col: usize) -> String {
+        app.sheets_data[BIG].cell(row, col).map(|c| c.into_owned()).unwrap_or_default()
+    }
+
+    /// One measured step: what the undo stack and the process each gained.
+    #[derive(Debug, Clone)]
+    struct Step {
+        what: &'static str,
+        ops: usize,
+        history: i64,
+        retained: i64,
+        secs: f64,
+    }
+
+    impl Step {
+        fn print(&self, rows: u64) {
+            let per = |b: f64| if self.ops == 0 { 0.0 } else { b / self.ops as f64 };
+            eprintln!(
+                "UNDO-MEM {:>11} rows | {:<46} | {:>7} ops | undo stack {:>+11} B ({:>+8.1} B/op) | process {:>+13} B ({:>9.1} B/op) | {:>7.2}s",
+                rows, self.what, self.ops, self.history, per(self.history as f64), self.retained,
+                per(self.retained as f64), self.secs
+            );
+        }
+    }
+
+    fn step(app: &mut MyApp, what: &'static str, ops: usize, f: impl FnOnce(&mut MyApp)) -> Step {
+        let before = history_bytes(app);
+        let t = Instant::now();
+        let ((), mem) = measure(|| f(app));
+        Step { what, ops, history: history_bytes(app) - before, retained: mem.retained, secs: t.elapsed().as_secs_f64() }
+    }
+
+    struct Report {
+        steps: Vec<Step>,
+        /// Process memory the edit phase added, and what was still held after
+        /// every edit had been undone.
+        edit_phase_growth: i64,
+        residual_after_undo_all: i64,
+    }
+
+    /// Run every scenario on a file of `rows` rows. Asserts exactness (undo
+    /// and redo give the data back) as it goes.
+    fn undo_memory_scenarios(rows: u64, edits: usize, selected: usize, row_ops: usize) -> Report {
+        let (mut app, open_bytes) = file_app(rows);
+        eprintln!(
+            "UNDO-MEM {rows:>11} rows | opening the sheet (index, nothing edited)          | process {open_bytes:>+13} B ({:.2} B/row)",
+            open_bytes as f64 / rows as f64
+        );
+        let n = rows as usize;
+        let mut steps = Vec::new();
+        let probe = |app: &MyApp, col: usize| -> Vec<String> { [0usize, n / 3, n / 2, n - 1].iter().map(|&r| cell(app, r, col)).collect() };
+        let original = probe(&app, 2);
+
+        // Column delete / insert while nothing is in memory.
+        steps.push(step(&mut app, "delete a column (nothing edited)", 1, |a| {
+            assert!(a.apply_delete_column(BIG, 2));
+        }));
+        assert_ne!(probe(&app, 2), original, "column 2 is gone, so column 3 is now at index 2");
+        steps.push(step(&mut app, "  undo it", 1, |a| {
+            assert!(a.apply_undo(BIG).is_some());
+        }));
+        assert_eq!(probe(&app, 2), original, "undo of the delete is exact");
+        steps.push(step(&mut app, "  redo it", 1, |a| {
+            assert!(a.apply_redo(BIG).is_some());
+        }));
+        assert!(app.apply_undo(BIG).is_some()); // leave the column in place
+        steps.push(step(&mut app, "insert a column at the end (nothing edited)", 1, |a| {
+            assert!(a.apply_insert_column(BIG, None, "extra").is_some());
+        }));
+        assert!(app.apply_undo(BIG).is_some());
+        assert_eq!(app.sheets_data[BIG].record(n / 2).unwrap().len(), 8, "undo of the insert is exact");
+        app.history = Default::default(); // the editing scenarios start from an empty stack
+
+        // Edits, then undo everything, all measured as one block so the
+        // memory left behind by undoing is visible.
+        let mut edit_rows: Vec<usize> = Vec::new();
+        let ((), whole) = measure(|| {
+            // Single-cell edits spread over the file.
+            let stride = (n / edits).max(1);
+            steps.push(step(&mut app, "single-cell edits", edits, |a| {
+                for k in 0..edits {
+                    assert!(a.apply_edit_cell(BIG, 1, (k * stride) as u64, 1, "an edited text value"));
+                }
+            }));
+            edit_rows = vec![0, (edits / 2) * stride, (edits - 1) * stride];
+
+            // Replace-all over a filtered view: one Batch entry.
+            let view_stride = (n / selected).max(1);
+            let view: Vec<u32> = (0..selected).map(|k| (k * view_stride + 1) as u32).collect();
+            app.filtered_data.insert((BIG.to_string(), 1), view);
+            steps.push(step(&mut app, "replace-all over a filtered view (one Batch)", selected, |a| {
+                assert_eq!(a.apply_replace_all(BIG, 1, "user", "USER", ReplaceScope::CurrentColumn(1)), selected);
+            }));
+            app.filtered_data.clear();
+            assert!(cell(&app, 1, 1).starts_with("USER"));
+
+            // Delete a column while many rows are in memory, then undo it.
+            let col3_before = cell(&app, edit_rows[1], 3);
+            steps.push(step(&mut app, "delete a column (rows are in memory)", 1, |a| {
+                assert!(a.apply_delete_column(BIG, 3));
+            }));
+            steps.push(step(&mut app, "  undo it", 1, |a| {
+                assert!(a.apply_undo(BIG).is_some());
+            }));
+            assert_eq!(cell(&app, edit_rows[1], 3), col3_before, "restored in a row that was edited");
+            assert_eq!(cell(&app, edit_rows[1], 1), "an edited text value", "the edit survived the column round trip");
+
+            // Undo the whole stack, then redo it.
+            let entries = app.history.undo_len(&BIG.to_string());
+            steps.push(step(&mut app, "undo the whole stack", entries, |a| {
+                while a.apply_undo(BIG).is_some() {}
+            }));
+            assert_eq!(app.history.undo_len(&BIG.to_string()), 0);
+            assert_eq!(cell(&app, 1, 1), format!("user{:010}", 1), "everything undone: the original text is back");
+            assert_eq!(cell(&app, 0, 1), format!("user{:010}", 0));
+        });
+        let grown: i64 = steps.iter().filter(|s| matches!(s.what, "single-cell edits" | "replace-all over a filtered view (one Batch)")).map(|s| s.retained).sum();
+        let report_residual = whole.retained;
+        steps.push(step(&mut app, "redo the whole stack", edits + 2, |a| {
+            while a.apply_redo(BIG).is_some() {}
+        }));
+        assert_eq!(cell(&app, 0, 1), "an edited text value");
+        while app.apply_undo(BIG).is_some() {}
+
+        // Structural edits last: the first one builds the order list, which
+        // costs memory and time proportional to the file until the piece
+        // table lands.
+        steps.push(step(&mut app, "delete rows", row_ops, |a| {
+            for k in 0..row_ops {
+                assert!(a.apply_delete_row(BIG, 1, (n / 2 + k) as u64));
+            }
+        }));
+        steps.push(step(&mut app, "insert rows", row_ops, |a| {
+            for k in 0..row_ops {
+                assert!(a.apply_insert_row(BIG, 1, Some((k as u64, InsertPosition::After))).is_some());
+            }
+        }));
+        let entries = app.history.undo_len(&BIG.to_string());
+        steps.push(step(&mut app, "undo the row edits", entries, |a| {
+            while a.apply_undo(BIG).is_some() {}
+        }));
+        assert_eq!(app.sheets_data[BIG].len(), n, "row count is back");
+        assert_eq!(cell(&app, n / 2, 0), format!("{:010}", n / 2), "the deleted rows are back in place");
+
+        for s in &steps {
+            s.print(rows);
+        }
+        eprintln!(
+            "UNDO-MEM {rows:>11} rows | edit phase grew the process by {grown} B; after undoing every edit it still holds {report_residual:+} B",
+        );
+        Report { steps, edit_phase_growth: grown, residual_after_undo_all: report_residual }
+    }
+
+    fn per_op(steps: &[Step], what: &str) -> f64 {
+        let s = steps.iter().find(|s| s.what == what).unwrap_or_else(|| panic!("no step {what:?}"));
+        s.history as f64 / s.ops.max(1) as f64
+    }
+
+    /// The budgets every file size must meet (bytes of undo stack per operation).
+    fn assert_undo_budgets(steps: &[Step]) {
+        assert!(per_op(steps, "delete a column (nothing edited)") <= 4096.0);
+        assert!(per_op(steps, "insert a column at the end (nothing edited)") <= 4096.0);
+        assert!(per_op(steps, "single-cell edits") <= 250.0, "a CellEdit entry: {}", per_op(steps, "single-cell edits"));
+        let batch = per_op(steps, "replace-all over a filtered view (one Batch)");
+        assert!(batch <= 250.0, "a cell inside a Batch: {batch}");
+        assert!(per_op(steps, "delete rows") <= 600.0, "a RowDelete entry: {}", per_op(steps, "delete rows"));
+        let with_memory = steps.iter().find(|s| s.what == "delete a column (rows are in memory)").unwrap();
+        assert!(with_memory.history <= 4096 + 100 * 15_000, "token for rows in memory: {}", with_memory.history);
+    }
+
+    #[test]
+    fn undo_stack_memory_on_a_one_million_row_file() {
+        let _g = serial();
+        let report = undo_memory_scenarios(1_000_000, 10_000, 5_000, 20);
+        assert_undo_budgets(&report.steps);
+    }
+
+    #[test]
+    #[ignore = "pending: an edited row that equals the file again is dropped from memory"]
+    fn undoing_every_edit_gives_the_memory_back() {
+        let _g = serial();
+        let report = undo_memory_scenarios(1_000_000, 10_000, 5_000, 20);
+        assert!(
+            report.residual_after_undo_all * 10 <= report.edit_phase_growth,
+            "after undoing everything the process still holds {} B of the {} B the edits added",
+            report.residual_after_undo_all,
+            report.edit_phase_growth
+        );
+    }
+
+    #[test]
+    #[ignore = "big: 5 GB virtual file; several minutes and 1-2 GB of RAM (scripts/big.sh)"]
+    fn undo_stack_memory_on_a_five_gigabyte_file() {
+        let _g = serial();
+        let small = undo_memory_scenarios(1_000_000, 10_000, 5_000, 20);
+        let big = undo_memory_scenarios(62_500_000, 10_000, 5_000, 20);
+        assert_undo_budgets(&big.steps);
+        // The claim: an undo entry's size depends on the edit, not on the file.
+        for what in ["single-cell edits", "replace-all over a filtered view (one Batch)", "delete rows", "delete a column (nothing edited)"] {
+            let (a, b) = (per_op(&small.steps, what), per_op(&big.steps, what));
+            assert!((a - b).abs() <= 0.05 * a.max(b) + 8.0, "{what}: {a:.1} B/op on 1M rows vs {b:.1} B/op on 62.5M rows");
+        }
     }
 }

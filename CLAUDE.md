@@ -64,6 +64,7 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 cargo test --workspace            # all unit, property and budget-guard tests (~30 s)
 scripts/budgets.sh                # release-mode budget table; red "pending" rows are expected
 scripts/budgets.sh --strict       # exit 1 if any budget test fails
+scripts/big.sh                    # undo-stack memory on a 5 GB virtual file (~1 min, ~1.5 GB RAM)
 ```
 
 - Linux needs GTK headers to build the app (`apt-get install libgtk-3-dev`);
