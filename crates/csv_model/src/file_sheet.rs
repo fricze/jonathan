@@ -17,8 +17,8 @@ use csv::StringRecord;
 use crate::lean::{Fields, LeanParser};
 use crate::pieces::Pieces;
 use crate::{
-    InsertedColumn, RemovedColumn, ReplacedAll, RowIndex, RowIndexBuilder, RowScanner, RowScope,
-    RowWalker, Sheet, SheetRow, SortOrder, View, sort_cells,
+    InsertedColumn, JobControl, RemovedColumn, ReplacePlan, ReplacedAll, RowIndex, RowIndexBuilder,
+    RowScanner, RowScope, RowWalker, Sheet, SheetRow, SortOrder, View, sort_cells,
 };
 
 /// Random-access bytes. Positional reads (not mmap) so that a file shrinking
@@ -498,6 +498,8 @@ struct FileColumn {
 struct FileReplace {
     before: ColumnMap,
     edited: Vec<(usize, StringRecord)>,
+    /// Cells it changed in rows read from the file (what a redo need not count again).
+    from_file: usize,
 }
 
 /// What a file-backed `insert_column` hands back for `undo_insert_column`: the
@@ -550,6 +552,38 @@ pub struct FileSheet {
     /// Bumped on every column change; part of the row cache key, because the
     /// cache is shared with snapshots that may see an older column layout.
     col_version: usize,
+    /// Bumped by every change to the sheet; a plan made from a snapshot is
+    /// only trusted if the stamp still matches.
+    stamp: u64,
+}
+
+/// What a replace-all needs to know about its arguments: the columns sorted
+/// and without repeats, and the row ids (if limited) sorted and without repeats.
+fn normalize_scope(rows: RowScope<'_>, cols: &[usize]) -> (Vec<usize>, Option<Vec<usize>>) {
+    let mut cols = cols.to_vec();
+    cols.sort_unstable();
+    cols.dedup();
+    let ids = match rows {
+        RowScope::All => None,
+        RowScope::Ids(ids) => {
+            let mut ids = ids.to_vec();
+            ids.sort_unstable();
+            ids.dedup();
+            Some(ids)
+        }
+    };
+    (cols, ids)
+}
+
+/// The result of the slow part of a replace-all, with what it was computed for.
+struct FilePlan {
+    stamp: u64,
+    cols: Vec<usize>,
+    find: String,
+    replace: String,
+    /// Row limit, summarised (count, first, last) - ids are sorted.
+    rows: Option<(usize, Option<usize>, Option<usize>)>,
+    from_file: usize,
 }
 
 impl FileSheet {
@@ -654,6 +688,7 @@ impl FileSheet {
             removed: HashSet::new(),
             columns: Arc::new(ColumnMap::default()),
             col_version: 0,
+            stamp: 0,
         })
     }
 
@@ -904,20 +939,144 @@ impl FileSheet {
         }
     }
 
+    /// How many cells in file rows (those not held in memory) `replace_all`
+    /// would change. `None` if `job` is cancelled before the end.
+    fn count_from_file(
+        &self,
+        ids: Option<&[usize]>,
+        cols: &[usize],
+        find: &str,
+        replace: &str,
+        job: Option<&JobControl>,
+    ) -> Option<usize> {
+        let finder = memchr::memmem::Finder::new(find.as_bytes());
+        let prefilter =
+            !find.as_bytes().contains(&b'"') && !self.columns.bytes_do_not_tell_the_whole_story();
+        let mut from_file = 0;
+        let done = self.visit_file_rows(ids, prefilter.then_some(&finder), job, |_, fields| {
+            for &col in cols {
+                if let Some(cell) = fields.get(col) {
+                    if replace_bytes(cell, find.as_bytes(), replace.as_bytes())
+                        .is_some_and(|new| new != **cell)
+                    {
+                        from_file += 1;
+                    }
+                }
+            }
+        });
+        done.then_some(from_file)
+    }
+
+    /// `replace_all`, where `known_from_file` is the number of cells to change
+    /// in file rows if it has already been counted (for this very state).
+    fn replace_all_with(
+        &mut self,
+        rows: RowScope<'_>,
+        cols: &[usize],
+        find: &str,
+        replace: &str,
+        known_from_file: Option<usize>,
+    ) -> (usize, ReplacedAll) {
+        self.stamp += 1;
+        let before = (*self.columns).clone();
+        let (cols, ids) = normalize_scope(rows, cols);
+        let mut changed = 0;
+        let mut rewritten: Vec<(usize, StringRecord)> = Vec::new();
+        let mut file_hits = 0;
+        if !find.is_empty() && find != replace && !cols.is_empty() {
+            let covers = |id: usize| ids.as_ref().is_none_or(|v| v.binary_search(&id).is_ok());
+
+            // Rows held in memory are rewritten now; the token keeps their old text.
+            for (id, row) in self.edited.iter_mut() {
+                if !covers(*id) {
+                    continue;
+                }
+                let mut fields: Option<Vec<String>> = None;
+                for &col in &cols {
+                    let Some(old) = row.get(col) else { continue };
+                    let new = old.replace(find, replace);
+                    if new != old {
+                        fields.get_or_insert_with(|| row.iter().map(str::to_string).collect())
+                            [col] = new;
+                        changed += 1;
+                    }
+                }
+                if let Some(fields) = fields {
+                    rewritten.push((*id, (**row).clone()));
+                    *row = Arc::new(fields.iter().map(String::as_str).collect());
+                }
+            }
+
+            // Everything else comes from the file: count what would change
+            // (unless a plan already did) and if anything would, record the rule.
+            let from_file = match known_from_file {
+                Some(n) => n,
+                None => self
+                    .count_from_file(ids.as_deref(), &cols, find, replace, None)
+                    .unwrap_or(0),
+            };
+            file_hits = from_file;
+            if from_file > 0 {
+                let rule_rows = match ids {
+                    None => RuleRows::All,
+                    Some(ids) => RuleRows::Ids(Arc::new(ids)),
+                };
+                Arc::make_mut(&mut self.columns).add_rule(rule_rows, &cols, find, replace);
+                changed += from_file;
+            }
+        }
+        self.col_version += 1;
+        let size = before.size_bytes()
+            + std::mem::size_of::<FileReplace>()
+            + rewritten.capacity() * std::mem::size_of::<(usize, StringRecord)>()
+            + rewritten
+                .iter()
+                .map(|(_, r)| 96 + r.as_slice().len() + (r.len() + 1) * 8)
+                .sum::<usize>();
+        (
+            changed,
+            ReplacedAll::new(
+                FileReplace {
+                    before,
+                    edited: rewritten,
+                    from_file: file_hits,
+                },
+                size,
+            ),
+        )
+    }
+
     /// Visit the rows that come from the file (present in the sheet and not held
     /// in memory) in display order, or just those with the given ids, with their
     /// fields as the user sees them. With a `prefilter`, rows whose bytes do not
     /// contain it are skipped unparsed; only sound when no field's text can differ
     /// from the file's bytes (see `bytes_do_not_tell_the_whole_story`).
+    ///
+    /// With a `job`, reports the rows gone through and stops early if it is
+    /// cancelled; returns whether the visit ran to the end.
     fn visit_file_rows(
         &self,
         ids: Option<&[usize]>,
         prefilter: Option<&memchr::memmem::Finder<'_>>,
+        job: Option<&JobControl>,
         mut f: impl FnMut(usize, &[Cow<'_, [u8]>]),
-    ) {
+    ) -> bool {
+        const REPORT_EVERY: u64 = 256;
         let file_rows = self.index.len();
         let mut walker = RowWalker::new(&self.index, &*self.source, SCAN_WINDOW as usize);
         let mut parser = LeanParser::new(self.delimiter);
+        let mut gone = 0u64;
+        // Count one row; false when the job has been cancelled.
+        let mut tick = |job: Option<&JobControl>| -> bool {
+            gone += 1;
+            match job {
+                Some(j) if gone % REPORT_EVERY == 0 => {
+                    j.add_done(REPORT_EVERY);
+                    !j.is_cancelled()
+                }
+                _ => true,
+            }
+        };
         let mut handle = |walker: &mut RowWalker<'_>, id: usize| {
             if let Some(p) = prefilter {
                 if walker
@@ -932,14 +1091,34 @@ impl FileSheet {
                 f(id, &self.columns.logical(id, &stored));
             });
         };
+        if let Some(j) = job {
+            let total = match ids {
+                None => self
+                    .pieces
+                    .runs()
+                    .map(|(_, r)| (r.first + r.len).min(file_rows).saturating_sub(r.first))
+                    .sum::<usize>(),
+                Some(ids) => ids.len(),
+            };
+            j.set_total(total as u64);
+        }
+        let mut completed = true;
         match ids {
             None => {
-                for (_, run) in self.pieces.runs() {
+                'runs: for (_, run) in self.pieces.runs() {
                     let end = (run.first + run.len).min(file_rows);
-                    if run.first >= end || walker.seek_id(run.first).is_none() {
+                    if run.first >= end {
                         continue;
                     }
+                    let found = walker.seek_id(run.first).is_some();
                     for id in run.first..end {
+                        if !tick(job) {
+                            completed = false;
+                            break 'runs;
+                        }
+                        if !found {
+                            continue;
+                        }
                         if !self.edited.contains_key(&id) {
                             handle(&mut walker, id);
                         }
@@ -951,6 +1130,10 @@ impl FileSheet {
             }
             Some(ids) => {
                 for &id in ids {
+                    if !tick(job) {
+                        completed = false;
+                        break;
+                    }
                     if id < file_rows
                         && !self.edited.contains_key(&id)
                         && self.pieces.position_of(id).is_some()
@@ -961,6 +1144,12 @@ impl FileSheet {
                 }
             }
         }
+        if let Some(j) = job {
+            if completed {
+                j.add_done(gone % REPORT_EVERY);
+            }
+        }
+        completed
     }
 
     /// Remember `record` as the content of row `id`, unless it is exactly what
@@ -1043,6 +1232,7 @@ impl Sheet for FileSheet {
     }
 
     fn set_cell(&mut self, row_id: usize, col: usize, value: &str) -> bool {
+        self.stamp += 1;
         let Some(current) = self.row_by_id(row_id) else {
             return false;
         };
@@ -1059,6 +1249,7 @@ impl Sheet for FileSheet {
     }
 
     fn remove_row(&mut self, position: usize) -> Option<SheetRow> {
+        self.stamp += 1;
         // Read first: a row that can't be read can't be handed back for
         // undo, so it stays where it is.
         let id = self.id_at(position)?;
@@ -1072,11 +1263,13 @@ impl Sheet for FileSheet {
     }
 
     fn insert_row(&mut self, position: usize, (id, record): SheetRow) {
+        self.stamp += 1;
         Arc::make_mut(&mut self.pieces).insert_at(position, id);
         self.keep_row(id, record);
     }
 
     fn remove_column(&mut self, col: usize) -> RemovedColumn {
+        self.stamp += 1;
         // Rows copied into memory are updated now (remembering their value);
         // every other row reads through the column map, so nothing in the
         // file is touched, however large it is.
@@ -1109,6 +1302,7 @@ impl Sheet for FileSheet {
     }
 
     fn restore_column(&mut self, col: usize, removed: &RemovedColumn) {
+        self.stamp += 1;
         let Some(token) = removed.payload::<FileColumn>() else {
             return;
         };
@@ -1134,6 +1328,7 @@ impl Sheet for FileSheet {
     }
 
     fn insert_column(&mut self, col: usize, values_by_row: &[(usize, String)]) -> InsertedColumn {
+        self.stamp += 1;
         let values: HashMap<usize, String> = values_by_row.iter().cloned().collect();
         let before = (*self.columns).clone();
         let mut edited = Vec::with_capacity(self.edited.len());
@@ -1154,6 +1349,7 @@ impl Sheet for FileSheet {
     }
 
     fn undo_insert_column(&mut self, col: usize, inserted: &InsertedColumn) {
+        self.stamp += 1;
         let Some(token) = inserted.payload::<FileInsert>() else {
             return;
         };
@@ -1310,92 +1506,72 @@ impl Sheet for FileSheet {
         find: &str,
         replace: &str,
     ) -> (usize, ReplacedAll) {
-        let before = (*self.columns).clone();
-        let mut cols = cols.to_vec();
-        cols.sort_unstable();
-        cols.dedup();
-        let mut changed = 0;
-        let mut rewritten: Vec<(usize, StringRecord)> = Vec::new();
-        if !find.is_empty() && find != replace && !cols.is_empty() {
-            let ids: Option<Vec<usize>> = match rows {
-                RowScope::All => None,
-                RowScope::Ids(ids) => {
-                    let mut ids = ids.to_vec();
-                    ids.sort_unstable();
-                    ids.dedup();
-                    Some(ids)
-                }
-            };
-            let covers = |id: usize| ids.as_ref().is_none_or(|v| v.binary_search(&id).is_ok());
+        self.replace_all_with(rows, cols, find, replace, None)
+    }
 
-            // Rows held in memory are rewritten now; the token keeps their old text.
-            for (id, row) in self.edited.iter_mut() {
-                if !covers(*id) {
-                    continue;
-                }
-                let mut fields: Option<Vec<String>> = None;
-                for &col in &cols {
-                    let Some(old) = row.get(col) else { continue };
-                    let new = old.replace(find, replace);
-                    if new != old {
-                        fields.get_or_insert_with(|| row.iter().map(str::to_string).collect())
-                            [col] = new;
-                        changed += 1;
-                    }
-                }
-                if let Some(fields) = fields {
-                    rewritten.push((*id, (**row).clone()));
-                    *row = Arc::new(fields.iter().map(String::as_str).collect());
-                }
-            }
+    fn replace_all_again(
+        &mut self,
+        rows: RowScope<'_>,
+        cols: &[usize],
+        find: &str,
+        replace: &str,
+        replaced: &ReplacedAll,
+    ) -> (usize, ReplacedAll) {
+        // Under the undo-stack discipline the sheet is as it was before the
+        // replace-all, so it changes the same file cells again.
+        let known = replaced.payload::<FileReplace>().map(|t| t.from_file);
+        self.replace_all_with(rows, cols, find, replace, known)
+    }
 
-            // Everything else comes from the file: count what would change in
-            // one streaming pass, and if anything would, record the rule.
-            let finder = memchr::memmem::Finder::new(find.as_bytes());
-            let prefilter = !find.as_bytes().contains(&b'"')
-                && !self.columns.bytes_do_not_tell_the_whole_story();
-            let mut from_file = 0;
-            self.visit_file_rows(ids.as_deref(), prefilter.then_some(&finder), |_, fields| {
-                for &col in &cols {
-                    if let Some(cell) = fields.get(col) {
-                        if replace_bytes(cell, find.as_bytes(), replace.as_bytes())
-                            .is_some_and(|new| new != **cell)
-                        {
-                            from_file += 1;
-                        }
-                    }
-                }
-            });
-            if from_file > 0 {
-                let rule_rows = match ids {
-                    None => RuleRows::All,
-                    Some(ids) => RuleRows::Ids(Arc::new(ids)),
-                };
-                Arc::make_mut(&mut self.columns).add_rule(rule_rows, &cols, find, replace);
-                changed += from_file;
-            }
-        }
-        self.col_version += 1;
-        let size = before.size_bytes()
-            + std::mem::size_of::<FileReplace>()
-            + rewritten.capacity() * std::mem::size_of::<(usize, StringRecord)>()
-            + rewritten
-                .iter()
-                .map(|(_, r)| 96 + r.as_slice().len() + (r.len() + 1) * 8)
-                .sum::<usize>();
-        (
-            changed,
-            ReplacedAll::new(
-                FileReplace {
-                    before,
-                    edited: rewritten,
-                },
-                size,
-            ),
-        )
+    fn plan_replace_all(
+        &self,
+        rows: RowScope<'_>,
+        cols: &[usize],
+        find: &str,
+        replace: &str,
+        job: &JobControl,
+    ) -> Option<ReplacePlan> {
+        let (cols, ids) = normalize_scope(rows, cols);
+        let from_file = if find.is_empty() || find == replace || cols.is_empty() {
+            0
+        } else {
+            self.count_from_file(ids.as_deref(), &cols, find, replace, Some(job))?
+        };
+        Some(ReplacePlan::new(
+            FilePlan {
+                stamp: self.stamp,
+                cols,
+                find: find.to_string(),
+                replace: replace.to_string(),
+                rows: ids.map(|v| (v.len(), v.first().copied(), v.last().copied())),
+                from_file,
+            },
+            std::mem::size_of::<FilePlan>(),
+        ))
+    }
+
+    fn replace_all_planned(
+        &mut self,
+        rows: RowScope<'_>,
+        cols: &[usize],
+        find: &str,
+        replace: &str,
+        plan: &ReplacePlan,
+    ) -> (usize, ReplacedAll) {
+        let trusted = plan.payload::<FilePlan>().and_then(|p| {
+            let (c, ids) = normalize_scope(rows, cols);
+            let same = p.stamp == self.stamp
+                && p.cols == c
+                && p.find == find
+                && p.replace == replace
+                && p.rows == ids.map(|v| (v.len(), v.first().copied(), v.last().copied()));
+            same.then_some(p.from_file)
+        });
+        self.replace_all_with(rows, cols, find, replace, trusted)
     }
 
     fn undo_replace_all(&mut self, replaced: &ReplacedAll) {
+        self.stamp += 1;
         let Some(token) = replaced.payload::<FileReplace>() else {
             return;
         };

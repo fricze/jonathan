@@ -24,7 +24,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use common::*;
-use csv_model::{ByteSource, FileSheet, RowIndex, Sheet, SortOrder};
+use csv_model::{ByteSource, FileSheet, JobControl, RowIndex, RowScope, Sheet, SortOrder};
 
 #[global_allocator]
 static ALLOC: CountingAlloc = CountingAlloc;
@@ -523,6 +523,123 @@ fn io_a_no_match_filter_reads_each_byte_once_in_large_blocks() {
         len / (256.0 * 1024.0) + 4.0,
         "calls",
     );
+}
+
+// ------------------------------------------- long jobs: plan, progress, cancel
+//
+// Counting what a replace-all would change is a pass over the whole file. It
+// must be possible off the UI thread (on a snapshot), report progress, stop on
+// request, and leave the quick part (recording the rule) to the owner of the
+// sheet without reading the file again (design 4.8).
+
+#[test]
+fn job_a_planned_replace_all_does_not_read_the_file_again_and_equals_the_direct_one() {
+    let _g = serial();
+    let (mut planned, src) = open(csv_bytes(20_000));
+    let (mut direct, _) = open(csv_bytes(20_000));
+    let job = JobControl::new();
+    let plan = planned
+        .snapshot()
+        .plan_replace_all(RowScope::All, &[1], "user1", "U1", &job)
+        .expect("not cancelled");
+    src.reset();
+    let (n, _) = planned.replace_all_planned(RowScope::All, &[1], "user1", "U1", &plan);
+    check_le(
+        "applying a plan: bytes read",
+        src.stats().bytes as f64,
+        0.0,
+        "B",
+    );
+    let (m, _) = direct.replace_all(RowScope::All, &[1], "user1", "U1");
+    assert_eq!(n, m);
+    assert!(n > 1000);
+    for pos in [0, 1, 10, 1000, 19_999] {
+        assert_eq!(planned.record(pos), direct.record(pos), "row {pos}");
+    }
+}
+
+#[test]
+fn job_progress_counts_rows_and_ends_at_the_total() {
+    let _g = serial();
+    let (sheet, _) = open(csv_bytes(10_000));
+    let job = JobControl::new();
+    assert_eq!(job.progress(), (0, 0));
+    sheet
+        .snapshot()
+        .plan_replace_all(RowScope::All, &[1], "user1", "U1", &job);
+    assert_eq!(job.progress(), (10_000, 10_000));
+}
+
+#[test]
+fn job_cancel_stops_the_scan_early_and_yields_no_plan() {
+    let _g = serial();
+    let (sheet, src) = open(csv_bytes(200_000));
+    let len = src.data_len() as f64;
+    let job = JobControl::new();
+    let snap = sheet.snapshot();
+    src.reset();
+    let watcher = {
+        let job = job.clone();
+        std::thread::spawn(move || {
+            while job.progress().0 == 0 {
+                std::thread::yield_now();
+            }
+            job.cancel();
+        })
+    };
+    let plan = snap.plan_replace_all(RowScope::All, &[1], "user1", "U1", &job);
+    watcher.join().unwrap();
+    assert!(plan.is_none(), "a cancelled job gives no plan");
+    check_le(
+        "cancelled scan: fraction of the file read",
+        src.stats().bytes as f64 / len,
+        0.5,
+        "ratio",
+    );
+}
+
+#[test]
+fn job_a_plan_made_before_an_edit_is_not_trusted() {
+    let _g = serial();
+    let (mut a, _) = open(csv_bytes(2_000));
+    let (mut b, _) = open(csv_bytes(2_000));
+    let job = JobControl::new();
+    let plan = a
+        .snapshot()
+        .plan_replace_all(RowScope::All, &[1], "user1", "U1", &job)
+        .unwrap();
+    // The sheet changes after the plan was made: row 1 no longer has "user1"
+    // and row 5 now does.
+    for s in [&mut a, &mut b] {
+        s.set_cell(1, 1, "zzz");
+        s.set_cell(5, 1, "user1 again");
+    }
+    let (n, _) = a.replace_all_planned(RowScope::All, &[1], "user1", "U1", &plan);
+    let (m, _) = b.replace_all(RowScope::All, &[1], "user1", "U1");
+    assert_eq!(n, m);
+    for pos in [0, 1, 5, 100, 1999] {
+        assert_eq!(a.record(pos), b.record(pos), "row {pos}");
+    }
+}
+
+#[test]
+fn job_redoing_a_replace_all_does_not_read_the_file() {
+    let _g = serial();
+    let (mut sheet, src) = open(csv_bytes(20_000));
+    let (n, token) = sheet.replace_all(RowScope::All, &[1], "user1", "U1");
+    assert!(n > 1000);
+    sheet.undo_replace_all(&token);
+    src.reset();
+    let (again, _) = sheet.replace_all_again(RowScope::All, &[1], "user1", "U1", &token);
+    check_le(
+        "redo of a replace-all: bytes read",
+        src.stats().bytes as f64,
+        0.0,
+        "B",
+    );
+    assert_eq!(again, n);
+    assert_eq!(sheet.record(10).unwrap().get(1), Some("U10"));
+    assert_eq!(sheet.record(2).unwrap().get(1), Some("user2"));
 }
 
 // ------------------------------------------------ performance (release)

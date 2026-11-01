@@ -12,6 +12,7 @@
 use std::any::Any;
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering::Relaxed};
 
 use csv::StringRecord;
 
@@ -63,6 +64,53 @@ undo_token! {
     /// What `replace_all` hands back so it can be undone exactly with
     /// `undo_replace_all`.
     ReplacedAll
+}
+
+undo_token! {
+    /// What `plan_replace_all` hands back: the result of the slow part of a
+    /// replace-all (finding out what it changes), to be given to
+    /// `replace_all_planned` on the sheet it was planned from. Opaque; a sheet
+    /// that has changed since ignores it and does the work again, so a stale
+    /// plan costs time, never correctness.
+    ReplacePlan
+}
+
+/// Shared handle to a long-running read-only job: the owner watches
+/// `progress` and can `cancel`; the job reports and checks. Cheap to clone;
+/// all clones are the same job.
+#[derive(Clone, Default)]
+pub struct JobControl {
+    cancelled: Arc<AtomicBool>,
+    done: Arc<AtomicU64>,
+    total: Arc<AtomicU64>,
+}
+
+impl JobControl {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Ask the job to stop at its next check.
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Relaxed);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Relaxed)
+    }
+
+    /// (units done, units in all); (0, 0) before the job knows its size.
+    pub fn progress(&self) -> (u64, u64) {
+        (self.done.load(Relaxed), self.total.load(Relaxed))
+    }
+
+    pub(crate) fn set_total(&self, total: u64) {
+        self.total.store(total, Relaxed);
+    }
+
+    pub(crate) fn add_done(&self, n: u64) {
+        self.done.fetch_add(n, Relaxed);
+    }
 }
 
 /// Which rows a bulk operation covers.
@@ -159,6 +207,52 @@ pub trait Sheet: Send + Sync {
     ) -> (usize, ReplacedAll);
 
     fn undo_replace_all(&mut self, replaced: &ReplacedAll);
+
+    /// Redo a replace-all that `undo_replace_all(replaced)` took back: the same
+    /// as `replace_all` with the same arguments, but a sheet may use what it
+    /// remembers in `replaced` instead of reading its storage again. Only valid
+    /// when the sheet is exactly as it was before that replace-all.
+    fn replace_all_again(
+        &mut self,
+        rows: RowScope<'_>,
+        cols: &[usize],
+        find: &str,
+        replace: &str,
+        replaced: &ReplacedAll,
+    ) -> (usize, ReplacedAll) {
+        let _ = replaced;
+        self.replace_all(rows, cols, find, replace)
+    }
+
+    /// The slow, read-only part of `replace_all`: find out what it would change
+    /// in the rows that come from storage. Meant to run on a `snapshot()` in a
+    /// background thread; reports rows done in `job` and stops early, giving
+    /// `None`, if it is cancelled. A sheet that has nothing slow to do returns
+    /// an empty plan at once.
+    fn plan_replace_all(
+        &self,
+        _rows: RowScope<'_>,
+        _cols: &[usize],
+        _find: &str,
+        _replace: &str,
+        _job: &JobControl,
+    ) -> Option<ReplacePlan> {
+        Some(ReplacePlan::new((), 0))
+    }
+
+    /// `replace_all`, using a plan made earlier from this sheet for the same
+    /// arguments instead of reading the file again. If the sheet has changed
+    /// since the plan was made, or the arguments differ, it is ignored.
+    fn replace_all_planned(
+        &mut self,
+        rows: RowScope<'_>,
+        cols: &[usize],
+        find: &str,
+        replace: &str,
+        _plan: &ReplacePlan,
+    ) -> (usize, ReplacedAll) {
+        self.replace_all(rows, cols, find, replace)
+    }
 
     /// Memory held because of changes since the file was opened: rows copied
     /// in for editing, the row order, the column map. Read caches are not
