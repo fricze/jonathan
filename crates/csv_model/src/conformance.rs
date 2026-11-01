@@ -13,7 +13,7 @@
 use csv::StringRecord;
 use proptest::prelude::*;
 
-use crate::{Sheet, SheetRow, SheetVec, SortOrder};
+use crate::{RemovedColumn, Sheet, SheetRow, SheetVec, SortOrder};
 
 pub type Make = dyn Fn(SheetVec) -> Box<dyn Sheet>;
 
@@ -166,49 +166,66 @@ fn short_rows_are_padded_so_inserted_columns_line_up(make: &Make) {
 
 fn removing_a_column_past_a_short_rows_end_leaves_it_alone(make: &Make) {
     let mut s = make(rows_of(&[&["a", "b", "c"], &["d"], &["e", "f"]]));
-    let removed = s.remove_column(1);
+    let first = s.remove_column(1);
+    assert_eq!(fields(s.as_ref(), 0), Some(vec!["a".into(), "c".into()]));
     assert_eq!(
-        removed,
-        vec![(0, "b".to_string()), (2, "f".to_string())],
-        "no value from the 1-field row"
+        fields(s.as_ref(), 1),
+        Some(vec!["d".into()]),
+        "the 1-field row has no column 1"
+    );
+    assert_eq!(fields(s.as_ref(), 2), Some(vec!["e".into()]));
+    let past_the_end = s.remove_column(5);
+    assert_eq!(
+        fields(s.as_ref(), 0),
+        Some(vec!["a".into(), "c".into()]),
+        "nothing reached column 5"
+    );
+    // Undone in reverse order, the sheet is exactly as it was: the short row
+    // is not given a field it never had.
+    s.restore_column(5, &past_the_end);
+    s.restore_column(1, &first);
+    assert_eq!(
+        fields(s.as_ref(), 0),
+        Some(vec!["a".into(), "b".into(), "c".into()])
     );
     assert_eq!(fields(s.as_ref(), 1), Some(vec!["d".into()]));
-    assert_eq!(fields(s.as_ref(), 2), Some(vec!["e".into()]));
-    let removed = s.remove_column(5);
-    assert!(removed.is_empty());
+    assert_eq!(fields(s.as_ref(), 2), Some(vec!["e".into(), "f".into()]));
 }
 
 fn column_ops_interleaved_with_row_and_cell_edits(make: &Make) {
     let mut s = make(rows_of(&[&["a", "b"], &["c", "d"], &["e", "f"]]));
-    s.set_cell(0, 1, "B"); // edit before the column op
+    s.set_cell(0, 1, "B"); // an edit before the column op
     let gone = s.remove_row(1).unwrap();
-    let removed = s.remove_column(0);
-    assert_eq!(removed, vec![(0, "a".to_string()), (2, "e".to_string())]);
+    let tok = s.remove_column(0);
     assert_eq!(
         fields(s.as_ref(), 0),
         Some(vec!["B".into()]),
         "earlier edit followed the column op"
     );
-    s.insert_row(1, (7, StringRecord::from(vec!["new"]))); // logical row, as the app would hand it back
-    s.insert_column(0, &removed);
+    assert_eq!(fields(s.as_ref(), 1), Some(vec!["f".into()]));
+
+    // More work, then undone in reverse order, like the app's undo stack.
+    s.insert_row(1, (7, StringRecord::from(vec!["new"])));
+    assert!(s.set_cell(2, 0, "F"));
+    assert!(s.set_cell(2, 0, "f")); // the edit's own undo
+    s.remove_row(1); // undo of the insert
+    s.restore_column(0, &tok);
     assert_eq!(fields(s.as_ref(), 0), Some(vec!["a".into(), "B".into()]));
-    assert_eq!(fields(s.as_ref(), 1), Some(vec!["".into(), "new".into()]));
-    assert_eq!(fields(s.as_ref(), 2), Some(vec!["e".into(), "f".into()]));
-    s.insert_row(1, gone); // the row removed before the column ops goes back as it was handed out
+    assert_eq!(fields(s.as_ref(), 1), Some(vec!["e".into(), "f".into()]));
+    s.insert_row(1, gone);
     assert_eq!(fields(s.as_ref(), 1), Some(vec!["c".into(), "d".into()]));
-    assert!(s.set_cell(2, 0, "NEW"));
-    assert_eq!(s.cell(3, 0).as_deref(), Some("NEW"));
+    assert_eq!(s.len(), 3);
 }
 
 fn removing_every_column_leaves_empty_rows(make: &Make) {
     let mut s = make(rows_of(&[&["a"], &["b"]]));
-    let removed = s.remove_column(0);
-    assert_eq!(removed.len(), 2);
+    let tok = s.remove_column(0);
     assert_eq!(s.len(), 2);
     assert_eq!(fields(s.as_ref(), 0), Some(vec![]));
     assert_eq!(s.cell(0, 0), None);
     assert_eq!(s.filter(""), vec![0, 1]);
-    s.insert_column(0, &removed);
+    s.restore_column(0, &tok);
+    assert_eq!(fields(s.as_ref(), 0), Some(vec!["a".into()]));
     assert_eq!(fields(s.as_ref(), 1), Some(vec!["b".into()]));
 }
 
@@ -370,18 +387,26 @@ fn insert_row_clamps_to_end(make: &Make) {
 
 fn column_remove_insert_round_trip(make: &Make) {
     let mut s = make(rows_of(&[&["a", "b", "c"], &["d", "e", "f"], &["g"]]));
-    let removed = s.remove_column(1);
-    assert_eq!(removed, vec![(0, "b".to_string()), (1, "e".to_string())]);
+    let tok = s.remove_column(1);
     assert_eq!(fields(s.as_ref(), 0), Some(vec!["a".into(), "c".into()]));
     assert_eq!(
         fields(s.as_ref(), 2),
         Some(vec!["g".into()]),
         "short row untouched"
     );
-    s.insert_column(1, &removed);
+    s.restore_column(1, &tok);
+    assert_eq!(
+        fields(s.as_ref(), 0),
+        Some(vec!["a".into(), "b".into(), "c".into()])
+    );
     assert_eq!(
         fields(s.as_ref(), 1),
         Some(vec!["d".into(), "e".into(), "f".into()])
+    );
+    assert_eq!(
+        fields(s.as_ref(), 2),
+        Some(vec!["g".into()]),
+        "exact inverse: still one field"
     );
     s.insert_column(0, &[]);
     assert_eq!(
@@ -493,6 +518,18 @@ impl RefModel {
         out
     }
 
+    /// Exact inverse of `remove_column`: only rows that had a value get one back.
+    fn restore_column(&mut self, col: usize, values: &[(usize, String)]) {
+        for (id, f) in self.rows.iter_mut() {
+            if let Some((_, v)) = values.iter().find(|(i, _)| i == id) {
+                while f.len() < col {
+                    f.push(String::new());
+                }
+                f.insert(col, v.clone());
+            }
+        }
+    }
+
     fn insert_column(&mut self, col: usize, values: &[(usize, String)]) {
         for (id, f) in self.rows.iter_mut() {
             let v = values
@@ -533,8 +570,11 @@ pub enum Op {
     },
     InsertColumn {
         col: usize,
-        restore: bool,
+        with_values: bool,
     },
+    /// Undo the most recent `RemoveColumn`; only applied when nothing but
+    /// snapshots happened since (the undo-stack precondition).
+    RestoreColumn,
     Snapshot,
 }
 
@@ -551,7 +591,8 @@ pub fn ops() -> impl Strategy<Value = Vec<Op>> {
             .prop_map(|(position, fields)| Op::InsertRow { position, fields }),
         2 => (0usize..8).prop_map(|position| Op::ReinsertRemovedRow { position }),
         2 => (0usize..5).prop_map(|col| Op::RemoveColumn { col }),
-        2 => (0usize..6, any::<bool>()).prop_map(|(col, restore)| Op::InsertColumn { col, restore }),
+        2 => (0usize..6, any::<bool>()).prop_map(|(col, with_values)| Op::InsertColumn { col, with_values }),
+        2 => Just(Op::RestoreColumn),
         1 => Just(Op::Snapshot),
     ];
     prop::collection::vec(op, 0..40)
@@ -638,7 +679,10 @@ pub fn check_ops(make: &Make, initial: &[Vec<String>], ops: &[Op]) {
     let mut sheet = make(to_sheet_vec(initial));
     let mut model = RefModel::from_rows(&to_sheet_vec(initial));
     let mut removed_rows: Vec<(usize, Vec<String>)> = vec![];
-    let mut removed_col: Vec<(usize, String)> = vec![];
+    // The most recent column removal, as the model saw it (for arbitrary
+    // `insert_column` values), and whether it can still be undone exactly.
+    let mut last_values: Vec<(usize, String)> = vec![];
+    let mut undoable: Option<(usize, RemovedColumn, Vec<(usize, String)>)> = None;
     let mut snapshots: Vec<(Box<dyn Sheet>, RefModel)> = vec![];
     assert_same(sheet.as_ref(), &model, "load");
 
@@ -687,17 +731,29 @@ pub fn check_ops(make: &Make, initial: &[Vec<String>], ops: &[Op]) {
                 model.insert_row(*position, (id, f));
             }
             Op::RemoveColumn { col } => {
-                let got = sheet.remove_column(*col);
-                let want = model.remove_column(*col);
-                assert_eq!(got, want, "{ctx}");
-                removed_col = want;
+                let token = sheet.remove_column(*col);
+                let values = model.remove_column(*col);
+                last_values = values.clone();
+                undoable = Some((*col, token, values));
             }
-            Op::InsertColumn { col, restore } => {
-                let values: &[(usize, String)] = if *restore { &removed_col } else { &[] };
+            Op::InsertColumn { col, with_values } => {
+                let values: &[(usize, String)] = if *with_values { &last_values } else { &[] };
                 sheet.insert_column(*col, values);
                 model.insert_column(*col, values);
             }
+            Op::RestoreColumn => {
+                if let Some((col, token, values)) = undoable.take() {
+                    sheet.restore_column(col, &token);
+                    model.restore_column(col, &values);
+                }
+            }
             Op::Snapshot => snapshots.push((sheet.snapshot(), model.clone())),
+        }
+        if !matches!(
+            op,
+            Op::Snapshot | Op::RemoveColumn { .. } | Op::RestoreColumn
+        ) {
+            undoable = None; // something else changed the sheet: no longer an exact undo
         }
         assert_same(sheet.as_ref(), &model, &ctx);
     }

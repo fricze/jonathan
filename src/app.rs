@@ -4,7 +4,7 @@ use egui_dock::{DockArea, Style};
 use std::path::PathBuf;
 use std::thread;
 
-use csv_model::{LoadStats, MemorySheet, open_csv_file, read_rows, write_csv};
+use csv_model::{LoadStats, MemorySheet, RemovedColumn, open_csv_file, read_rows, write_csv};
 use crate::menu::{COPY_AS_CSV_ID, OPEN_FILE_ID};
 use crate::types::{
     ColumnId, CsvTabViewer, FileHeader, InsertPosition, MyApp, ReplaceScope, SendUiMessage, SheetTab,
@@ -258,10 +258,10 @@ impl MyApp {
                 };
                 Some((reverse, result))
             }
-            UndoEntry::ColumnDelete { filename, position, header, values_by_row } => {
+            UndoEntry::ColumnDelete { filename, position, header, removed } => {
                 let column_id = header.id;
                 let name = header.name.clone();
-                self.insert_column_at(&filename, position, header, &values_by_row);
+                self.restore_column_at(&filename, position, header, &removed);
                 let reverse = UndoEntry::ColumnInsert { filename, column_id };
                 let result = UndoRedoResult {
                     row: None,
@@ -277,8 +277,8 @@ impl MyApp {
                 let header = headers[position].clone();
                 let name = header.name.clone();
 
-                let values_by_row = self.remove_column_at(&filename, position, column_id);
-                let reverse = UndoEntry::ColumnDelete { filename, position, header, values_by_row };
+                let removed = self.remove_column_at(&filename, position, column_id)?;
+                let reverse = UndoEntry::ColumnDelete { filename, position, header, removed };
                 let result = UndoRedoResult {
                     row: None,
                     column: Some(name),
@@ -517,41 +517,39 @@ impl MyApp {
         Some(master_row)
     }
 
-    /// Remove the field at `position` from every row's StringRecord in
-    /// master and every filtered/sorted view of `filename` (O(rows)), and
-    /// remove `header_id`'s FileHeader from every open tab's columns Vec for
-    /// that file. Returns each row's value at that position before removal
-    /// (keyed by master_row), for undo to restore.
-    fn remove_column_at(&mut self, filename: &str, position: usize, header_id: ColumnId) -> Vec<(usize, String)> {
-        let values_by_row = self
-            .sheets_data
-            .get_mut(filename)
-            .map(|sheet| sheet.remove_column(position))
-            .unwrap_or_default();
+    /// Remove the field at `position` from every row of `filename` and
+    /// `header_id`'s FileHeader from every open tab's columns Vec for that
+    /// file. Returns what the sheet needs to put the column back (see
+    /// `restore_column_at`), or `None` if the file isn't loaded.
+    fn remove_column_at(&mut self, filename: &str, position: usize, header_id: ColumnId) -> Option<RemovedColumn> {
+        let removed = self.sheets_data.get_mut(filename)?.remove_column(position);
         for tab in self.tree.iter_all_tabs_mut() {
             if let Some(headers) = tab.1.columns.get_mut(filename) {
                 headers.retain(|h| h.id != header_id);
             }
         }
-
-        values_by_row
+        Some(removed)
     }
 
-    /// Insert `header` at `position` into every open tab's columns Vec for
-    /// `filename`, and insert a field into every row's StringRecord in
-    /// master and every filtered/sorted view at that position -- taken from
-    /// `values_by_row` where a value exists (keyed by master_row), empty
-    /// otherwise. Inverse of `remove_column_at`.
-    fn insert_column_at(
-        &mut self,
-        filename: &str,
-        position: usize,
-        header: FileHeader,
-        values_by_row: &[(usize, String)],
-    ) {
+    /// Put `header` back at `position` in every open tab's columns Vec for
+    /// `filename` and hand `removed` back to the sheet. Exact inverse of
+    /// `remove_column_at`.
+    fn restore_column_at(&mut self, filename: &str, position: usize, header: FileHeader, removed: &RemovedColumn) {
         if let Some(sheet) = self.sheets_data.get_mut(filename) {
-            sheet.insert_column(position, values_by_row);
+            sheet.restore_column(position, removed);
         }
+        self.insert_header_at(filename, position, header);
+    }
+
+    /// Insert a new, empty column named by `header` at `position`.
+    fn insert_column_at(&mut self, filename: &str, position: usize, header: FileHeader) {
+        if let Some(sheet) = self.sheets_data.get_mut(filename) {
+            sheet.insert_column(position, &[]);
+        }
+        self.insert_header_at(filename, position, header);
+    }
+
+    fn insert_header_at(&mut self, filename: &str, position: usize, header: FileHeader) {
         for tab in self.tree.iter_all_tabs_mut() {
             if let Some(headers) = tab.1.columns.get_mut(filename) {
                 let insert_at = position.min(headers.len());
@@ -578,11 +576,13 @@ impl MyApp {
         };
         let header = headers[position].clone();
 
-        let values_by_row = self.remove_column_at(filename, position, column_id);
+        let Some(removed) = self.remove_column_at(filename, position, column_id) else {
+            return false;
+        };
 
         self.push_undo(
             filename,
-            UndoEntry::ColumnDelete { filename: filename.to_string(), position, header, values_by_row },
+            UndoEntry::ColumnDelete { filename: filename.to_string(), position, header, removed },
         );
         true
     }
@@ -608,7 +608,7 @@ impl MyApp {
         self.next_col_id.insert(filename.to_string(), column_id + 1);
 
         let header = FileHeader { id: column_id, name: name.to_string(), visible: true, sort: None };
-        self.insert_column_at(filename, position, header, &[]);
+        self.insert_column_at(filename, position, header);
 
         self.push_undo(filename, UndoEntry::ColumnInsert { filename: filename.to_string(), column_id });
         Some(column_id)

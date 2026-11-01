@@ -14,7 +14,9 @@ use std::sync::{Arc, Mutex};
 use csv::StringRecord;
 
 use crate::lean::LeanParser;
-use crate::{RowIndex, RowIndexBuilder, Sheet, SheetRow, SortOrder, View, sort_cells};
+use crate::{
+    RemovedColumn, RowIndex, RowIndexBuilder, Sheet, SheetRow, SortOrder, View, sort_cells,
+};
 
 /// Random-access bytes. Positional reads (not mmap) so that a file shrinking
 /// under us is an `Err`, never a crash.
@@ -167,6 +169,11 @@ thread_local! {
 #[derive(Clone)]
 enum ColOp {
     Remove(usize),
+    /// Undo of a `Remove`: put the value back, but only into rows that had one.
+    Restore {
+        col: usize,
+        values: Arc<HashMap<usize, String>>,
+    },
     Insert {
         col: usize,
         values: Arc<HashMap<usize, String>>,
@@ -182,6 +189,15 @@ impl ColOp {
                 .filter(|(i, _)| i != col)
                 .map(|(_, f)| f)
                 .collect(),
+            ColOp::Restore { col, values } => match values.get(&id) {
+                None => row.clone(),
+                Some(value) => {
+                    let mut fields: Vec<&str> = row.iter().collect();
+                    fields.resize(fields.len().max(*col), "");
+                    fields.insert(*col, value);
+                    fields.into_iter().collect()
+                }
+            },
             ColOp::Insert { col, values } => {
                 let mut fields: Vec<&str> = row.iter().collect();
                 // Pad a short row so the new column lines up with the rest.
@@ -524,10 +540,10 @@ impl Sheet for FileSheet {
         self.edited.insert(id, Arc::new(record));
     }
 
-    fn remove_column(&mut self, col: usize) -> Vec<(usize, String)> {
+    fn remove_column(&mut self, col: usize) -> RemovedColumn {
         // Collect first, from the rows as they are now. Rows that cannot be
         // read from the file are skipped (they have no value to hand back).
-        let removed = (0..self.len())
+        let removed: Vec<(usize, String)> = (0..self.len())
             .filter_map(|position| {
                 let id = self.id_at(position)?;
                 let row = self.load_by_id(id)?;
@@ -535,7 +551,15 @@ impl Sheet for FileSheet {
             })
             .collect();
         self.push_col_op(ColOp::Remove(col));
-        removed
+        RemovedColumn::new(removed)
+    }
+
+    fn restore_column(&mut self, col: usize, removed: &RemovedColumn) {
+        let Some(values) = removed.payload::<Vec<(usize, String)>>() else {
+            return;
+        };
+        let values = Arc::new(values.iter().cloned().collect());
+        self.push_col_op(ColOp::Restore { col, values });
     }
 
     fn insert_column(&mut self, col: usize, values_by_row: &[(usize, String)]) {
@@ -1141,22 +1165,24 @@ mod tests {
     }
 
     #[test]
-    fn removing_a_column_returns_values_in_display_order_for_every_kind_of_row() {
+    fn restoring_a_column_brings_back_file_edited_and_inserted_rows_exactly() {
         let mut s = open(b"a,1\nb,2\nc,3\n", false);
         s.set_cell(2, 1, "EDITED");
         s.insert_row(1, (9, StringRecord::from(vec!["ins", "ert"])));
-        let removed = s.remove_column(1);
-        assert_eq!(
-            removed,
-            vec![
-                (0, "1".to_string()),
-                (9, "ert".to_string()),
-                (1, "2".to_string()),
-                (2, "EDITED".to_string())
-            ]
-        );
+        let token = s.remove_column(1);
         assert_eq!(first_cells(&s), ["a", "ins", "b", "c"]);
         assert_eq!(s.cell(0, 1), None);
+        s.restore_column(1, &token);
+        let all: Vec<_> = (0..s.len()).map(|p| strs(&s, p).unwrap()).collect();
+        assert_eq!(
+            all,
+            vec![
+                vec!["a", "1"],
+                vec!["ins", "ert"],
+                vec!["b", "2"],
+                vec!["c", "EDITED"]
+            ]
+        );
     }
 
     #[test]
@@ -1239,7 +1265,9 @@ mod tests {
     }
 
     fn big_sheet(rows: &[Vec<String>]) -> FileSheet {
-        let mut w = csv::WriterBuilder::new().has_headers(false).from_writer(vec![]);
+        let mut w = csv::WriterBuilder::new()
+            .has_headers(false)
+            .from_writer(vec![]);
         for r in rows {
             w.write_record(r).unwrap();
         }
@@ -1247,15 +1275,32 @@ mod tests {
     }
 
     fn naive_filter(rows: &[Vec<String>], needle: &str) -> Vec<u32> {
-        (0..rows.len()).filter(|&i| rows[i].iter().any(|c| c.contains(needle))).map(|i| i as u32).collect()
+        (0..rows.len())
+            .filter(|&i| rows[i].iter().any(|c| c.contains(needle)))
+            .map(|i| i as u32)
+            .collect()
     }
 
     #[test]
     fn filtering_across_many_scan_windows_matches_a_naive_search() {
         let rows = big_rows(50_000);
         let sheet = big_sheet(&rows);
-        for needle in ["user3", "city96", "comma 4421", "x", "\"7\"", "say \"1", "0,", "user49999", "zzz"] {
-            assert_eq!(sheet.filter(needle), naive_filter(&rows, needle), "needle {needle:?}");
+        for needle in [
+            "user3",
+            "city96",
+            "comma 4421",
+            "x",
+            "\"7\"",
+            "say \"1",
+            "0,",
+            "user49999",
+            "zzz",
+        ] {
+            assert_eq!(
+                sheet.filter(needle),
+                naive_filter(&rows, needle),
+                "needle {needle:?}"
+            );
         }
     }
 
@@ -1263,12 +1308,28 @@ mod tests {
     fn edited_rows_are_judged_by_their_edited_text_across_windows() {
         let mut rows = big_rows(50_000);
         let mut sheet = big_sheet(&rows);
-        for (id, col, text) in [(0usize, 1usize, "needle-a"), (24_999, 3, "needle-a, here"), (49_999, 2, "xx"), (1234, 1, "user99999")] {
+        for (id, col, text) in [
+            (0usize, 1usize, "needle-a"),
+            (24_999, 3, "needle-a, here"),
+            (49_999, 2, "xx"),
+            (1234, 1, "user99999"),
+        ] {
             assert!(sheet.set_cell(id, col, text));
             rows[id][col] = text.to_string();
         }
-        for needle in ["needle-a", "user99999", "user1234", "xx", "city0", "comma 24999"] {
-            assert_eq!(sheet.filter(needle), naive_filter(&rows, needle), "needle {needle:?}");
+        for needle in [
+            "needle-a",
+            "user99999",
+            "user1234",
+            "xx",
+            "city0",
+            "comma 24999",
+        ] {
+            assert_eq!(
+                sheet.filter(needle),
+                naive_filter(&rows, needle),
+                "needle {needle:?}"
+            );
         }
     }
 

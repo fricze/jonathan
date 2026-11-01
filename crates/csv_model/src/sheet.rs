@@ -9,11 +9,30 @@
 //! assigned at load and never reused. Columns are plain field indices; the
 //! app resolves its own stable column ids to indices before calling in.
 
+use std::any::Any;
 use std::borrow::Cow;
+use std::sync::Arc;
 
 use csv::StringRecord;
 
 use crate::{SheetRow, SheetVec, SortOrder, View, edit_record, filter_indices, sort_indices};
+
+/// What `remove_column` hands back so the removal can be undone with
+/// `restore_column`. Opaque: each backend keeps whatever is cheapest for it
+/// (an in-memory sheet keeps the removed values; a file-backed one keeps a
+/// reference to where the column's data comes from). Cheap to clone.
+#[derive(Clone)]
+pub struct RemovedColumn(Arc<dyn Any + Send + Sync>);
+
+impl RemovedColumn {
+    pub fn new<T: Any + Send + Sync>(payload: T) -> Self {
+        RemovedColumn(Arc::new(payload))
+    }
+
+    pub fn payload<T: Any>(&self) -> Option<&T> {
+        self.0.downcast_ref()
+    }
+}
 
 pub trait Sheet: Send + Sync {
     /// Number of rows.
@@ -54,11 +73,18 @@ pub trait Sheet: Send + Sync {
     /// Insert `row` at `position` (clamped to the end).
     fn insert_row(&mut self, position: usize, row: SheetRow);
 
-    /// Remove field `col` from every row. Returns each row's removed value
-    /// (keyed by row id) so the removal can be undone.
-    fn remove_column(&mut self, col: usize) -> Vec<(usize, String)>;
+    /// Remove field `col` from every row (a row with no field `col` is left
+    /// alone). The result undoes it via [`Sheet::restore_column`].
+    fn remove_column(&mut self, col: usize) -> RemovedColumn;
 
-    /// Insert a field at `col` into every row: the value from
+    /// Undo a `remove_column(col)`: put each removed value back at `col`, and
+    /// touch no row that had no value there. Exact inverse provided the sheet is
+    /// as it was right after the removal, i.e. everything done since has been
+    /// undone in reverse order, which is how the app's undo stack works. In any
+    /// other state the result is unspecified (but never panics).
+    fn restore_column(&mut self, col: usize, removed: &RemovedColumn);
+
+    /// Insert a new field at `col` into every row: the value from
     /// `values_by_row` (keyed by row id) where present, empty otherwise. A row
     /// with fewer than `col` fields is first padded with empty fields, so the
     /// new column is at index `col` in every row.
@@ -138,21 +164,36 @@ impl Sheet for MemorySheet {
         self.rows.insert(position.min(self.rows.len()), row);
     }
 
-    fn remove_column(&mut self, col: usize) -> Vec<(usize, String)> {
-        let removed = self
-            .rows
-            .iter()
-            .filter_map(|(id, r)| r.get(col).map(|v| (*id, v.to_string())))
-            .collect();
-        for (_, record) in self.rows.iter_mut() {
-            *record = record
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != col)
-                .map(|(_, f)| f)
-                .collect();
+    fn remove_column(&mut self, col: usize) -> RemovedColumn {
+        let mut removed: Vec<(usize, String)> = Vec::new();
+        for (id, record) in self.rows.iter_mut() {
+            if let Some(value) = record.get(col) {
+                removed.push((*id, value.to_string()));
+                *record = record
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != col)
+                    .map(|(_, f)| f)
+                    .collect();
+            }
         }
-        removed
+        RemovedColumn::new(removed)
+    }
+
+    fn restore_column(&mut self, col: usize, removed: &RemovedColumn) {
+        let Some(values) = removed.payload::<Vec<(usize, String)>>() else {
+            return;
+        };
+        let values: std::collections::HashMap<usize, &str> =
+            values.iter().map(|(id, v)| (*id, v.as_str())).collect();
+        for (id, record) in self.rows.iter_mut() {
+            if let Some(value) = values.get(id) {
+                let mut fields: Vec<&str> = record.iter().collect();
+                fields.resize(fields.len().max(col), "");
+                fields.insert(col, value);
+                *record = fields.into_iter().collect();
+            }
+        }
     }
 
     fn insert_column(&mut self, col: usize, values_by_row: &[(usize, String)]) {
@@ -224,21 +265,33 @@ mod tests {
     }
 
     #[test]
-    fn remove_and_insert_column_round_trip() {
-        let mut s = sheet(&[(0, &["a", "b", "c"]), (1, &["d", "e", "f"])]);
-        let removed = s.remove_column(1);
-        assert_eq!(removed, vec![(0, "b".to_string()), (1, "e".to_string())]);
+    fn remove_then_restore_column_is_an_exact_inverse() {
+        let mut s = sheet(&[(0, &["a", "b", "c"]), (1, &["d", "e", "f"]), (2, &["g"])]);
+        let token = s.remove_column(1);
         assert_eq!(s.record(0).unwrap().iter().collect::<Vec<_>>(), ["a", "c"]);
-        s.insert_column(1, &removed);
+        assert_eq!(s.record(2).unwrap().iter().collect::<Vec<_>>(), ["g"]);
+        s.restore_column(1, &token);
         assert_eq!(
             s.record(1).unwrap().iter().collect::<Vec<_>>(),
             ["d", "e", "f"]
+        );
+        assert_eq!(
+            s.record(2).unwrap().iter().collect::<Vec<_>>(),
+            ["g"],
+            "the short row gains nothing"
         );
         s.insert_column(0, &[]);
         assert_eq!(
             s.record(0).unwrap().iter().collect::<Vec<_>>(),
             ["", "a", "b", "c"]
         );
+    }
+
+    #[test]
+    fn restoring_with_a_token_from_another_kind_of_sheet_does_nothing() {
+        let mut s = sheet(&[(0, &["a", "b"])]);
+        s.restore_column(1, &RemovedColumn::new(42u8));
+        assert_eq!(s.record(0).unwrap().iter().collect::<Vec<_>>(), ["a", "b"]);
     }
 
     #[test]

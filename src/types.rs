@@ -1,4 +1,4 @@
-pub use csv_model::{ColumnId, FileHeader, MemorySheet, Sheet, SheetRow, SortOrder, View};
+pub use csv_model::{ColumnId, FileHeader, MemorySheet, RemovedColumn, Sheet, SheetRow, SortOrder, View};
 pub use selection::SelectionState;
 pub use undo_history::UndoHistory;
 #[cfg(test)]
@@ -182,14 +182,15 @@ pub enum UndoEntry {
     /// A row with `master_row` was inserted. Undoing removes it again.
     RowInsert { filename: Filename, master_row: usize },
     /// A column was removed at `position` (its index among headers at the
-    /// time of deletion). Undoing re-inserts `header` there and restores
-    /// `values_by_row`, keyed by master_row, into every row's record at that
-    /// position.
+    /// time of deletion). Undoing re-inserts `header` there and hands
+    /// `removed` back to the sheet, which puts the column's data back (what
+    /// that holds is the sheet's business: values for an in-memory sheet, a
+    /// reference to the file column for a file-backed one).
     ColumnDelete {
         filename: Filename,
         position: usize,
         header: FileHeader,
-        values_by_row: Vec<(usize, String)>,
+        removed: RemovedColumn,
     },
     /// A column with `column_id` was inserted. Undoing removes it again.
     ColumnInsert { filename: Filename, column_id: ColumnId },
