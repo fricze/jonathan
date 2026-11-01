@@ -631,6 +631,20 @@ impl FileSheet {
         self.row_by_id(self.id_at(position)?)
     }
 
+    /// Remember `record` as the content of row `id`, unless it is exactly what
+    /// the file gives for that row (through the column map): then the row is
+    /// just the file's again and nothing needs to stay in memory. This is what
+    /// returns the memory when an edit is undone, and what makes a row put
+    /// back unchanged a plain file row once more.
+    fn keep_row(&mut self, id: usize, record: StringRecord) {
+        if id < self.index.len() && self.read_row(id).as_ref() == Some(&record) {
+            self.edited.remove(&id);
+            self.removed.remove(&id);
+        } else {
+            self.edited.insert(id, Arc::new(record));
+        }
+    }
+
     /// The value a file column has in row `id`, as it was in the file (what a
     /// restored column puts back into rows that were copied into memory
     /// after the column was removed).
@@ -654,6 +668,11 @@ impl FileSheet {
     /// More than the single run of an untouched file.
     fn order_is_materialized(&self) -> bool {
         !self.pieces.is_identity(self.index.len())
+    }
+
+    /// Rows currently held in memory (edited, inserted or put back).
+    fn rows_in_memory(&self) -> usize {
+        self.edited.len()
     }
 
     fn order_bytes(&self) -> usize {
@@ -700,7 +719,7 @@ impl Sheet for FileSheet {
             .enumerate()
             .map(|(i, f)| if i == col { value } else { f })
             .collect();
-        self.edited.insert(row_id, Arc::new(rewritten));
+        self.keep_row(row_id, rewritten);
         true
     }
 
@@ -719,7 +738,7 @@ impl Sheet for FileSheet {
 
     fn insert_row(&mut self, position: usize, (id, record): SheetRow) {
         Arc::make_mut(&mut self.pieces).insert_at(position, id);
-        self.edited.insert(id, Arc::new(record));
+        self.keep_row(id, record);
     }
 
     fn remove_column(&mut self, col: usize) -> RemovedColumn {
@@ -970,6 +989,20 @@ impl Sheet for FileSheet {
             spans.iter().map(|&(a, b, p)| (&arena[a..b], p)).collect(),
             sort_by.1,
         )
+    }
+
+    fn edit_bytes(&self) -> usize {
+        // Per row held in memory: the map entry, the Arc, the record's boxed
+        // header and vectors, and its text and field ends.
+        const PER_ROW_FIXED: usize = 24 + 16 + 96;
+        let rows: usize = self
+            .edited
+            .values()
+            .map(|r| {
+                PER_ROW_FIXED + r.as_slice().len() + (r.len() + 1) * std::mem::size_of::<usize>()
+            })
+            .sum();
+        rows + self.pieces.size_bytes() + self.columns.size_bytes() + self.removed.len() * 16
     }
 
     fn snapshot(&self) -> Box<dyn Sheet> {
@@ -1797,6 +1830,94 @@ mod tests {
             }
         }
 
+    }
+
+    #[test]
+    fn a_row_whose_edit_is_undone_is_no_longer_held_in_memory() {
+        let mut s = open(b"a,1\nb,2\nc,3\n", false);
+        assert_eq!(s.rows_in_memory(), 0);
+        assert!(s.set_cell(1, 0, "B"));
+        assert_eq!(s.rows_in_memory(), 1);
+        assert!(s.set_cell(1, 0, "b")); // back to what the file says
+        assert_eq!(
+            s.rows_in_memory(),
+            0,
+            "it equals the file again, so the copy is dropped"
+        );
+        assert_eq!(strs(&s, 1), Some(vec!["b".into(), "2".into()]));
+        // a second edit of another cell keeps it, and reverting both drops it
+        assert!(s.set_cell(1, 0, "B"));
+        assert!(s.set_cell(1, 1, "TWO"));
+        assert!(s.set_cell(1, 0, "b"));
+        assert_eq!(s.rows_in_memory(), 1, "still differs in one cell");
+        assert!(s.set_cell(1, 1, "2"));
+        assert_eq!(s.rows_in_memory(), 0);
+    }
+
+    #[test]
+    fn a_removed_row_put_back_unchanged_is_a_file_row_again() {
+        let mut s = open(b"a,1\nb,2\nc,3\n", false);
+        let row = s.remove_row(1).unwrap();
+        s.insert_row(1, row);
+        assert_eq!(
+            s.rows_in_memory(),
+            0,
+            "nothing to remember: it is the file's row"
+        );
+        assert_eq!(ids(&s), vec![0, 1, 2]);
+        assert!(
+            !s.order_is_materialized(),
+            "and the order is a single run again"
+        );
+        // an edited row put back keeps its edit
+        s.set_cell(2, 1, "THREE");
+        let row = s.remove_row(2).unwrap();
+        s.insert_row(0, row);
+        assert_eq!(s.rows_in_memory(), 1);
+        assert_eq!(strs(&s, 0), Some(vec!["c".into(), "THREE".into()]));
+    }
+
+    #[test]
+    fn column_edits_still_restore_exactly_when_rows_were_dropped_from_memory() {
+        let mut s = open(b"a,b,c\nd,e,f\n", false);
+        s.set_cell(1, 1, "E");
+        let token = s.remove_column(1);
+        s.set_cell(0, 0, "A");
+        s.set_cell(0, 0, "a"); // dropped again: equals what the file gives under the map
+        s.restore_column(1, &token);
+        assert_eq!(strs(&s, 0), Some(vec!["a".into(), "b".into(), "c".into()]));
+        assert_eq!(strs(&s, 1), Some(vec!["d".into(), "E".into(), "f".into()]));
+    }
+
+    #[test]
+    fn edit_bytes_counts_changes_and_returns_to_a_floor_when_they_are_undone() {
+        let mut s = open(&csv_like(5_000), false);
+        let floor = s.edit_bytes();
+        assert!(
+            floor < 1024,
+            "an untouched sheet holds almost nothing: {floor}"
+        );
+        for k in 0..1_000 {
+            s.set_cell(k * 5, 1, "an edited value");
+        }
+        let held = s.edit_bytes();
+        assert!(held > 1_000 * 150, "about 150 B+ per edited row: {held}");
+        for k in 0..1_000 {
+            s.set_cell(k * 5, 1, &format!("user{}", k * 5));
+        }
+        assert_eq!(s.rows_in_memory(), 0);
+        assert!(
+            s.edit_bytes() <= floor + 64,
+            "undone edits give the memory back"
+        );
+    }
+
+    /// `n` rows `i,user<i>,x` (so a cell can be set back to its original text).
+    fn csv_like(n: usize) -> Vec<u8> {
+        (0..n)
+            .map(|i| format!("{i},user{i},x\n"))
+            .collect::<String>()
+            .into_bytes()
     }
 
     #[test]

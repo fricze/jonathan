@@ -2094,10 +2094,10 @@ mod tests {
 
     struct Report {
         steps: Vec<Step>,
-        /// Process memory the edit phase added, and what was still held after
-        /// every edit had been undone.
-        edit_phase_growth: i64,
-        residual_after_undo_all: i64,
+        /// Memory the sheet held for changes at the height of the edit phase,
+        /// and after every edit had been undone (`Sheet::edit_bytes`).
+        edit_bytes_peak: usize,
+        edit_bytes_after_undo_all: usize,
     }
 
     /// Run every scenario on a file of `rows` rows. Asserts exactness (undo
@@ -2136,9 +2136,14 @@ mod tests {
         // Edits, then undo everything, all measured as one block so the
         // memory left behind by undoing is visible.
         let mut edit_rows: Vec<usize> = Vec::new();
+        let mut edit_bytes_peak = 0;
         let ((), whole) = measure(|| {
-            // Single-cell edits spread over the file.
+            // Single-cell edits spread over the file. The read caches are filled
+            // first (they are a constant size), so what is measured is the edits.
             let stride = (n / edits).max(1);
+            for k in 0..edits.min(2_000) {
+                let _ = cell(&app, k * stride, 1);
+            }
             steps.push(step(&mut app, "single-cell edits", edits, |a| {
                 for k in 0..edits {
                     assert!(a.apply_edit_cell(BIG, 1, (k * stride) as u64, 1, "an edited text value"));
@@ -2168,6 +2173,7 @@ mod tests {
             assert_eq!(cell(&app, edit_rows[1], 1), "an edited text value", "the edit survived the column round trip");
 
             // Undo the whole stack, then redo it.
+            edit_bytes_peak = app.sheets_data[BIG].edit_bytes();
             let entries = app.history.undo_len(&BIG.to_string());
             steps.push(step(&mut app, "undo the whole stack", entries, |a| {
                 while a.apply_undo(BIG).is_some() {}
@@ -2176,8 +2182,8 @@ mod tests {
             assert_eq!(cell(&app, 1, 1), format!("user{:010}", 1), "everything undone: the original text is back");
             assert_eq!(cell(&app, 0, 1), format!("user{:010}", 0));
         });
-        let grown: i64 = steps.iter().filter(|s| matches!(s.what, "single-cell edits" | "replace-all over a filtered view (one Batch)")).map(|s| s.retained).sum();
-        let report_residual = whole.retained;
+        let _ = whole;
+        let edit_bytes_after_undo_all = app.sheets_data[BIG].edit_bytes();
         steps.push(step(&mut app, "redo the whole stack", edits + 2, |a| {
             while a.apply_redo(BIG).is_some() {}
         }));
@@ -2208,9 +2214,9 @@ mod tests {
             s.print(rows);
         }
         eprintln!(
-            "UNDO-MEM {rows:>11} rows | edit phase grew the process by {grown} B; after undoing every edit it still holds {report_residual:+} B",
+            "UNDO-MEM {rows:>11} rows | memory held for changes: {edit_bytes_peak} B at the peak of the edits, {edit_bytes_after_undo_all} B after undoing every one",
         );
-        Report { steps, edit_phase_growth: grown, residual_after_undo_all: report_residual }
+        Report { steps, edit_bytes_peak, edit_bytes_after_undo_all }
     }
 
     fn per_op(steps: &[Step], what: &str) -> f64 {
@@ -2235,18 +2241,13 @@ mod tests {
         let _g = serial();
         let report = undo_memory_scenarios(1_000_000, 10_000, 5_000, 20);
         assert_undo_budgets(&report.steps);
-    }
-
-    #[test]
-    #[ignore = "pending: an edited row that equals the file again is dropped from memory"]
-    fn undoing_every_edit_gives_the_memory_back() {
-        let _g = serial();
-        let report = undo_memory_scenarios(1_000_000, 10_000, 5_000, 20);
+        // Undoing every edit gives the sheet's memory back (rows that equal the
+        // file again are dropped), instead of leaving a copy of each.
+        assert!(report.edit_bytes_peak > 3_000_000, "the edits were held in memory: {}", report.edit_bytes_peak);
         assert!(
-            report.residual_after_undo_all * 10 <= report.edit_phase_growth,
-            "after undoing everything the process still holds {} B of the {} B the edits added",
-            report.residual_after_undo_all,
-            report.edit_phase_growth
+            report.edit_bytes_after_undo_all <= 64 * 1024,
+            "after undoing everything the sheet still holds {} B for changes",
+            report.edit_bytes_after_undo_all
         );
     }
 

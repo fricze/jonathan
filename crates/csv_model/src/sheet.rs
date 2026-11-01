@@ -128,6 +128,14 @@ pub trait Sheet: Send + Sync {
     /// `view` sorted by column `sort_by.0` (stable; numbers by value).
     fn sort(&self, view: View, sort_by: (usize, SortOrder)) -> View;
 
+    /// Memory held because of changes since the file was opened: rows copied
+    /// in for editing, the row order, the column map. Read caches are not
+    /// counted. An in-memory sheet cannot separate its edits from its data and
+    /// reports 0.
+    fn edit_bytes(&self) -> usize {
+        0
+    }
+
     /// A frozen copy that background threads can filter/sort while the UI
     /// keeps editing the original. Only the read methods are meaningful on it.
     fn snapshot(&self) -> Box<dyn Sheet>;
