@@ -11,7 +11,7 @@ mod pieces;
 mod row_index;
 mod sheet;
 pub mod testing;
-pub use file_sheet::{ByteSource, FileSheet, VecSource};
+pub use file_sheet::{ByteSource, FileSheet, FileSource, VecSource};
 pub use row_index::{DEFAULT_STRIDE, RowIndex, RowIndexBuilder, RowScanner, RowWalker};
 pub use sheet::{
     InsertedColumn, JobControl, MemorySheet, RemovedColumn, ReplacePlan, ReplacedAll, RowScope,
@@ -108,8 +108,38 @@ pub fn parse_clipboard(text: &str) -> Vec<Vec<String>> {
     sample_records(text.as_bytes(), delimiter, usize::MAX)
 }
 
+/// Write the sheet to `path` so that either the whole new file is there or the
+/// old one is untouched: the rows go to a temporary file next to it, which is
+/// flushed to disk and then renamed over `path`. Anything reading the old file
+/// through an open handle (a file-backed sheet) keeps seeing the old bytes.
+/// A row with no fields is written as one empty field: a blank line would
+/// vanish when the file is read back.
 pub fn write_csv(
     path: &str,
+    headers: &[FileHeader],
+    data: &dyn Sheet,
+    format: CsvFormat,
+) -> Result<(), csv::Error> {
+    let target = std::path::Path::new(path);
+    let dir = target
+        .parent()
+        .filter(|d| !d.as_os_str().is_empty())
+        .unwrap_or(std::path::Path::new("."));
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let temp = dir.join(format!(".{name}.{}.saving", std::process::id()));
+    let result = write_csv_to(&temp, headers, data, format)
+        .and_then(|()| std::fs::rename(&temp, target).map_err(csv::Error::from));
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+fn write_csv_to(
+    path: &std::path::Path,
     headers: &[FileHeader],
     data: &dyn Sheet,
     format: CsvFormat,
@@ -123,10 +153,18 @@ pub fn write_csv(
     }
     for position in 0..data.len() {
         if let Some(record) = data.record(position) {
-            writer.write_record(record.as_ref())?;
+            if record.is_empty() {
+                writer.write_record([""])?;
+            } else {
+                writer.write_record(record.as_ref())?;
+            }
         }
     }
     writer.flush()?;
+    let file = writer
+        .into_inner()
+        .map_err(|e| csv::Error::from(e.into_error()))?;
+    file.sync_all()?;
     Ok(())
 }
 

@@ -29,6 +29,39 @@ pub trait ByteSource: Send + Sync {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize>;
 }
 
+/// A file on disk, read with positional reads. The handle stays valid when the
+/// path is later replaced by another file (saving renames a new file over it),
+/// so a sheet keeps reading the bytes it indexed.
+pub struct FileSource {
+    file: std::fs::File,
+    len: u64,
+}
+
+impl FileSource {
+    pub fn open(path: impl AsRef<std::path::Path>) -> io::Result<Self> {
+        let file = std::fs::File::open(path)?;
+        let len = file.metadata()?.len();
+        Ok(FileSource { file, len })
+    }
+}
+
+impl ByteSource for FileSource {
+    fn len(&self) -> u64 {
+        self.len
+    }
+
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> io::Result<usize> {
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::FileExt::read_at(&self.file, buf, offset)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::fs::FileExt::seek_read(&self.file, buf, offset)
+        }
+    }
+}
+
 pub struct VecSource(pub Vec<u8>);
 
 impl ByteSource for VecSource {
@@ -2606,6 +2639,133 @@ mod tests {
         conformance::run_read_only(MAKE);
     }
 
+    /// A scratch directory that is removed afterwards.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new() -> Self {
+            use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
+            static N: AtomicUsize = AtomicUsize::new(0);
+            let dir = std::env::temp_dir().join(format!(
+                "jonathan-save-{}-{}",
+                std::process::id(),
+                N.fetch_add(1, Relaxed)
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Run `ops` on a FileSheet over a real file, where `Op::Save` writes the
+    /// sheet over that very file (atomically) and reads it back.
+    fn check_ops_over_a_real_file(initial: &[Vec<String>], ops: &[conformance::Op]) {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("data.csv");
+        let path_str = path.to_str().unwrap().to_string();
+        let make_path = path.clone();
+        let make = move |rows: SheetVec| -> Box<dyn Sheet> {
+            let path = &make_path;
+            let mut w = csv::WriterBuilder::new()
+                .has_headers(false)
+                .flexible(true)
+                .from_path(&path)
+                .unwrap();
+            for (_, r) in &rows {
+                w.write_record(r).unwrap();
+            }
+            w.flush().unwrap();
+            Box::new(
+                FileSheet::new(
+                    Arc::new(crate::FileSource::open(&path).unwrap()),
+                    b',',
+                    false,
+                )
+                .unwrap(),
+            )
+        };
+        let save = |sheet: &dyn Sheet| -> Vec<Vec<String>> {
+            let format = crate::CsvFormat {
+                delimiter: b',',
+                has_header: false,
+            };
+            crate::write_csv(&path_str, &[], sheet, format).unwrap();
+            let mut r = csv::ReaderBuilder::new()
+                .has_headers(false)
+                .flexible(true)
+                .from_path(&path)
+                .unwrap();
+            r.records()
+                .map(|r| r.unwrap().iter().map(str::to_string).collect())
+                .collect()
+        };
+        conformance::check_ops_saving(&make, initial, ops, Some(&save));
+    }
+
+    #[test]
+    fn undo_works_after_a_save_for_every_kind_of_edit() {
+        use conformance::Op;
+        let initial: Vec<Vec<String>> = (0..6)
+            .map(|i| vec![format!("a{i}"), format!("b{i}"), format!("c{i}")])
+            .collect();
+        // Each undo-able operation, then a save, then the undo.
+        let cases: Vec<Vec<Op>> = vec![
+            vec![Op::RemoveColumn { col: 1 }, Op::Save, Op::RestoreColumn],
+            vec![
+                Op::InsertColumn {
+                    col: 1,
+                    with_values: true,
+                },
+                Op::Save,
+                Op::RestoreColumn,
+            ],
+            vec![
+                Op::ReplaceThenUndo {
+                    picks: vec![],
+                    cols: vec![0, 1],
+                    find: "b".into(),
+                    replace: "Z".into(),
+                },
+                Op::Save,
+            ],
+            vec![
+                Op::RemoveRow { position: 2 },
+                Op::Save,
+                Op::ReinsertRemovedRow { position: 2 },
+                Op::Save,
+            ],
+            vec![
+                Op::SetCell {
+                    pick: 1,
+                    col: 1,
+                    value: "new".into(),
+                },
+                Op::Save,
+                Op::SetCell {
+                    pick: 1,
+                    col: 1,
+                    value: "b1".into(),
+                },
+                Op::Save,
+            ],
+            vec![
+                Op::RemoveColumn { col: 0 },
+                Op::Save,
+                Op::Save,
+                Op::RestoreColumn,
+                Op::Save,
+            ],
+        ];
+        for ops in cases {
+            check_ops_over_a_real_file(&initial, &ops);
+        }
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(400))]
 
@@ -2628,6 +2788,14 @@ mod tests {
             ops in conformance::ops(),
         ) {
             conformance::check_ops(MAKE, &initial, &ops);
+        }
+
+        #[test]
+        fn random_edits_and_saves_over_a_real_file_match_the_reference_model(
+            initial in conformance::initial_rows(),
+            ops in conformance::ops(),
+        ) {
+            check_ops_over_a_real_file(&initial, &ops);
         }
 
         #[test]

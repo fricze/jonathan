@@ -958,6 +958,11 @@ pub enum Op {
     /// nothing but snapshots happened since (the undo-stack precondition).
     RestoreColumn,
     Snapshot,
+    /// Save the sheet to its file and read the file back: it must hold exactly
+    /// the sheet's rows. Changes nothing in the sheet, so every undo that was
+    /// possible before still is (undo across save). A no-op for backends
+    /// without a file.
+    Save,
 }
 
 fn text() -> impl Strategy<Value = String> {
@@ -989,6 +994,7 @@ pub fn ops() -> impl Strategy<Value = Vec<Op>> {
         3 => replace_op().prop_map(|(picks, cols, find, replace)| Op::Replace { picks, cols, find, replace }),
         2 => replace_op().prop_map(|(picks, cols, find, replace)| Op::ReplaceThenUndo { picks, cols, find, replace }),
         1 => Just(Op::Snapshot),
+        3 => Just(Op::Save),
     ];
     prop::collection::vec(op, 0..40)
 }
@@ -1095,6 +1101,19 @@ enum Undoable {
 /// Apply `ops` to a backend built from `initial` and to a [`RefModel`],
 /// requiring agreement on contents and on every return value.
 pub fn check_ops(make: &Make, initial: &[Vec<String>], ops: &[Op]) {
+    check_ops_saving(make, initial, ops, None)
+}
+
+/// What `Op::Save` does: write the sheet to its file, read the file back.
+pub type SaveAndReload<'a> = &'a dyn Fn(&dyn Sheet) -> Vec<Vec<String>>;
+
+/// `check_ops`, where `Op::Save` goes through `save`.
+pub fn check_ops_saving(
+    make: &Make,
+    initial: &[Vec<String>],
+    ops: &[Op],
+    save: Option<SaveAndReload<'_>>,
+) {
     let mut sheet = make(to_sheet_vec(initial));
     let mut model = RefModel::from_rows(&to_sheet_vec(initial));
     let mut removed_rows: Vec<(usize, Vec<String>)> = vec![];
@@ -1230,10 +1249,32 @@ pub fn check_ops(make: &Make, initial: &[Vec<String>], ops: &[Op]) {
                 None => {}
             },
             Op::Snapshot => snapshots.push((sheet.snapshot(), model.clone())),
+            Op::Save => {
+                if let Some(save) = save {
+                    let on_disk = save(sheet.as_ref());
+                    // A row with no fields cannot be told from a blank line, so
+                    // it is written (and read back) as one empty field.
+                    let want: Vec<Vec<String>> = model
+                        .rows
+                        .iter()
+                        .map(|(_, f)| {
+                            if f.is_empty() {
+                                vec![String::new()]
+                            } else {
+                                f.clone()
+                            }
+                        })
+                        .collect();
+                    assert_eq!(
+                        on_disk, want,
+                        "the saved file holds the sheet's rows, {ctx}"
+                    );
+                }
+            }
         }
         if !matches!(
             op,
-            Op::Snapshot | Op::RemoveColumn { .. } | Op::RestoreColumn
+            Op::Snapshot | Op::Save | Op::RemoveColumn { .. } | Op::RestoreColumn
         ) {
             undoable = None; // something else changed the sheet: no longer an exact undo
         }

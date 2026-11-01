@@ -244,13 +244,23 @@ range from the sparse index), edited rows are serialised with the file's
 delimiter/quoting rules, inserted rows likewise. If the column map is not the
 identity every row is re-serialised (lean parse + write, ~1 us/row). Check
 free space first; on any error delete the temp file and keep the original.
-After a successful save the new file becomes the base, the overlay is
-cleared, and the sparse index is built from offsets noted while writing.
-**Row ids do not change at save** (see 4.9): the piece table at the moment of
-saving is flattened into an *id map* - runs of `(new base row, count, first
-id)`, memory proportional to the number of pieces - so base row `j` of the new
-file still answers to the id it had. Ids are never reused (`next_row_id` only
-grows).
+**Saving does not change the sheet (decided, implemented for the writer).** The
+sheet keeps its open handle on the file it indexed; the rename replaces the
+path, not the inode, so it goes on reading the old bytes. Row ids, the column
+map, rules, overlay and piece table are untouched, so **every undo entry,
+including column and replace-all tokens, stays valid across a save** with no
+rewriting. Rebasing onto the new file (flattening the piece table into an id
+map, folding rules in) was the earlier plan; it would have to rewrite every
+column/replace token (a deleted column's values are not in the new file), so it
+is left as an optional compaction for when the undo stack is empty or the file
+is reopened. Costs accepted: the old file stays on disk until the file is
+closed (a 5 GB file briefly takes ~10 GB), and the overlay/rules are not
+reclaimed at save (bounded by the edits, as before the save). External-change
+detection compares with the file as last written. `write_csv` is atomic
+(temp file in the same directory, `fsync`, rename); a row with no fields is
+written as one empty field because a blank line would vanish. Tested by
+`Op::Save` in the conformance suite (every random edit/undo sequence with saves
+interleaved, over a real file); overwriting in place makes it fail.
 Before overwriting, compare size and modification time with what was loaded;
 if changed, ask (reload / overwrite / Save As) (U7).
 
