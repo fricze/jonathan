@@ -1,4 +1,4 @@
-pub use csv_model::{ColumnId, FileHeader, MemorySheet, RemovedColumn, Sheet, SheetRow, SortOrder, View};
+pub use csv_model::{ColumnId, FileHeader, InsertedColumn, MemorySheet, RemovedColumn, Sheet, SheetRow, SortOrder, View};
 pub use selection::SelectionState;
 pub use undo_history::UndoHistory;
 #[cfg(test)]
@@ -192,14 +192,54 @@ pub enum UndoEntry {
         header: FileHeader,
         removed: RemovedColumn,
     },
-    /// A column with `column_id` was inserted. Undoing removes it again.
-    ColumnInsert { filename: Filename, column_id: ColumnId },
+    /// Remove the column `column_id` (the reverse of `ColumnDelete`, i.e. a
+    /// redo of the user's delete). Producing it hands back a fresh
+    /// `RemovedColumn` for the `ColumnDelete` that undoes it.
+    ColumnRemove { filename: Filename, column_id: ColumnId },
+    /// The user inserted column `column_id`. Undoing takes it out *and* takes
+    /// back the padding it added to short rows, using the sheet's own record
+    /// of what it changed (`inserted`), so the sheet is exactly as before.
+    ColumnUninsert { filename: Filename, column_id: ColumnId, inserted: InsertedColumn },
+    /// Insert an empty column `header` at `position` (the reverse of
+    /// `ColumnUninsert`, i.e. a redo of the user's insert).
+    ColumnAdd { filename: Filename, position: usize, header: FileHeader },
     /// Multiple entries that should undo/redo as one action (e.g. every
     /// cell changed by a single paste or replace-all). Reversing a batch
     /// reverses each entry in reverse order (so entries that depend on
     /// earlier ones in the batch unwind correctly) and produces a Batch of
     /// their reverses.
     Batch(Vec<UndoEntry>),
+}
+
+impl UndoEntry {
+    /// Memory this entry keeps alive (its own size plus heap data), as an
+    /// estimate; the undo history sums these to bound its size.
+    pub fn approx_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.heap_bytes()
+    }
+
+    fn heap_bytes(&self) -> usize {
+        match self {
+            UndoEntry::CellEdit { filename, old_value, .. } => filename.capacity() + old_value.capacity(),
+            UndoEntry::RowDelete { filename, record, .. } => filename.capacity() + row_bytes(record),
+            UndoEntry::RowInsert { filename, .. } | UndoEntry::ColumnRemove { filename, .. } => filename.capacity(),
+            UndoEntry::ColumnDelete { filename, header, removed, .. } => {
+                filename.capacity() + header.name.capacity() + removed.size_bytes()
+            }
+            UndoEntry::ColumnUninsert { filename, inserted, .. } => filename.capacity() + inserted.size_bytes(),
+            UndoEntry::ColumnAdd { filename, header, .. } => filename.capacity() + header.name.capacity(),
+            UndoEntry::Batch(entries) => {
+                entries.capacity() * std::mem::size_of::<UndoEntry>() + entries.iter().map(Self::heap_bytes).sum::<usize>()
+            }
+        }
+    }
+}
+
+/// A row held by an undo entry: the record's text and field ends, plus the
+/// fixed part of a `StringRecord` (a boxed header and two vectors).
+fn row_bytes((_, record): &SheetRow) -> usize {
+    const RECORD_FIXED: usize = 96;
+    RECORD_FIXED + record.as_slice().len() + (record.len() + 1) * std::mem::size_of::<usize>()
 }
 
 pub struct MyApp {

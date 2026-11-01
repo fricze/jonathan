@@ -147,6 +147,21 @@ impl<K: Eq + Hash + Clone, E> UndoHistory<K, E> {
         self.redo_stack.get(key).map_or(0, |s| s.len())
     }
 
+    /// `key`'s undo entries, oldest first (for measuring the stack).
+    pub fn undo_entries(&self, key: &K) -> &[E] {
+        self.undo_stack.get(key).map_or(&[], |s| s.as_slice())
+    }
+
+    /// `key`'s redo entries, oldest first.
+    pub fn redo_entries(&self, key: &K) -> &[E] {
+        self.redo_stack.get(key).map_or(&[], |s| s.as_slice())
+    }
+
+    /// Total of `size` over every undo and redo entry of `key`.
+    pub fn total_size(&self, key: &K, size: impl Fn(&E) -> usize) -> usize {
+        self.undo_entries(key).iter().chain(self.redo_entries(key)).map(size).sum()
+    }
+
     fn refresh_dirty(&mut self, key: &K) {
         let current_len = self.undo_stack.get(key).map_or(0, |s| s.len());
         let clean_len = self.clean_marker.get(key).copied().unwrap_or(0);
@@ -285,5 +300,22 @@ mod tests {
         assert!(h.any_dirty());
         h.undo(&"a.csv".to_string(), |e| Some((e, e)));
         assert!(!h.any_dirty());
+    }
+
+    #[test]
+    fn entries_are_exposed_oldest_first_and_totalled() {
+        let mut h: UndoHistory<String, usize> = UndoHistory::new();
+        let key = "f.csv".to_string();
+        assert!(h.undo_entries(&key).is_empty());
+        assert_eq!(h.total_size(&key, |e| *e), 0);
+        for n in [10, 20, 30] {
+            h.push(&key, n);
+        }
+        assert_eq!(h.undo_entries(&key), &[10, 20, 30]);
+        h.undo(&key, |e| Some((e + 1, ())));
+        assert_eq!(h.undo_entries(&key), &[10, 20]);
+        assert_eq!(h.redo_entries(&key), &[31]);
+        assert_eq!(h.total_size(&key, |e| *e), 10 + 20 + 31, "undo and redo entries both count");
+        assert_eq!(h.total_size(&"other".to_string(), |e| *e), 0, "another file's history is separate");
     }
 }

@@ -4,7 +4,7 @@ use egui_dock::{DockArea, Style};
 use std::path::PathBuf;
 use std::thread;
 
-use csv_model::{LoadStats, MemorySheet, RemovedColumn, open_csv_file, read_rows, write_csv};
+use csv_model::{InsertedColumn, LoadStats, MemorySheet, RemovedColumn, open_csv_file, read_rows, write_csv};
 use crate::menu::{COPY_AS_CSV_ID, OPEN_FILE_ID};
 use crate::types::{
     ColumnId, CsvTabViewer, FileHeader, InsertPosition, MyApp, ReplaceScope, SendUiMessage, SheetTab,
@@ -262,7 +262,7 @@ impl MyApp {
                 let column_id = header.id;
                 let name = header.name.clone();
                 self.restore_column_at(&filename, position, header, &removed);
-                let reverse = UndoEntry::ColumnInsert { filename, column_id };
+                let reverse = UndoEntry::ColumnRemove { filename, column_id };
                 let result = UndoRedoResult {
                     row: None,
                     column: Some(name),
@@ -271,7 +271,7 @@ impl MyApp {
                 };
                 Some((reverse, result))
             }
-            UndoEntry::ColumnInsert { filename, column_id } => {
+            UndoEntry::ColumnRemove { filename, column_id } => {
                 let headers = self.tree.iter_all_tabs().find_map(|(_, tab)| tab.columns.get(&filename).cloned())?;
                 let position = column_position(&headers, column_id)?;
                 let header = headers[position].clone();
@@ -284,6 +284,35 @@ impl MyApp {
                     column: Some(name),
                     restored: "(deleted)".to_string(),
                     overwritten: "(column removed)".to_string(),
+                };
+                Some((reverse, result))
+            }
+            UndoEntry::ColumnUninsert { filename, column_id, inserted } => {
+                let headers = self.tree.iter_all_tabs().find_map(|(_, tab)| tab.columns.get(&filename).cloned())?;
+                let position = column_position(&headers, column_id)?;
+                let header = headers[position].clone();
+                let name = header.name.clone();
+
+                self.uninsert_column_at(&filename, position, column_id, &inserted)?;
+                let reverse = UndoEntry::ColumnAdd { filename, position, header };
+                let result = UndoRedoResult {
+                    row: None,
+                    column: Some(name),
+                    restored: "(deleted)".to_string(),
+                    overwritten: "(column removed)".to_string(),
+                };
+                Some((reverse, result))
+            }
+            UndoEntry::ColumnAdd { filename, position, header } => {
+                let column_id = header.id;
+                let name = header.name.clone();
+                let inserted = self.insert_column_at(&filename, position, header)?;
+                let reverse = UndoEntry::ColumnUninsert { filename, column_id, inserted };
+                let result = UndoRedoResult {
+                    row: None,
+                    column: Some(name),
+                    restored: "(column restored)".to_string(),
+                    overwritten: "(deleted)".to_string(),
                 };
                 Some((reverse, result))
             }
@@ -541,12 +570,30 @@ impl MyApp {
         self.insert_header_at(filename, position, header);
     }
 
-    /// Insert a new, empty column named by `header` at `position`.
-    fn insert_column_at(&mut self, filename: &str, position: usize, header: FileHeader) {
-        if let Some(sheet) = self.sheets_data.get_mut(filename) {
-            sheet.insert_column(position, &[]);
-        }
+    /// Insert a new, empty column named by `header` at `position`. The
+    /// returned record of what the sheet changed lets `uninsert_column_at`
+    /// undo it exactly; `None` if the file isn't loaded.
+    fn insert_column_at(&mut self, filename: &str, position: usize, header: FileHeader) -> Option<InsertedColumn> {
+        let inserted = self.sheets_data.get_mut(filename)?.insert_column(position, &[]);
         self.insert_header_at(filename, position, header);
+        Some(inserted)
+    }
+
+    /// Exact inverse of `insert_column_at`.
+    fn uninsert_column_at(
+        &mut self,
+        filename: &str,
+        position: usize,
+        header_id: ColumnId,
+        inserted: &InsertedColumn,
+    ) -> Option<()> {
+        self.sheets_data.get_mut(filename)?.undo_insert_column(position, inserted);
+        for tab in self.tree.iter_all_tabs_mut() {
+            if let Some(headers) = tab.1.columns.get_mut(filename) {
+                headers.retain(|h| h.id != header_id);
+            }
+        }
+        Some(())
     }
 
     fn insert_header_at(&mut self, filename: &str, position: usize, header: FileHeader) {
@@ -608,9 +655,12 @@ impl MyApp {
         self.next_col_id.insert(filename.to_string(), column_id + 1);
 
         let header = FileHeader { id: column_id, name: name.to_string(), visible: true, sort: None };
-        self.insert_column_at(filename, position, header);
+        let inserted = self.insert_column_at(filename, position, header)?;
 
-        self.push_undo(filename, UndoEntry::ColumnInsert { filename: filename.to_string(), column_id });
+        self.push_undo(
+            filename,
+            UndoEntry::ColumnUninsert { filename: filename.to_string(), column_id, inserted },
+        );
         Some(column_id)
     }
 }
@@ -1850,6 +1900,67 @@ mod tests {
 
         let headers = app.tree.iter_all_tabs().next().unwrap().1.columns.get("f.csv").unwrap();
         assert_eq!(headers.len(), 1);
+    }
+
+    fn record_fields(app: &MyApp, file: &str, pos: usize) -> Vec<String> {
+        app.sheets_data[file].record(pos).unwrap().iter().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn undoing_an_inserted_column_restores_short_rows_exactly() {
+        let mut app = test_app();
+        app.sheets_data.insert_rows(
+            "f.csv".to_string(),
+            vec![row(0, &["a", "b", "c"]), row(1, &["d"]), row(2, &["e", "f"])],
+        );
+        set_columns(&mut app, "f.csv", 3);
+        app.next_col_id.insert("f.csv".to_string(), 3);
+
+        app.apply_insert_column("f.csv", None, "new"); // appended: position 3
+        assert_eq!(record_fields(&app, "f.csv", 1), ["d", "", "", ""], "short rows are padded to line up");
+
+        app.apply_undo("f.csv");
+        assert_eq!(record_fields(&app, "f.csv", 0), ["a", "b", "c"]);
+        assert_eq!(record_fields(&app, "f.csv", 1), ["d"], "the padding goes too");
+        assert_eq!(record_fields(&app, "f.csv", 2), ["e", "f"]);
+        assert!(!app.history.is_dirty(&"f.csv".to_string()), "back at the saved state");
+    }
+
+    #[test]
+    fn redo_and_undo_of_an_inserted_column_keep_working() {
+        let mut app = test_app();
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a", "b"]), row(1, &["c"])]);
+        set_columns(&mut app, "f.csv", 2);
+        app.next_col_id.insert("f.csv".to_string(), 2);
+
+        let id = app.apply_insert_column("f.csv", Some(0), "mid").unwrap(); // after column 0
+        assert_eq!(record_fields(&app, "f.csv", 0), ["a", "", "b"]);
+        for round in 0..3 {
+            app.apply_undo("f.csv");
+            assert_eq!(record_fields(&app, "f.csv", 0), ["a", "b"], "round {round}");
+            assert_eq!(record_fields(&app, "f.csv", 1), ["c"], "round {round}");
+            app.apply_redo("f.csv");
+            assert_eq!(record_fields(&app, "f.csv", 0), ["a", "", "b"], "round {round}");
+            let headers = app.tree.iter_all_tabs().next().unwrap().1.columns.get("f.csv").unwrap();
+            assert_eq!(headers.len(), 3);
+            assert_eq!(headers[1].id, id);
+        }
+    }
+
+    #[test]
+    fn deleting_a_column_then_undo_redo_undo_is_exact_for_short_rows() {
+        let mut app = test_app();
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a", "b", "c"]), row(1, &["d"])]);
+        set_columns(&mut app, "f.csv", 3);
+        assert!(app.apply_delete_column("f.csv", 1));
+        assert_eq!(record_fields(&app, "f.csv", 0), ["a", "c"]);
+        for _ in 0..2 {
+            app.apply_undo("f.csv");
+            assert_eq!(record_fields(&app, "f.csv", 0), ["a", "b", "c"]);
+            assert_eq!(record_fields(&app, "f.csv", 1), ["d"]);
+            app.apply_redo("f.csv");
+            assert_eq!(record_fields(&app, "f.csv", 0), ["a", "c"]);
+        }
     }
 
     #[test]
