@@ -11,7 +11,7 @@ mod row_index;
 mod sheet;
 pub use file_sheet::{ByteSource, FileSheet, VecSource};
 pub use row_index::{RowIndex, RowIndexBuilder};
-pub use sheet::{MemorySheet, RemovedColumn, Sheet};
+pub use sheet::{InsertedColumn, MemorySheet, RemovedColumn, Sheet};
 
 #[cfg(test)]
 pub(crate) mod conformance;

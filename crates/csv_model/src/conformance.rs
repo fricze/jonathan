@@ -13,7 +13,7 @@
 use csv::StringRecord;
 use proptest::prelude::*;
 
-use crate::{RemovedColumn, Sheet, SheetRow, SheetVec, SortOrder};
+use crate::{InsertedColumn, RemovedColumn, Sheet, SheetRow, SheetVec, SortOrder};
 
 pub type Make = dyn Fn(SheetVec) -> Box<dyn Sheet>;
 
@@ -114,6 +114,9 @@ pub fn run_row_edits(make: &Make) {
 }
 
 pub fn run_column_edits(make: &Make) {
+    undoing_an_insert_restores_short_rows_exactly(make);
+    undoing_an_insert_with_values_and_edited_rows(make);
+    token_sizes_are_reported(make);
     column_restore_survives_edits_made_and_undone_in_between(make);
     filter_and_sort_see_the_values_of_added_columns(make);
     column_remove_insert_round_trip(make);
@@ -126,6 +129,60 @@ pub fn run_column_edits(make: &Make) {
 
 /// A row shorter than the insertion point is treated as padded with empty
 /// fields, so the new column lines up with every other row.
+/// A column inserted past the end of short rows pads them; undoing the insert
+/// must take the padding off again, not just the new field.
+fn undoing_an_insert_restores_short_rows_exactly(make: &Make) {
+    let original: [&[&str]; 4] = [&["a", "b", "c"], &["d"], &["e", "f"], &["g", "h", "i", "j"]];
+    for col in [0usize, 1, 3, 4, 6] {
+        let mut s = make(rows_of(&original));
+        let tok = s.insert_column(col, &[]);
+        for pos in 0..4 {
+            assert!(
+                s.cell(pos, col).is_some(),
+                "col {col}: the new column exists in every row"
+            );
+        }
+        s.undo_insert_column(col, &tok);
+        for (pos, want) in original.iter().enumerate() {
+            let want: Vec<String> = want.iter().map(|x| x.to_string()).collect();
+            assert_eq!(fields(s.as_ref(), pos), Some(want), "col {col}, row {pos}");
+        }
+    }
+}
+
+fn undoing_an_insert_with_values_and_edited_rows(make: &Make) {
+    let mut s = make(rows_of(&[&["a", "b"], &["c"], &["d", "e"]]));
+    s.set_cell(0, 1, "B"); // a row that is already edited when the column goes in
+    let tok = s.insert_column(3, &[(0, "x".to_string()), (1, "y".to_string())]);
+    assert_eq!(
+        fields(s.as_ref(), 1),
+        Some(vec!["c".into(), "".into(), "".into(), "y".into()])
+    );
+    assert!(s.set_cell(2, 0, "D")); // touched after the insert...
+    assert!(s.set_cell(2, 0, "d")); // ...and set back by its own undo
+    s.undo_insert_column(3, &tok);
+    assert_eq!(fields(s.as_ref(), 0), Some(vec!["a".into(), "B".into()]));
+    assert_eq!(fields(s.as_ref(), 1), Some(vec!["c".into()]));
+    assert_eq!(fields(s.as_ref(), 2), Some(vec!["d".into(), "e".into()]));
+}
+
+/// Tokens say how much memory they keep alive (the undo history sums these).
+fn token_sizes_are_reported(make: &Make) {
+    let mut s = make(rows_of(&[&["a", "b", "c"], &["d", "e", "f"]]));
+    let ins = s.insert_column(1, &[]);
+    let rem = s.remove_column(1);
+    assert!(
+        ins.size_bytes() > 0 && ins.size_bytes() < 64 * 1024,
+        "{}",
+        ins.size_bytes()
+    );
+    assert!(
+        rem.size_bytes() > 0 && rem.size_bytes() < 64 * 1024,
+        "{}",
+        rem.size_bytes()
+    );
+}
+
 /// Rows touched between the removal and the restore (and put back as they
 /// were by the undo stack) must still get their column back.
 fn column_restore_survives_edits_made_and_undone_in_between(make: &Make) {
@@ -588,17 +645,34 @@ impl RefModel {
         }
     }
 
-    fn insert_column(&mut self, col: usize, values: &[(usize, String)]) {
+    /// Returns the old length of every row that was padded (shorter than `col`).
+    fn insert_column(&mut self, col: usize, values: &[(usize, String)]) -> Vec<(usize, usize)> {
+        let mut padded = vec![];
         for (id, f) in self.rows.iter_mut() {
             let v = values
                 .iter()
                 .find(|(i, _)| i == id)
                 .map(|(_, v)| v.clone())
                 .unwrap_or_default();
+            if f.len() < col {
+                padded.push((*id, f.len()));
+            }
             while f.len() < col {
                 f.push(String::new());
             }
             f.insert(col, v);
+        }
+        padded
+    }
+
+    fn undo_insert_column(&mut self, col: usize, padded: &[(usize, usize)]) {
+        for (id, f) in self.rows.iter_mut() {
+            if col < f.len() {
+                f.remove(col);
+            }
+            if let Some((_, old_len)) = padded.iter().find(|(i, _)| i == id) {
+                f.truncate(*old_len);
+            }
         }
     }
 }
@@ -630,8 +704,18 @@ pub enum Op {
         col: usize,
         with_values: bool,
     },
-    /// Undo the most recent `RemoveColumn`; only applied when nothing but
-    /// snapshots happened since (the undo-stack precondition).
+    /// Insert a column and immediately undo it: from any state this must leave
+    /// the sheet exactly as it was.
+    InsertThenUndo {
+        col: usize,
+        with_values: bool,
+    },
+    /// Remove a column and immediately restore it: likewise a no-op overall.
+    RemoveThenRestore {
+        col: usize,
+    },
+    /// Undo the most recent `RemoveColumn` or `InsertColumn`; only applied when
+    /// nothing but snapshots happened since (the undo-stack precondition).
     RestoreColumn,
     Snapshot,
 }
@@ -651,6 +735,8 @@ pub fn ops() -> impl Strategy<Value = Vec<Op>> {
         2 => (0usize..5).prop_map(|col| Op::RemoveColumn { col }),
         2 => (0usize..6, any::<bool>()).prop_map(|(col, with_values)| Op::InsertColumn { col, with_values }),
         2 => Just(Op::RestoreColumn),
+        2 => (0usize..7, any::<bool>()).prop_map(|(col, with_values)| Op::InsertThenUndo { col, with_values }),
+        2 => (0usize..7).prop_map(|col| Op::RemoveThenRestore { col }),
         1 => Just(Op::Snapshot),
     ];
     prop::collection::vec(op, 0..40)
@@ -731,6 +817,12 @@ pub fn assert_same(sheet: &dyn Sheet, model: &RefModel, ctx: &str) {
     );
 }
 
+/// The last column operation, while it can still be undone exactly.
+enum Undoable {
+    Removed(usize, RemovedColumn, Vec<(usize, String)>),
+    Inserted(usize, InsertedColumn, Vec<(usize, usize)>),
+}
+
 /// Apply `ops` to a backend built from `initial` and to a [`RefModel`],
 /// requiring agreement on contents and on every return value.
 pub fn check_ops(make: &Make, initial: &[Vec<String>], ops: &[Op]) {
@@ -740,7 +832,7 @@ pub fn check_ops(make: &Make, initial: &[Vec<String>], ops: &[Op]) {
     // The most recent column removal, as the model saw it (for arbitrary
     // `insert_column` values), and whether it can still be undone exactly.
     let mut last_values: Vec<(usize, String)> = vec![];
-    let mut undoable: Option<(usize, RemovedColumn, Vec<(usize, String)>)> = None;
+    let mut undoable: Option<Undoable> = None;
     let mut snapshots: Vec<(Box<dyn Sheet>, RefModel)> = vec![];
     assert_same(sheet.as_ref(), &model, "load");
 
@@ -792,19 +884,48 @@ pub fn check_ops(make: &Make, initial: &[Vec<String>], ops: &[Op]) {
                 let token = sheet.remove_column(*col);
                 let values = model.remove_column(*col);
                 last_values = values.clone();
-                undoable = Some((*col, token, values));
+                undoable = Some(Undoable::Removed(*col, token, values));
             }
             Op::InsertColumn { col, with_values } => {
                 let values: &[(usize, String)] = if *with_values { &last_values } else { &[] };
-                sheet.insert_column(*col, values);
-                model.insert_column(*col, values);
+                let token = sheet.insert_column(*col, values);
+                let padded = model.insert_column(*col, values);
+                undoable = Some(Undoable::Inserted(*col, token, padded));
             }
-            Op::RestoreColumn => {
-                if let Some((col, token, values)) = undoable.take() {
+            Op::InsertThenUndo { col, with_values } => {
+                let values: &[(usize, String)] = if *with_values { &last_values } else { &[] };
+                let before = model.clone();
+                let token = sheet.insert_column(*col, values);
+                let padded = model.insert_column(*col, values);
+                sheet.undo_insert_column(*col, &token);
+                model.undo_insert_column(*col, &padded);
+                assert_eq!(
+                    model, before,
+                    "the model's own insert/undo is an exact inverse: {ctx}"
+                );
+            }
+            Op::RemoveThenRestore { col } => {
+                let before = model.clone();
+                let token = sheet.remove_column(*col);
+                let values = model.remove_column(*col);
+                sheet.restore_column(*col, &token);
+                model.restore_column(*col, &values);
+                assert_eq!(
+                    model, before,
+                    "the model's own remove/restore is an exact inverse: {ctx}"
+                );
+            }
+            Op::RestoreColumn => match undoable.take() {
+                Some(Undoable::Removed(col, token, values)) => {
                     sheet.restore_column(col, &token);
                     model.restore_column(col, &values);
                 }
-            }
+                Some(Undoable::Inserted(col, token, padded)) => {
+                    sheet.undo_insert_column(col, &token);
+                    model.undo_insert_column(col, &padded);
+                }
+                None => {}
+            },
             Op::Snapshot => snapshots.push((sheet.snapshot(), model.clone())),
         }
         if !matches!(

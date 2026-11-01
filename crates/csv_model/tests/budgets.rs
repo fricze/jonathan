@@ -268,6 +268,111 @@ fn memory_snapshot_cost_does_not_grow_with_the_number_of_edits() {
     assert!(allocated[1] <= allocated[0] + 1024);
 }
 
+// --------------------------------------------- undo token sizes
+
+/// Memory a token really keeps alive: what dropping it gives back.
+fn real_bytes<T>(token: T) -> usize {
+    let (_, m) = measure(|| drop(token));
+    (-m.retained) as usize
+}
+
+fn within(name: &str, claimed: usize, real: usize) {
+    // The claim must not understate the memory by much (the history cap relies
+    // on it) and must not wildly overstate it either.
+    check_ge(
+        &format!("{name}: claimed / real bytes"),
+        claimed as f64 / real.max(1) as f64,
+        0.75,
+        "ratio",
+    );
+    check_le(
+        &format!("{name}: claimed / real bytes"),
+        claimed as f64 / real.max(1) as f64,
+        2.0,
+        "ratio",
+    );
+}
+
+#[test]
+fn undo_token_size_claims_match_the_allocator_for_a_file_backed_sheet() {
+    let _g = serial();
+    for edited in [0usize, 2_000] {
+        let (mut sheet, _src) = open(csv_bytes(30_000));
+        for k in 0..edited {
+            sheet.set_cell(k * 7, 1, "some edited text here");
+        }
+        let removed = sheet.remove_column(2);
+        let claimed = removed.size_bytes();
+        within(
+            &format!("remove-column token, file-backed, {edited} rows in memory"),
+            claimed,
+            real_bytes(removed),
+        );
+        let inserted = sheet.insert_column(1, &[]);
+        let claimed = inserted.size_bytes();
+        within(
+            &format!("insert-column token, file-backed, {edited} rows in memory"),
+            claimed,
+            real_bytes(inserted),
+        );
+    }
+}
+
+#[test]
+fn undo_token_size_claims_match_the_allocator_for_an_in_memory_sheet() {
+    let _g = serial();
+    let rows: Vec<(usize, csv::StringRecord)> = csv::ReaderBuilder::new()
+        .has_headers(false)
+        .from_reader(&csv_bytes(20_000)[..])
+        .records()
+        .map(|r| r.unwrap())
+        .enumerate()
+        .collect();
+    let mut sheet = csv_model::MemorySheet::new(rows);
+    let removed = sheet.remove_column(1);
+    let claimed = removed.size_bytes();
+    within(
+        "remove-column token, in-memory, 20k rows",
+        claimed,
+        real_bytes(removed),
+    );
+    check_le(
+        "remove-column token, in-memory: bytes per row",
+        claimed as f64 / 20_000.0,
+        100.0,
+        "B/row",
+    );
+    let inserted = sheet.insert_column(9, &[]); // past the 8-field rows: all are padded
+    let claimed = inserted.size_bytes();
+    within(
+        "insert-column token, in-memory, 20k padded rows",
+        claimed,
+        real_bytes(inserted),
+    );
+}
+
+#[test]
+fn a_column_token_for_a_file_without_edits_is_tiny_whatever_the_file_size() {
+    let _g = serial();
+    for n in [10_000usize, 100_000] {
+        let (mut sheet, _src) = open(csv_bytes(n));
+        let removed = sheet.remove_column(2);
+        check_le(
+            &format!("remove-column token, nothing edited ({n} rows)"),
+            removed.size_bytes() as f64,
+            4096.0,
+            "bytes",
+        );
+        let inserted = sheet.insert_column(1, &[]);
+        check_le(
+            &format!("insert-column token, nothing edited ({n} rows)"),
+            inserted.size_bytes() as f64,
+            4096.0,
+            "bytes",
+        );
+    }
+}
+
 // ------------------------------------------ I/O complexity (exact reads)
 
 #[test]

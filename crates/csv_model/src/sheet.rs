@@ -17,21 +17,46 @@ use csv::StringRecord;
 
 use crate::{SheetRow, SheetVec, SortOrder, View, edit_record, filter_indices, sort_indices};
 
-/// What `remove_column` hands back so the removal can be undone with
-/// `restore_column`. Opaque: each backend keeps whatever is cheapest for it
-/// (an in-memory sheet keeps the removed values; a file-backed one keeps a
-/// reference to where the column's data comes from). Cheap to clone.
-#[derive(Clone)]
-pub struct RemovedColumn(Arc<dyn Any + Send + Sync>);
+macro_rules! undo_token {
+    ($(#[$doc:meta])* $name:ident) => {
+        $(#[$doc])*
+        #[derive(Clone)]
+        pub struct $name {
+            payload: Arc<dyn Any + Send + Sync>,
+            size_bytes: usize,
+        }
 
-impl RemovedColumn {
-    pub fn new<T: Any + Send + Sync>(payload: T) -> Self {
-        RemovedColumn(Arc::new(payload))
-    }
+        impl $name {
+            /// `size_bytes` is the memory this token keeps alive (its own
+            /// struct plus heap data), which the undo history sums to bound
+            /// its size. Backends compute it when they build the token.
+            pub fn new<T: Any + Send + Sync>(payload: T, size_bytes: usize) -> Self {
+                $name { payload: Arc::new(payload), size_bytes }
+            }
 
-    pub fn payload<T: Any>(&self) -> Option<&T> {
-        self.0.downcast_ref()
-    }
+            pub fn payload<T: Any>(&self) -> Option<&T> {
+                self.payload.downcast_ref()
+            }
+
+            pub fn size_bytes(&self) -> usize {
+                self.size_bytes
+            }
+        }
+    };
+}
+
+undo_token! {
+    /// What `remove_column` hands back so the removal can be undone with
+    /// `restore_column`. Opaque: each backend keeps whatever is cheapest for it
+    /// (an in-memory sheet keeps the removed values; a file-backed one keeps a
+    /// copy of its small column map). Cheap to clone.
+    RemovedColumn
+}
+
+undo_token! {
+    /// What `insert_column` hands back so the insertion can be undone exactly
+    /// with `undo_insert_column`, including the padding it added to short rows.
+    InsertedColumn
 }
 
 pub trait Sheet: Send + Sync {
@@ -88,7 +113,14 @@ pub trait Sheet: Send + Sync {
     /// `values_by_row` (keyed by row id) where present, empty otherwise. A row
     /// with fewer than `col` fields is first padded with empty fields, so the
     /// new column is at index `col` in every row.
-    fn insert_column(&mut self, col: usize, values_by_row: &[(usize, String)]);
+    fn insert_column(&mut self, col: usize, values_by_row: &[(usize, String)]) -> InsertedColumn;
+
+    /// Undo an `insert_column(col, ..)` exactly: the new field is taken out of
+    /// every row and the padding it added to short rows is taken off again.
+    /// Same precondition as `restore_column`: everything done since has been
+    /// undone in reverse order; otherwise the result is unspecified (but never
+    /// a panic).
+    fn undo_insert_column(&mut self, col: usize, inserted: &InsertedColumn);
 
     /// Positions of rows with any cell containing `needle`.
     fn filter(&self, needle: &str) -> View;
@@ -177,7 +209,10 @@ impl Sheet for MemorySheet {
                     .collect();
             }
         }
-        RemovedColumn::new(removed)
+        let size = std::mem::size_of::<Vec<(usize, String)>>()
+            + removed.capacity() * std::mem::size_of::<(usize, String)>()
+            + removed.iter().map(|(_, v)| v.capacity()).sum::<usize>();
+        RemovedColumn::new(removed, size)
     }
 
     fn restore_column(&mut self, col: usize, removed: &RemovedColumn) {
@@ -196,16 +231,41 @@ impl Sheet for MemorySheet {
         }
     }
 
-    fn insert_column(&mut self, col: usize, values_by_row: &[(usize, String)]) {
+    fn insert_column(&mut self, col: usize, values_by_row: &[(usize, String)]) -> InsertedColumn {
         let values: std::collections::HashMap<usize, &str> = values_by_row
             .iter()
             .map(|(id, v)| (*id, v.as_str()))
             .collect();
+        let mut padded: Vec<(usize, usize)> = Vec::new();
         for (id, record) in self.rows.iter_mut() {
             let mut fields: Vec<&str> = record.iter().collect();
+            if fields.len() < col {
+                padded.push((*id, fields.len()));
+            }
             // A row shorter than `col` is padded so the new column lines up.
             fields.resize(fields.len().max(col), "");
             fields.insert(col, values.get(id).copied().unwrap_or(""));
+            *record = fields.into_iter().collect();
+        }
+        let size = std::mem::size_of::<Vec<(usize, usize)>>()
+            + padded.capacity() * std::mem::size_of::<(usize, usize)>();
+        InsertedColumn::new(padded, size)
+    }
+
+    fn undo_insert_column(&mut self, col: usize, inserted: &InsertedColumn) {
+        let Some(padded) = inserted.payload::<Vec<(usize, usize)>>() else {
+            return;
+        };
+        let padded: std::collections::HashMap<usize, usize> = padded.iter().copied().collect();
+        for (id, record) in self.rows.iter_mut() {
+            let mut fields: Vec<&str> = record.iter().collect();
+            if col < fields.len() {
+                fields.remove(col);
+            }
+            // Take off the padding the insert added to a short row.
+            if let Some(&old_len) = padded.get(id) {
+                fields.truncate(old_len);
+            }
             *record = fields.into_iter().collect();
         }
     }
@@ -290,7 +350,7 @@ mod tests {
     #[test]
     fn restoring_with_a_token_from_another_kind_of_sheet_does_nothing() {
         let mut s = sheet(&[(0, &["a", "b"])]);
-        s.restore_column(1, &RemovedColumn::new(42u8));
+        s.restore_column(1, &RemovedColumn::new(42u8, 1));
         assert_eq!(s.record(0).unwrap().iter().collect::<Vec<_>>(), ["a", "b"]);
     }
 

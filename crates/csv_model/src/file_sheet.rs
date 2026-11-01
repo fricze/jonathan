@@ -15,7 +15,8 @@ use csv::StringRecord;
 
 use crate::lean::LeanParser;
 use crate::{
-    RemovedColumn, RowIndex, RowIndexBuilder, Sheet, SheetRow, SortOrder, View, sort_cells,
+    InsertedColumn, RemovedColumn, RowIndex, RowIndexBuilder, Sheet, SheetRow, SortOrder, View,
+    sort_cells,
 };
 
 /// Random-access bytes. Positional reads (not mmap) so that a file shrinking
@@ -254,6 +255,15 @@ impl ColumnMap {
         self.entries.is_empty() && self.tail_start == 0 && self.len.is_identity()
     }
 
+    /// Memory this map keeps alive. (An `Added` column's value table is shared
+    /// and counted where it was made, but a token holding the only reference
+    /// does keep it alive; `added_values_bytes` is added by callers that know.)
+    fn size_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.entries.capacity() * std::mem::size_of::<ColSource>()
+            + self.len.flat.capacity() * std::mem::size_of::<usize>()
+    }
+
     /// Some added column carries values that are not in the file's bytes, so a
     /// search of the bytes cannot rule a row out.
     fn has_added_values(&self) -> bool {
@@ -329,6 +339,13 @@ struct FileColumn {
     before: ColumnMap,
     source: ColSource,
     edited: Vec<(usize, Option<String>)>,
+}
+
+/// What a file-backed `insert_column` hands back for `undo_insert_column`: the
+/// column map before the insertion and the length each in-memory row had.
+struct FileInsert {
+    before: ColumnMap,
+    edited: Vec<(usize, usize)>,
 }
 
 fn record_without(row: &StringRecord, col: usize) -> StringRecord {
@@ -736,11 +753,21 @@ impl Sheet for FileSheet {
         let before = (*self.columns).clone();
         let source = Arc::make_mut(&mut self.columns).remove(col);
         self.col_version += 1;
-        RemovedColumn::new(FileColumn {
-            before,
-            source,
-            edited,
-        })
+        let size = before.size_bytes()
+            + std::mem::size_of::<FileColumn>()
+            + edited.capacity() * std::mem::size_of::<(usize, Option<String>)>()
+            + edited
+                .iter()
+                .map(|(_, v)| v.as_ref().map_or(0, |s| s.capacity()))
+                .sum::<usize>();
+        RemovedColumn::new(
+            FileColumn {
+                before,
+                source,
+                edited,
+            },
+            size,
+        )
     }
 
     fn restore_column(&mut self, col: usize, removed: &RemovedColumn) {
@@ -768,9 +795,12 @@ impl Sheet for FileSheet {
         self.col_version += 1;
     }
 
-    fn insert_column(&mut self, col: usize, values_by_row: &[(usize, String)]) {
+    fn insert_column(&mut self, col: usize, values_by_row: &[(usize, String)]) -> InsertedColumn {
         let values: HashMap<usize, String> = values_by_row.iter().cloned().collect();
+        let before = (*self.columns).clone();
+        let mut edited = Vec::with_capacity(self.edited.len());
         for (id, row) in self.edited.iter_mut() {
+            edited.push((*id, row.len()));
             *row = Arc::new(record_with(
                 row,
                 col,
@@ -778,6 +808,47 @@ impl Sheet for FileSheet {
             ));
         }
         Arc::make_mut(&mut self.columns).insert(col, ColSource::Added(Arc::new(values)));
+        self.col_version += 1;
+        let size = before.size_bytes()
+            + std::mem::size_of::<FileInsert>()
+            + edited.capacity() * std::mem::size_of::<(usize, usize)>();
+        InsertedColumn::new(FileInsert { before, edited }, size)
+    }
+
+    fn undo_insert_column(&mut self, col: usize, inserted: &InsertedColumn) {
+        let Some(token) = inserted.payload::<FileInsert>() else {
+            return;
+        };
+        let remembered: HashMap<usize, usize> = token.edited.iter().copied().collect();
+        let ids: Vec<usize> = self.edited.keys().copied().collect();
+        for id in ids {
+            // A row that was in memory when the column went in remembers its
+            // old length. One copied in since (and returned to its earlier
+            // state by the undo stack) is a file row: its old length follows
+            // from the stored length and the map as it was.
+            let old_len = match remembered.get(&id) {
+                Some(&len) => Some(len),
+                None if id < self.index.len() => self
+                    .read_stored_row(id)
+                    .map(|stored| token.before.len.apply(stored.len())),
+                None => None,
+            };
+            let Some(row) = self.edited.get(&id) else {
+                continue;
+            };
+            let mut rebuilt = if col < row.len() {
+                record_without(row, col)
+            } else {
+                (**row).clone()
+            };
+            if let Some(len) = old_len {
+                rebuilt = rebuilt.iter().take(len).collect();
+            }
+            self.edited.insert(id, Arc::new(rebuilt));
+        }
+        // Under the undo-stack discipline the map is exactly as it was right
+        // after the insertion, so putting the old one back is the exact inverse.
+        self.columns = Arc::new(token.before.clone());
         self.col_version += 1;
     }
 
