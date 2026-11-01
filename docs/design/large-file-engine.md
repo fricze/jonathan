@@ -1,0 +1,541 @@
+# Design: large-file engine for Jonathan
+
+Status: proposal for review. Supersedes the step list in
+`docs/plans/file-backed-sheet.md` (that plan was written test-first but without
+budgets; see "What the existing code is and isn't").
+
+## 1. Requirements
+
+Jonathan is a CSV viewer/editor whose promise is *huge files, fast and
+responsive*, with *high-quality editing* (cells stay exact text; unedited
+bytes are saved untouched).
+
+**Envelope (D2 decided).** Required: files up to **10 GB** (~130M rows at
+~76 B/row) on a 16 GB / 4-core laptop with an SSD. Future size is unknown, so
+the design must degrade gracefully, not fall over, up to ~50 GB (~650M rows).
+Below ~256 MB the simple in-memory backend is fine and stays.
+
+What that means at 10 GB (131M rows), from the measurements in section 2:
+
+| Structure | Cost at 10 GB |
+|---|---|
+| Rows in memory as `StringRecord` (today's `MemorySheet`) | ~37 GB - impossible |
+| Dense row index (8 B/row), current `FileSheet` | 1.05 GB |
+| Order `Vec` after the first row insert/remove, current | +1.05 GB, ~100+ ms memmove per row edit |
+| **Sparse index (1 per 64 rows)** | **16 MB** |
+| **Piece table** | proportional to edits (KBs) |
+| Full index build, one thread, warm | ~19 s (progressive, cancellable) |
+| Lean full scan, one thread, warm | ~14 s; raw-buffer search ~1.3 s |
+| Filter result view if every row matches (4 B/row) | 524 MB |
+| Sort keys (16 B/row, transient) | 2.1 GB |
+| Cold-cache read of the file | ~4 s at 2.5 GB/s (NVMe), ~70 s at 150 MB/s (HDD) |
+
+**What the user must be able to do, and how it must feel:**
+
+| # | Interaction | Requirement |
+|---|---|---|
+| U1 | Open a file of any size | First screen of rows visible in < 300 ms. App stays interactive while the rest is indexed. Row count and a progress indicator update live. |
+| U2 | Scroll / jump anywhere in the indexed part | Every frame (16 ms) reads only the visible rows. Jumping to row N is instant. |
+| U3 | Type a filter | Typing never blocks. First matches appear < 100 ms; total grows live; typing another character cancels the previous scan. |
+| U4 | Sort by a column | Starts immediately, shows progress, cancellable, never freezes the UI. Numbers sort by value. |
+| U5 | Edit a cell, insert/delete a row or a column | Instant (< 1 ms) at any file size. Undo/redo instant. |
+| U6 | Save | Never loses data: a failure leaves the original intact. Progress shown. Unedited rows are byte-identical to the input. |
+| U7 | File changes on disk while open, or disk errors | Detected and shown to the user. Never silently shown as empty rows. |
+| U8 | Memory | Resident memory grows with *edits and views*, not with file size. |
+
+## 2. Measurements this design rests on
+
+One run each, release build, synthetic 227 MB / 3M rows / 76 B per row /
+8 fields (one quoted with a comma), data already in RAM (warm), 4 vCPU
+sandbox. Treat as order-of-magnitude, not benchmarks. Script:
+`docs/design/spike.rs` (kept outside the build).
+
+| Primitive | Result |
+|---|---|
+| Index scan with `csv_core` (single thread) | 544 MB/s = 0.14 us/row (10 GB ~ 19 s) |
+| Current `FileSheet` row read (new `csv::Reader` per row) | **19.2 us/row** |
+| Lean parse: one reused `csv_core` reader, no allocation | **0.11 us/row** (9M rows/s/thread) |
+| Whole-buffer substring search (`memchr::memmem`) | 7.6 GB/s (227 MB in 30 ms) |
+| `Vec<StringRecord>` in memory | **272 B/row = 3.7x the file text** |
+| Dense row index (current) | 8 B/row |
+
+**Measurement noise.** The cloud sandbox is a shared machine: the same
+index-build code measured 544, 365, 225, 172 and 101 MB/s across runs. The
+single-run numbers in this section are therefore best cases, good for orders
+of magnitude only. Timing tests take the best of several runs and scale their
+limits by a same-run calibration (`perf_scale`); the memory and I/O budgets
+are exact byte/call counts and carry no such noise.
+
+### 2.1 Second round: reads, scaling, sort, write
+
+4 GB / 55M rows synthetic file (same shape as above), 4 vCPU cloud sandbox,
+one run each. Source: `docs/design/spikes/`.
+
+| Question | Result |
+|---|---|
+| Sequential read + raw search, `pread`, warm | 64 KiB: 6.0 GB/s, 1 MiB: 5.6 GB/s, 8 MiB: 4.3 GB/s |
+| Same with `mmap`, warm | 7.8 GB/s |
+| Random 256-byte read, warm | `pread` **1.26 us**, `mmap` **0.11 us** |
+| Raw search scaling (1 / 2 / 4 threads) | 7.7 / 15.9 / 29.8 GB/s |
+| Row scan with `csv_core` (1 / 2 / 4 threads) | 10.1 / 20.9 / **45.1 M rows/s** (0.74 / 1.5 / 3.3 GB/s) |
+| Sort-key extraction, 1 thread | 8.2-9.7 M rows/s |
+| Sort 10.3M `(u64,u32)` keys | 0.5 s (1 thread), 0.2 s (4 threads) |
+| Sort 131M random keys, 4 threads | **2.7 s**, 2.1 GB of memory |
+| Re-serialise rows (parse + quote check + write), CPU only | **4.2 M rows/s** = 0.31 GB/s, 1 thread |
+| Raw copy of 4 GB to a new file | 0.15 GB/s - the sandbox disk, not the CPU |
+
+**Not valid (see `spikes/README.md`):** the "cold" read rows. The sandbox's
+`drop_caches`/`fadvise` did not evict (cold random reads cost the same as warm
+ones), so real cold-disk read throughput is **still unmeasured**, and so is
+real SSD write speed. Both are disk-bound and must be re-run on a laptop.
+Also unmeasured: parallel *index build* (needs quote-state speculation at
+chunk boundaries - the 45 M rows/s figure used chunks aligned by knowing the
+data has no newlines in quotes), sort tie-breaking cost when text prefixes
+collide, and a real 130M-row `sort` including extraction.
+
+What these numbers settle:
+* **`pread` over `mmap`.** `pread` is 8-10x slower per random access
+  (1.3 us vs 0.1 us) but that is 40x under the 50 us row budget, and it is
+  safe when the file is truncated or removed under us (mmap would crash the
+  app). Sequential `pread` at 64 KiB-1 MiB blocks is 5.6-6 GB/s, far above
+  any disk. Decision: positional reads, 1 MiB blocks; revisit only if
+  profiling shows the syscall cost.
+* **Scans scale almost linearly with threads** (4.5x on 4 for the row scan),
+  so filter/sort extraction should be parallel over chunks aligned at the
+  sparse-index samples, not left single-threaded.
+* **Sort is not the problem; extraction is.** 131M keys sort in 2.7 s; reading
+  and parsing the column is ~13 s on one thread, ~3-4 s on four. Estimated
+  10 GB sort: ~7-10 s warm, 2.1 GB transient.
+* **Save is disk-bound, not CPU-bound**, for the passthrough path
+  (`copy` at disk speed). Re-serialising every row (column edits) costs
+  ~31 s CPU for 131M rows on one thread and parallelises per piece.
+
+Consequences:
+* The current read path is ~170x slower than necessary. That is a design
+  flaw, not a tuning detail.
+* In-memory rows cost 3.7x the file: a 4 GB file cannot be opened on a 16 GB
+  machine with the current backend, and a 10 GB file is hopeless.
+* Searching raw bytes is ~70x faster than parsing rows. Filtering should
+  search the buffer, then verify only candidate rows.
+
+## 3. Budgets
+
+Derived from section 1 and 2. Each is enforced by a test (section 7).
+
+| Budget | Target | Why |
+|---|---|---|
+| Index memory | <= 0.25 B/row (sparse index, 1 sample per 64 rows) | 500M rows -> ~60 MB, vs 4 GB dense |
+| Row access (random) | <= 50 us (sample + <= 63 rows lean-parsed ~ 7 us) | U2 |
+| Visible window read (60 rows) | <= 1 ms, and *bytes read independent of file size* | U2 |
+| Index build | >= 300 MB/s warm (best observed 544, typical ~350); progressive; cancellable | U1 |
+| Filter, needle with no delimiter/quote | >= 3 GB/s single thread, >= 12 GB/s on 4 threads when warm (measured 7.7 / 29.8); cold: disk-bound | U3 |
+| Filter, general (parse) | >= 5M rows/s/thread, near-linear to 4 threads (measured 10 / 45 M) | U3 |
+| Sort, one column | end to end >= 2M rows/s/thread (observed 2.3-4.0), extraction parallel across threads; sort keys 16 B/row; cancellable (spike: 10M keys ~1.5 s single-thread, 131M keys sort 2.7 s) | U4 |
+| Cell/row/column edit, undo | O(1) or O(log edits); **zero file reads for column delete** | U5 |
+| Edit memory | proportional to number of edits | U8 |
+| Row cache | bounded by bytes (default 32 MB), not rows | U8 |
+| View (filter result) | 4 B per matching row | U8 |
+| Save | streaming; disk-bound for passthrough; re-serialise >= 2M rows/s/thread (measured 4.2); peak extra RAM O(1) | U6 |
+
+Steady-state RSS for a 500M-row file with no active filter: < 300 MB. With a
+filter matching every row it is ~2 GB (4 B/row view); acceptable for v1, and
+views could become run-length ranges later.
+
+## 4. Architecture
+
+```
+        UI (egui)  ── Sheet trait ──┬── MemorySheet  (small files, unchanged)
+                                    └── FileSheet
+                                          ├─ ByteSource  (positional reads; errors surfaced)
+                                          ├─ SparseIndex (1 offset / 64 rows, exact count)
+                                          ├─ PieceTable  (row order: file runs + inserted rows)
+                                          ├─ Overlay     (edited / inserted row contents)
+                                          ├─ ColumnMap   (logical column -> source)
+                                          └─ Scanner     (lean parser, memmem prefilter,
+                                                          cancellable, streaming results)
+```
+
+### 4.1 Sparse index
+Store the byte offset of every 64th row (plus exact row count and total
+length). Row `i` is found by taking the sample at `i/64`, then lean-parsing
+forward at most 63 rows with `csv_core`. Cost ~7 us; memory 0.125 B/row.
+Because it scans with the same `csv_core` state machine as parsing, boundaries
+always agree with the parser (property-tested; this part of the existing
+`RowIndex` is kept). The builder is streaming and chunk-size independent
+(also kept). What changes is *storage*: samples only, not every row.
+
+### 4.2 Row order: a piece table
+Today: a `Vec<usize>` of ids (8 B/row) built on the first insert/remove, with
+O(rows) insert/remove/position_of. Replace with the structure text editors
+use: an ordered list of *pieces*, each either a run of consecutive file rows
+`[a, b)` or one inserted/put-back row id. Deleting a row splits a run;
+inserting adds a piece. Memory is proportional to the number of edits;
+position -> id and id -> position are O(log pieces) (file rows keep their
+relative order, so a file id is located by binary search over runs).
+The piece table must also be **persistent** (copy-on-write path, O(log pieces)
+per edit, O(1) snapshot): an order-statistic tree whose nodes carry row
+counts. Off-the-shelf persistent vectors index by element, not by weight, so
+this is a custom structure; it is tested against the `Vec`-based `RefModel`.
+`removed: HashSet` disappears: a removed file row is simply in no piece.
+
+### 4.3 Overlay
+`edited: id -> Arc<StringRecord>`: copy-on-write rows, inserted rows and
+put-back rows. Memory ∝ edits. **Must be a persistent map** (structural
+sharing, e.g. an HAMT), not the `HashMap` it is today: today `snapshot()`
+clones the whole map, O(edits) per snapshot. See 4.9.
+
+### 4.4 Columns: a column map (D1 decided: short rows are padded)
+Today column edits are an operation log replayed on every read (measured:
+~0.24 us per row per logged operation, and `remove_column` scans the whole
+file to return undo values). Replace with a `ColumnMap`: a vector of
+`logical column -> Original(i) | Added(values by row id)`. Reading a cell is
+one lookup, O(1) regardless of how many columns were added/removed.
+Undo of a column delete must not read the file, so `remove_column` returns an
+opaque *token* (MemorySheet: the values, as today; FileSheet: the column's
+source, O(1)) and `restore_column(col, token)` puts it back.
+
+This needed a decision on ragged rows (D1), because the old contract clamped
+`insert_column` to each row's own length, which a column map cannot express.
+**Decided: a row shorter than the insertion column is treated as padded with
+empty fields**, so the new column lines up in every row; removing a column
+from a row that doesn't reach it is a no-op.
+
+**Padding is real, which the map has to know (found by testing it against a
+naive per-row model).** Inserting a column at 3 into a 0-field row leaves three
+empty fields behind even if that column is later removed. So a row's length
+depends on the order of operations and on its stored length `k`. The map keeps
+a small length function `f(k)` (a base plus a short list of breakpoints, since
+every operation grows the length by 0 or 1 when `k` grows by 1) next to the
+column list. Both stay as small as the widest column ever touched.
+
+**Undo token.** `remove_column` returns the map as it was before the removal
+(small, independent of file size), the removed column's source, and the removed
+column's value in each row that had been copied into memory. `restore_column`
+puts the old map back and reinserts the value into those in-memory rows; a row
+copied in after the removal (and returned to its earlier state by the undo
+stack) takes the value from the file. The contract: restore is an exact
+inverse **provided everything done since the removal has been undone in
+reverse order** (the app's undo stack), and never panics otherwise. Deleting a
+column on a file of any size reads nothing from it.
+
+### 4.5 Reading and scanning
+* One reusable `csv_core` reader and buffers per thread; no allocation per row.
+* Reads go through `ByteSource` in large blocks (>= 64 KB) with a small
+  block cache, not one `read_at` per row. Errors are returned, remembered on
+  the sheet, and surfaced to the UI (U7); they are never turned into `None`.
+* **Filter:** if the needle contains no delimiter, quote or newline, search
+  the raw buffer with `memmem` in large blocks; for each match, locate its
+  row (binary search of the sample table + forward scan) and verify that a
+  *field* contains it; deduplicate per row. Otherwise parse rows with the
+  lean parser. Results stream in batches of positions.
+* **Sort:** one pass extracting `(key, position)` for the sort column (number
+  as `f64`, text as the first 8 bytes, 16 B/row); sort; resolve prefix ties
+  by reading the cell. Cancellable between passes.
+* All scans take a `Cancel` token, check it per block, and emit progress.
+  The app already tags requests with an epoch; the token makes the *worker*
+  stop, not just its result be ignored.
+* Scans are single-threaded in v1; splitting by byte ranges at sample
+  boundaries is a later step once the single-thread numbers are validated.
+
+### 4.6 Save
+Stream the output to a temp file in the same directory, then atomically
+rename. Walk the piece table: untouched runs are copied as raw bytes (offset
+range from the sparse index), edited rows are serialised with the file's
+delimiter/quoting rules, inserted rows likewise. If the column map is not the
+identity every row is re-serialised (lean parse + write, ~1 us/row). Check
+free space first; on any error delete the temp file and keep the original.
+**Saving does not change the sheet (decided, implemented for the writer).** The
+sheet keeps its open handle on the file it indexed; the rename replaces the
+path, not the inode, so it goes on reading the old bytes. Row ids, the column
+map, rules, overlay and piece table are untouched, so **every undo entry,
+including column and replace-all tokens, stays valid across a save** with no
+rewriting. Rebasing onto the new file (flattening the piece table into an id
+map, folding rules in) was the earlier plan; it would have to rewrite every
+column/replace token (a deleted column's values are not in the new file), so it
+is left as an optional compaction for when the undo stack is empty or the file
+is reopened. Costs accepted: the old file stays on disk until the file is
+closed (a 5 GB file briefly takes ~10 GB), and the overlay/rules are not
+reclaimed at save (bounded by the edits, as before the save). External-change
+detection compares with the file as last written. `write_csv` is atomic
+(temp file in the same directory, `fsync`, rename); a row with no fields is
+written as one empty field because a blank line would vanish. Tested by
+`Op::Save` in the conformance suite (every random edit/undo sequence with saves
+interleaved, over a real file); overwriting in place makes it fail.
+Before overwriting, compare size and modification time with what was loaded;
+if changed, ask (reload / overwrite / Save As) (U7).
+
+### 4.7 Choosing a backend
+`open_sheet(path)` picks `MemorySheet` when the file is small
+(default < 256 MB *and* < 5% of available RAM), else `FileSheet`. A setting
+forces either. Both implement the same trait and the same conformance suite,
+so behaviour is identical.
+
+### 4.8 Concurrency and the app
+Workers receive `snapshot()`s (cheap `Arc` clones) and a `Cancel` token, and
+send batches (`View` chunks, progress) over the existing channel. The UI shows
+live counts. A new filter/sort request cancels the previous one. Index build
+runs the same way, so U1 holds.
+
+### 4.9 Undo/redo and history (D6 decided)
+
+**Decision: operation-based undo stays; the engine's structures become
+persistent so snapshots are O(1).** Whole-sheet versions as the undo mechanism
+were considered (undo = go back to an older immutable version) and rejected:
+
+| | Operation-based (kept) | Version-per-edit |
+|---|---|---|
+| Inverse logic per edit type | needed (6 variants today) | none |
+| Memory per cell edit | ~100 B | ~1 KB (tree path copy; estimate, not measured) |
+| Bulk edit (replace-all) | one `Batch` entry | one version, but needs a bulk/transient build mode |
+| UI needs ("Undo Eye color", jump to the cell) | carried in the entry | still needs a label + target stored beside each version |
+| Undo **across save** | works if ids are stable | **breaks**: a version refers to the old base file, which save replaced |
+| Crash-recovery journal | op log is directly serialisable | structures are not |
+
+What persistence buys regardless of the undo model: background filter/sort
+workers read a frozen, consistent version while the user keeps editing, at O(1)
+cost. That is why 4.2/4.3 require persistent structures. The column map is a
+small `Arc<Vec>` (clone-on-write, size ∝ columns), which is enough.
+
+**Requirement: undo and redo keep working across save** (Cmd+Z after Cmd+S).
+Operation entries refer to row ids and column ids, so both must be stable:
+column ids already are (`FileHeader.id`); row ids are kept stable by the id map
+in 4.6. An entry made before the save, e.g. "row deleted at position p",
+undoes after the save by inserting the row back as an inserted row, which
+makes the sheet dirty again, as it should. Dirty tracking stays relative to the
+save point (`mark_clean` records the stack depth), so undoing past the save
+point shows the sheet as modified.
+
+**History memory.** Entries are small, but a replace-all over millions of cells
+creates a `Batch` of millions of old values. Cap history by bytes (default
+256 MB); when exceeded, drop the oldest entries and tell the user once. A
+column delete stores an O(1) token (4.4), not per-row values.
+
+### 4.10 Bulk edits: a replace-all is a rule, not a million edits (implemented)
+
+**Problem (measured, 7.3).** Every edited row costs ~400 B in memory plus
+~180 B per changed cell in the undo stack. A replace-all that changes 10% of a
+62.5M-row file needs ~3.5 GB; one that touches every row ~35 GB and cannot
+work. Bulk edits are common on big files ("NULL" -> "" everywhere).
+
+**Design.** `Sheet::replace_all(rows, cols, find, replace)` returns the number
+of cells changed and an undo token. A memory-backed sheet applies it eagerly
+(its token holds the old values). A file-backed sheet stores it as a **rule**
+attached to the *source* columns of the column map (so it follows a column when
+columns are inserted, removed or restored) with a row scope: every row, or the
+sorted list of ids that were selected (8 B per row, not 580). Reading a field
+that comes from the file applies the rules that cover its source and row. Rows
+already held in memory are rewritten eagerly, and the token keeps their old
+records. Undo puts the previous column map back (rules are part of it) and the
+old records of those rows.
+
+* Memory for "replace in every row": a few hundred bytes, whatever the file.
+* The number of cells changed is found by one streaming scan.
+* Filter on a sheet with rules cannot search raw bytes (the visible text is
+  not in the file), so it parses every row (5-6M rows/s instead of 5 GB/s) -
+  the price of not materialising the edit.
+* Save streams through the same mapping, so a replace-all on a 10 GB file is
+  a streaming rewrite, not an in-memory edit.
+* Rules are applied per field read, in order. Many rules cost time per read; a
+  cap (and merging rules that name the same column) is a follow-up.
+
+## 5. Trait changes this implies
+
+* `remove_column` returns a token; add `restore_column` (or make insert accept
+  a token) so undo never needs per-row data from a file.
+* Scans become incremental: `filter`/`sort` take a `Cancel` and a sink for
+  batches (the current returning-a-Vec versions remain as helpers for tests).
+* Add `fn health(&self) -> Option<IoProblem>` so the UI can show disk errors.
+* `ByteSource::read_at` errors propagate to `health`.
+Scans additionally take a thread count / use the shared worker pool.
+Everything else (`cell`, `record`, `set_cell`, `insert_row`, `remove_row`,
+`position_of`, `next_row_id`, `snapshot`) is unchanged, so `app.rs` barely moves.
+
+## 6. Decisions needed
+
+* **D1 - ragged rows and column edits. DECIDED (padding).** Inserting at
+  column c inserts at c for every row, padding short rows with empty fields;
+  removing column c from a row shorter than c is a no-op. Gives O(1) column
+  edits with a column map. (The old behaviour clamped to each row's length.)
+* **D2 - envelope. DECIDED:** 5-10 GB required, larger possible later. The
+  sparse index and piece table are therefore in scope (see the table in
+  section 1).
+* **D6 - undo model. DECIDED:** operation-based undo, persistent engine
+  structures, stable row ids across save (4.9).
+* **D3 - backend threshold** (256 MB / 5% of RAM) and whether users get a
+  setting.
+* **D4 - sort on huge files.** Accept 16 B/row transient memory and a full
+  pass, or restrict sorting above a size?
+* **D5 - zero-field rows on save** (a row with every column removed). Write a
+  row of empty fields (`,,,`), or refuse the column delete?
+
+## 7. How each requirement is tested
+
+Correctness (exists): the `Sheet` conformance suite and the model-based
+property test against `RefModel` run against every backend; the row index is
+property-tested against the `csv` crate.
+
+Memory (new, deterministic): a test binary with a counting
+`#[global_allocator]`. Assertions are in bytes, so they are machine-independent:
+index of N rows allocates <= 0.25 B x N + c; a 1M-row sheet with 1k edits holds
+<= k x 1k; a filter view is 4 B x matches; the row cache never exceeds its byte
+cap. Compared across N = 100k and 1M to prove linear/flat growth.
+
+Undo (new): model-based - random edits, saves and undo/redo against the
+`MemorySheet` + `RefModel` pair; after any interleaving of edit, undo, redo
+and **save**, contents equal the model and the dirty flag equals "differs from
+the saved state". Snapshot cost: a counting allocator shows `snapshot()`
+allocates a constant number of bytes independent of the number of edits.
+Stable ids: after a save, `row_id`/`position_of` give the same ids for every
+surviving row, and an undo entry recorded before the save applies after it.
+
+Complexity (new, deterministic): an instrumented `ByteSource` counting calls
+and bytes. Assertions: reading a 60-row window reads <= X KB *and the same X
+for a 10x larger file*; column delete/restore performs 0 reads; a cell edit
+performs 0 writes; a no-match filter reads each byte exactly once; random row
+access reads <= 2 blocks.
+
+Performance (new, `--release --ignored`): generated files of 1M-100M rows
+with budgets from section 3, set at ~50% of measured numbers and scaled by a
+calibration (memmem/memcpy speed measured in the same run) so slow machines
+do not false-fail. Reported as a table; also run on demand for tuning.
+
+Usability (new, headless scenario tests with fault injection): typing a second
+filter cancels the first (the old worker stops within N blocks); the first
+result batch arrives before the scan completes; a `ByteSource` that errors
+mid-scan surfaces via `health` and does not drop rows silently; a file
+modified between open and save is detected; a writer failing at any byte
+leaves the original file byte-identical; free-space shortage is reported
+before writing.
+
+## 7.1 Test infrastructure (built)
+
+`crates/csv_model/tests/common/mod.rs`: counting allocator (per-thread, so
+the harness and parallel tests cannot disturb a measurement; whole-process
+variant for multi-threaded scans), `Instrumented` byte source (counts calls and
+bytes, injects read failures), deterministic CSV generator, `check_le` /
+`check_ge` (assert and print a table line), `best_secs`, `perf_scale`.
+`crates/csv_model/tests/budgets.rs`: the budgets. Plain tests always run
+(harness self-tests and budgets already met, as regression guards);
+`#[ignore = "pending: ..."]` are budgets the design requires and the code does
+not meet yet; `#[ignore = "perf: ..."]` are machine-speed guards. When a
+pending item lands, its `ignore` is removed in the same commit.
+`scripts/budgets.sh` runs everything in release mode and prints measured
+values against limits.
+
+Still to add, each together with the API it needs (cancellation tokens,
+progress, `health()`, save): usability scenarios - typing a second filter
+cancels the first, first results arrive before the scan ends, mid-scan I/O
+errors are reported, a failing writer leaves the original intact, an
+externally modified file is detected before save.
+
+## 7.2 Budget status
+
+Implemented so far: lean single-row parser (`lean.rs`, property-tested against
+the `csv` crate), 64 KiB block cache for random row access, 1 MiB scan windows
+for sequential scans, whole-window raw search with per-row verification for
+filter, arena-based sort-key extraction. Measured against the first red run
+(release, noisy sandbox):
+
+| Budget | Before | Now |
+|---|---|---|
+| 60-row window, read calls | 60 | 1 |
+| No-match filter, read calls | 100,000 | 8 |
+| Filter, rows are parsed | 0.026 M rows/s | 5.9 M rows/s |
+| Filter, raw search | 0.003 GB/s | 4.7 GB/s |
+| Sort, numeric column | 0.036 M rows/s | 2.3-4.0 M rows/s |
+| First touch, 60 rows x 8 cells | 1.7 ms | 0.19 ms |
+| Random row read | 27.5 us | 2.1 us |
+
+Column delete now reads 0 bytes of the file (column map + undo token, 4.4).
+
+Sparse index is built (1 sample per 64 rows): 0.084 B/row at 100k rows, 0.117 at
+500k (was 10.4 B/row), random row read 6.7 us, first touch 0.44 ms, parse
+filter ~4.5 M rows/s (the scanner hands out the fields it parsed while
+delimiting the row, so a row is parsed once).
+
+Still red (pending): persistent overlay (snapshot cost grows with edits).
+
+## 7.3 Undo-stack memory (measured on a 5 GB file)
+
+`scripts/big.sh` drives the app's real code paths (edit, replace-all, row and
+column operations, undo, redo) over a file-backed sheet on a 62.5M-row, 5 GB
+*virtual* file (`csv_model::testing::SyntheticSource`: rows are computed when
+read, so no disk is needed), next to the same scenarios on 1M rows. Memory is
+counted exactly by the test allocator. Release build, after the piece table and
+dropping unchanged rows (the first measurement is in the git history):
+
+| Operation | Undo stack | Process memory | Same at 1M and 62.5M rows? |
+|---|---|---|---|
+| Delete a column, nothing edited | 275 B | 0.9 KB | yes, identical |
+| Insert a column, nothing edited | 255 B | 0.4 KB | yes |
+| Single-cell edit | 117 B | 514 B (so ~400 B for the row copied in) | yes |
+| Replace-all over a filtered view of 5,000 cells | 13 B per cell | 21 B per cell (was 178 / 538) | yes |
+| **Replace-all over every row** (62.5M cells) | **2.7 MB** (the old text of the 10,000 rows already in memory) | **3 MB** (was ~35 GB, i.e. impossible) | yes, identical |
+| Delete a column with 15k rows in memory | 630 KB (42 B/row) | 0.3 MB | yes |
+| Delete a row | 341 B | **0** (was 498 MB the first time) | yes (20 deletes: 0.01 s, was 1.6 s) |
+| Insert a row | 103 B | ~0 | yes |
+| Index of the opened file | - | **537 MB** (8.59 B/row) *(measured before the sparse index; now ~0.1 B/row, ~7 MB for 5 GB - re-run `scripts/big.sh` to confirm)* | no - grows with the file |
+
+Memory the sheet holds for changes (`Sheet::edit_bytes`): 4.2 MB at the peak of
+15k edited rows, **144 B after undoing every edit** (was 13.5 MB before rows
+equal to the file were dropped).
+
+What this shows:
+
+* **The undo stack is bounded by the edits, not the file.** Every entry costs
+  exactly the same on a 5 GB file as on an 80 MB one.
+* **Structural edits no longer cost anything proportional to the file** (piece
+  table, 4.2).
+* **Edits cost ~400 B per edited row in memory, plus ~120 B of undo.** Fine for
+  edits typed by a person. Bulk edits are rules (4.10, implemented): a
+  replace-all costs memory in proportion to the rows already in memory, never
+  to the cells it changes, however large the file.
+* **The price of a rule is time, paid twice.** Finding out how many cells a
+  replace-all changes is one streaming pass over the rows it covers: 79 s for
+  all 62.5M rows here (about 30 s of that is the test file synthesising its own
+  bytes; a real 5 GB file will be bound by the disk). **This is now a
+  background job (4.8, built for replace-all):** `Sheet::plan_replace_all` runs
+  on a snapshot, reports rows done through a `JobControl`, and stops when
+  cancelled; the app shows a progress window with Cancel, and applying the plan
+  (`replace_all_planned`) reads nothing. Redo (`replace_all_again`) reuses the
+  count stored in the undo token, so it does not rescan either. A plan made
+  before the sheet changed is detected (change stamp) and ignored, so an edit
+  made while counting costs a second pass, never a wrong result. After that,
+  reads cost an extra substring search per covered field, and filter must parse
+  every row instead of searching raw bytes (5-6M rows/s instead of GB/s).
+* **The dense index** was 537 MB for 5 GB; the sparse index brings it to
+  ~16 MB or less (budget met in `budgets.rs`).
+* The test takes ~90 s end to end, mostly indexing and synthesising 5 GB.
+
+Sizes reported by `UndoEntry::approx_bytes` and by tokens are checked against
+the allocator in `crates/csv_model/tests/budgets.rs`.
+
+## 8. Plan
+
+1. **Spikes** - DONE for pread vs mmap, parallel scaling, sort, CPU cost of
+   re-serialise (section 2.1). STILL OPEN, needs a real laptop: cold-cache read
+   and real write throughput; parallel index build; text-prefix tie cost.
+   Run `docs/design/spikes`.
+2. **Decide D1-D5.**
+3. **Test infrastructure first:** counting allocator, instrumented source,
+   file generator, perf harness with the budgets above (all failing).
+4. **Build to make them pass, in this order:** lean reader + block reads;
+   sparse index; persistent piece table (order-statistic tree) and persistent
+   overlay map; id map for stable ids across save; column map + tokens; scanner (filter, sort,
+   cancel, progress); `health`; save; real file `ByteSource`; app wiring
+   with progress UI and the backend threshold.
+5. **Wire into the app behind a setting**, dogfood on real large files, then
+   make it the default above the threshold.
+
+## 9. What the existing code is and isn't
+
+Kept, because it is the correctness specification and is independent of the
+storage design: the `Sheet` trait, `MemorySheet`, `conformance.rs` (scenarios,
+`RefModel`, model-based test), the load/lossy/ragged-row handling, the row
+index's boundary logic and its property tests, delimiter/header sniffing.
+
+Replaced: `FileSheet`'s read path (19 us/row), the dense index, the order
+`Vec` + `removed` set, the column operation log, the row-count cache, and the
+naive filter/sort. The steps 2-5 `FileSheet` is a **correctness prototype**
+whose performance model was never checked; its tests carry over unchanged and
+become the safety net for the rewrite.

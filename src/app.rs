@@ -2,11 +2,12 @@ use csv::StringRecord;
 use egui::Key;
 use egui_dock::{DockArea, Style};
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread;
 
-use csv_model::{edit_record, filter_indices, open_csv_file, sort_indices, write_csv};
-use crate::menu::OPEN_FILE_ID;
-use crate::types::{
+use csv_model::{InsertedColumn, JobControl, ReplacePlan, LoadStats, MemorySheet, RemovedColumn, ReplacedAll, RowScope, open_csv_file, read_rows, write_csv};
+use crate::menu::{COPY_AS_CSV_ID, OPEN_FILE_ID};
+use crate::types::{ReplaceDone, ReplaceJob, ReplaceRedo, ReplaceSpec, 
     ColumnId, CsvTabViewer, FileHeader, InsertPosition, MyApp, ReplaceScope, SendUiMessage, SheetTab,
     SortOrder, TabId, UiMessage, UndoEntry, View, SheetRow, active_sheet_data, column_position,
 };
@@ -14,6 +15,16 @@ use crate::ui::drop::preview_files_being_dropped;
 
 #[cfg(target_os = "macos")]
 use muda::MenuEvent;
+
+/// How a replace-all gets its numbers.
+enum ReplaceHow<'a> {
+    /// Work everything out now.
+    Fresh,
+    /// Use a plan made in the background.
+    Planned(&'a ReplacePlan),
+    /// A redo: the token of the undone replace-all remembers the count.
+    Again(&'a ReplacedAll),
+}
 
 /// Outcome of a successful `apply_undo`/`apply_redo`, enough to describe the
 /// change in a toast: which row/column, what it had, what it's now. `row` is
@@ -61,6 +72,22 @@ fn undo_redo_toast(action: &str, result: &UndoRedoResult) -> (String, String) {
 }
 
 /// Bump the request epoch for a (filename, tab_id) key and return the new value.
+/// What to tell the user when loading had to alter or skip rows. Saving
+/// writes the replacement characters back, so lossy rows are worth a warning.
+fn load_warning(stats: &LoadStats) -> Option<String> {
+    let mut parts = Vec::new();
+    if stats.lossy_rows > 0 {
+        parts.push(format!(
+            "{} row(s) are not valid UTF-8; bad bytes are shown as replacement characters and will be replaced on save",
+            stats.lossy_rows
+        ));
+    }
+    if stats.skipped_rows > 0 {
+        parts.push(format!("{} row(s) could not be read and were skipped", stats.skipped_rows));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
 fn bump_epoch(epochs: &mut std::collections::HashMap<(String, usize), u64>, key: (String, usize)) -> u64 {
     let entry = epochs.entry(key).or_insert(0);
     *entry += 1;
@@ -74,11 +101,9 @@ impl MyApp {
     /// recorded).
     fn read_cell(&self, filename: &str, master_row: usize, col_id: ColumnId) -> Option<String> {
         let position = self.column_position(filename, col_id)?;
-        self.sheets_data
-            .get(filename)
-            .and_then(|sheet| sheet.iter().find(|(idx, _)| *idx == master_row))
-            .and_then(|(_, record)| record.get(position))
-            .map(|s| s.to_string())
+        let sheet = self.sheets_data.get(filename)?;
+        let row_position = sheet.position_of(master_row)?;
+        sheet.cell(row_position, position).map(|v| v.into_owned())
     }
 
     /// Resolve a column_id to its current display position in `filename`'s
@@ -119,7 +144,7 @@ impl MyApp {
             return;
         };
         if let Some(sheet) = self.sheets_data.get_mut(filename) {
-            edit_record(sheet, master_row, position, value);
+            sheet.set_cell(master_row, position, value);
         }
     }
 
@@ -131,7 +156,7 @@ impl MyApp {
             Some(view) => *view.get(row_nr as usize)? as usize,
             None => row_nr as usize,
         };
-        master.get(position).map(|(id, _)| *id)
+        master.row_id(position)
     }
 
     /// Drop in-flight sort/filter results for `filename`: they were computed
@@ -149,10 +174,7 @@ impl MyApp {
     fn remove_master_row(&mut self, filename: &str, position: usize) -> Option<SheetRow> {
         let row = {
             let sheet = self.sheets_data.get_mut(filename)?;
-            if position >= sheet.len() {
-                return None;
-            }
-            sheet.remove(position)
+            sheet.remove_row(position)?
         };
         self.invalidate_pending_views(filename);
         let p = position as u32;
@@ -170,7 +192,7 @@ impl MyApp {
     fn insert_master_row(&mut self, filename: &str, position: usize, row: SheetRow) -> Option<()> {
         let sheet = self.sheets_data.get_mut(filename)?;
         let position = position.min(sheet.len());
-        sheet.insert(position, row);
+        sheet.insert_row(position, row);
         self.invalidate_pending_views(filename);
         let p = position as u32;
         for ((fname, _), view) in self.filtered_data.iter_mut() {
@@ -236,7 +258,7 @@ impl MyApp {
                 Some((reverse, result))
             }
             UndoEntry::RowInsert { filename, master_row } => {
-                let position = self.sheets_data.get(&filename)?.iter().position(|(idx, _)| *idx == master_row)?;
+                let position = self.sheets_data.get(&filename)?.position_of(master_row)?;
                 let record = self.remove_master_row(&filename, position)?;
                 let reverse = UndoEntry::RowDelete { filename, master_row, position, record };
                 let result = UndoRedoResult {
@@ -247,11 +269,11 @@ impl MyApp {
                 };
                 Some((reverse, result))
             }
-            UndoEntry::ColumnDelete { filename, position, header, values_by_row } => {
+            UndoEntry::ColumnDelete { filename, position, header, removed } => {
                 let column_id = header.id;
                 let name = header.name.clone();
-                self.insert_column_at(&filename, position, header, &values_by_row);
-                let reverse = UndoEntry::ColumnInsert { filename, column_id };
+                self.restore_column_at(&filename, position, header, &removed);
+                let reverse = UndoEntry::ColumnRemove { filename, column_id };
                 let result = UndoRedoResult {
                     row: None,
                     column: Some(name),
@@ -260,14 +282,14 @@ impl MyApp {
                 };
                 Some((reverse, result))
             }
-            UndoEntry::ColumnInsert { filename, column_id } => {
+            UndoEntry::ColumnRemove { filename, column_id } => {
                 let headers = self.tree.iter_all_tabs().find_map(|(_, tab)| tab.columns.get(&filename).cloned())?;
                 let position = column_position(&headers, column_id)?;
                 let header = headers[position].clone();
                 let name = header.name.clone();
 
-                let values_by_row = self.remove_column_at(&filename, position, column_id);
-                let reverse = UndoEntry::ColumnDelete { filename, position, header, values_by_row };
+                let removed = self.remove_column_at(&filename, position, column_id)?;
+                let reverse = UndoEntry::ColumnDelete { filename, position, header, removed };
                 let result = UndoRedoResult {
                     row: None,
                     column: Some(name),
@@ -275,6 +297,58 @@ impl MyApp {
                     overwritten: "(column removed)".to_string(),
                 };
                 Some((reverse, result))
+            }
+            UndoEntry::ColumnUninsert { filename, column_id, inserted } => {
+                let headers = self.tree.iter_all_tabs().find_map(|(_, tab)| tab.columns.get(&filename).cloned())?;
+                let position = column_position(&headers, column_id)?;
+                let header = headers[position].clone();
+                let name = header.name.clone();
+
+                self.uninsert_column_at(&filename, position, column_id, &inserted)?;
+                let reverse = UndoEntry::ColumnAdd { filename, position, header };
+                let result = UndoRedoResult {
+                    row: None,
+                    column: Some(name),
+                    restored: "(deleted)".to_string(),
+                    overwritten: "(column removed)".to_string(),
+                };
+                Some((reverse, result))
+            }
+            UndoEntry::ColumnAdd { filename, position, header } => {
+                let column_id = header.id;
+                let name = header.name.clone();
+                let inserted = self.insert_column_at(&filename, position, header)?;
+                let reverse = UndoEntry::ColumnUninsert { filename, column_id, inserted };
+                let result = UndoRedoResult {
+                    row: None,
+                    column: Some(name),
+                    restored: "(column restored)".to_string(),
+                    overwritten: "(deleted)".to_string(),
+                };
+                Some((reverse, result))
+            }
+            UndoEntry::ReplaceAll(done) => {
+                let ReplaceDone { spec, changed, token } = *done;
+                self.sheets_data.get_mut(&spec.filename)?.undo_replace_all(&token);
+                let result = UndoRedoResult {
+                    row: None,
+                    column: None,
+                    restored: format!("{changed} cell{}", if changed == 1 { "" } else { "s" }),
+                    overwritten: "".to_string(),
+                };
+                Some((UndoEntry::ReplaceAgain(Box::new(ReplaceRedo { spec, token })), result))
+            }
+            UndoEntry::ReplaceAgain(redo) => {
+                let ReplaceRedo { spec, token: old } = *redo;
+                let (changed, token) = self.run_replace_all(&spec, ReplaceHow::Again(&old))?;
+                let result = UndoRedoResult {
+                    row: None,
+                    column: None,
+                    restored: format!("{changed} cell{}", if changed == 1 { "" } else { "s" }),
+                    overwritten: "".to_string(),
+                };
+                let done = ReplaceDone { spec, changed, token };
+                Some((UndoEntry::ReplaceAll(Box::new(done)), result))
             }
             UndoEntry::Batch(entries) => {
                 let count = entries.len();
@@ -298,6 +372,25 @@ impl MyApp {
                 Some((reverse, result))
             }
         }
+    }
+
+    /// Set one cell, recording the old value for undo. `row_nr` is an index
+    /// into the currently displayed (filtered/sorted) view; it is resolved to
+    /// a stable master row first and the write always goes through to master
+    /// (the filtered view is just a cache). Returns whether a cell changed.
+    fn apply_edit_cell(&mut self, filename: &str, tab_id: TabId, row_nr: u64, col_id: ColumnId, new_value: &str) -> bool {
+        let Some(master_row) = self.master_row_at(filename, tab_id, row_nr) else {
+            return false;
+        };
+        let Some(old_value) = self.read_cell(filename, master_row, col_id) else {
+            return false;
+        };
+        self.write_cell(filename, master_row, col_id, new_value);
+        self.push_undo(
+            filename,
+            UndoEntry::CellEdit { filename: filename.to_string(), master_row, col_id, old_value },
+        );
+        true
     }
 
     /// Write a pasted grid into master starting at (anchor_row, anchor_col_id)
@@ -365,12 +458,27 @@ impl MyApp {
         pasted_count
     }
 
-    /// Replace every occurrence of `find` with `replace` across the rows
-    /// currently displayed for (filename, tab_id) -- the filtered/sorted view
-    /// if one exists, otherwise all of master -- within `scope`. Empty `find`
-    /// matches nothing (avoids replacing every cell boundary). Pushes one
-    /// UndoEntry::Batch covering every changed cell, so the whole replace
-    /// undoes/redoes as a single action. Returns the count of cells changed.
+    /// What a replace-all in this tab covers: the rows its filtered view shows
+    /// (as stable ids) or every row, and the columns by stable id.
+    fn replace_spec(&self, filename: &str, tab_id: TabId, find: &str, replace: &str, scope: ReplaceScope) -> ReplaceSpec {
+        let rows: Option<Arc<Vec<usize>>> = match (self.sheets_data.get(filename), self.filtered_data.get(&(filename.to_string(), tab_id))) {
+            (Some(sheet), Some(view)) => Some(Arc::new(view.iter().filter_map(|&p| sheet.row_id(p as usize)).collect())),
+            _ => None,
+        };
+        let col_ids: Vec<ColumnId> = match scope {
+            ReplaceScope::CurrentColumn(col_id) => vec![col_id],
+            ReplaceScope::AllColumns => self
+                .tree
+                .iter_all_tabs()
+                .find_map(|(_, tab)| tab.columns.get(filename))
+                .map_or(vec![], |headers| headers.iter().map(|h| h.id).collect()),
+        };
+        ReplaceSpec { filename: filename.to_string(), rows, col_ids, find: find.to_string(), replace: replace.to_string() }
+    }
+
+    /// Replace now, on this thread (reads the whole file if the sheet must).
+    /// The app itself goes through `start_replace_all`; this is for callers
+    /// that can wait.
     fn apply_replace_all(
         &mut self,
         filename: &str,
@@ -382,58 +490,131 @@ impl MyApp {
         if find.is_empty() {
             return 0;
         }
+        let spec = self.replace_spec(filename, tab_id, find, replace, scope);
+        self.finish_replace_all(spec, None)
+    }
 
-        let master_rows: Vec<usize> = match (
-            self.sheets_data.get(filename),
-            self.filtered_data.get(&(filename.to_string(), tab_id)),
-        ) {
-            (Some(master), Some(view)) => view.iter().map(|&i| master[i as usize].0).collect(),
-            (Some(master), None) => master.iter().map(|(idx, _)| *idx).collect(),
-            _ => vec![],
+    /// Do the replace-all and put it on the undo stack. With a plan from a
+    /// background count the file is not read again.
+    fn finish_replace_all(&mut self, spec: ReplaceSpec, plan: Option<&ReplacePlan>) -> usize {
+        let how = plan.map_or(ReplaceHow::Fresh, ReplaceHow::Planned);
+        let Some((changed, token)) = self.run_replace_all(&spec, how) else {
+            return 0;
         };
+        if changed > 0 {
+            let filename = spec.filename.clone();
+            self.push_undo(&filename, UndoEntry::ReplaceAll(Box::new(ReplaceDone { spec, changed, token })));
+        }
+        changed
+    }
 
-        let all_col_ids: Vec<ColumnId> = self
-            .tree
-            .iter_all_tabs()
-            .find_map(|(_, tab)| tab.columns.get(filename))
-            .map_or(vec![], |headers| headers.iter().map(|h| h.id).collect());
-
-        let col_ids: Vec<ColumnId> = match scope {
-            ReplaceScope::CurrentColumn(col_id) => vec![col_id],
-            ReplaceScope::AllColumns => all_col_ids,
+    /// Replace-all in the background: count on a snapshot (progress, cancel),
+    /// then `ReplacePlanned` brings the plan back and the change is made in an
+    /// instant. At most one per file.
+    fn start_replace_all(
+        &mut self,
+        ctx: &egui::Context,
+        filename: &str,
+        tab_id: TabId,
+        find: &str,
+        replace: &str,
+        scope: ReplaceScope,
+    ) {
+        if find.is_empty() {
+            return;
+        }
+        if self.replace_jobs.contains_key(filename) {
+            crate::toast::show(ctx, "A replace is already running on this file");
+            return;
+        }
+        let Some(sheet) = self.sheets_data.get(filename) else {
+            return;
         };
+        let spec = self.replace_spec(filename, tab_id, find, replace, scope);
+        let positions: Vec<usize> = spec.col_ids.iter().filter_map(|&id| self.column_position(filename, id)).collect();
+        let snapshot = sheet.snapshot();
+        let id = self.next_job_id;
+        self.next_job_id += 1;
+        let control = JobControl::new();
+        self.replace_jobs.insert(filename.to_string(), ReplaceJob { id, spec: spec.clone(), control: control.clone() });
+        let chan = self.worker_chan.0.clone();
+        let ctx = ctx.clone();
+        thread::spawn(move || {
+            let scope = match spec.rows.as_deref() {
+                Some(ids) => RowScope::Ids(ids),
+                None => RowScope::All,
+            };
+            let plan = snapshot.plan_replace_all(scope, &positions, &spec.find, &spec.replace, &control);
+            chan.send_msg(UiMessage::ReplacePlanned(spec.filename.clone(), id, plan));
+            ctx.request_repaint();
+        });
+    }
 
-        let mut batch: Vec<UndoEntry> = Vec::new();
-
-        for master_row in master_rows {
-            for &col_id in &col_ids {
-                let Some(old_value) = self.read_cell(filename, master_row, col_id) else {
-                    continue;
-                };
-                if !old_value.contains(find) {
-                    continue;
-                }
-                let new_value = old_value.replace(find, replace);
-                if new_value == old_value {
-                    continue;
-                }
-
-                batch.push(UndoEntry::CellEdit {
-                    filename: filename.to_string(),
-                    master_row,
-                    col_id,
-                    old_value,
+    /// A small window per running replace-all with its progress and a Cancel button.
+    fn show_replace_progress(&mut self, ctx: &egui::Context) {
+        if self.replace_jobs.is_empty() {
+            return;
+        }
+        let mut cancel: Vec<String> = vec![];
+        for (filename, job) in &self.replace_jobs {
+            let (done, total) = job.control.progress();
+            let fraction = if total == 0 { 0.0 } else { (done as f32 / total as f32).min(1.0) };
+            egui::Window::new(format!("Replacing in {filename}"))
+                .id(egui::Id::new(("replace-progress", job.id)))
+                .collapsible(false)
+                .resizable(false)
+                .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+                .show(ctx, |ui| {
+                    ui.label(format!("\"{}\" -> \"{}\"", job.spec.find, job.spec.replace));
+                    ui.add(egui::ProgressBar::new(fraction).show_percentage());
+                    ui.label(format!("{done} of {total} rows"));
+                    if ui.button("Cancel").clicked() {
+                        cancel.push(filename.clone());
+                    }
                 });
-                self.write_cell(filename, master_row, col_id, &new_value);
+        }
+        for filename in cancel {
+            if let Some(job) = self.replace_jobs.get(&filename) {
+                job.control.cancel();
             }
         }
+        // Progress is read from another thread, so keep drawing until it is done.
+        ctx.request_repaint_after(std::time::Duration::from_millis(100));
+    }
 
-        let changed_count = batch.len();
-        if changed_count > 0 {
-            self.push_undo(filename, UndoEntry::Batch(batch));
+    /// A background count came back: make the change, or drop a cancelled job.
+    fn replace_planned(&mut self, ctx: &egui::Context, filename: &str, job_id: u64, plan: Option<ReplacePlan>) {
+        if self.replace_jobs.get(filename).is_none_or(|j| j.id != job_id) {
+            return;
         }
+        let Some(job) = self.replace_jobs.remove(filename) else {
+            return;
+        };
+        match plan {
+            None => crate::toast::show(ctx, "Replace cancelled"),
+            Some(plan) => {
+                let changed = self.finish_replace_all(job.spec, Some(&plan));
+                let plural = if changed == 1 { "" } else { "s" };
+                crate::toast::show(ctx, format!("Replaced in {changed} cell{plural}"));
+            }
+        }
+    }
 
-        changed_count
+    /// Ask the sheet to replace `find` by `replace` in the columns with these
+    /// ids (those still present) of these rows (None = all). The sheet decides
+    /// how: edit every cell, or remember a rule.
+    fn run_replace_all(&mut self, spec: &ReplaceSpec, how: ReplaceHow<'_>) -> Option<(usize, ReplacedAll)> {
+        let positions: Vec<usize> = spec.col_ids.iter().filter_map(|&id| self.column_position(&spec.filename, id)).collect();
+        let scope = match spec.rows.as_deref() {
+            Some(ids) => RowScope::Ids(ids),
+            None => RowScope::All,
+        };
+        let sheet = self.sheets_data.get_mut(&spec.filename)?;
+        Some(match how {
+            ReplaceHow::Fresh => sheet.replace_all(scope, &positions, &spec.find, &spec.replace),
+            ReplaceHow::Planned(plan) => sheet.replace_all_planned(scope, &positions, &spec.find, &spec.replace, plan),
+            ReplaceHow::Again(old) => sheet.replace_all_again(scope, &positions, &spec.find, &spec.replace, old),
+        })
     }
 
     /// Delete the row at `row_nr` in the currently displayed view for
@@ -445,11 +626,7 @@ impl MyApp {
         let Some(master_row) = self.master_row_at(filename, tab_id, row_nr) else {
             return false;
         };
-        let Some(position) = self
-            .sheets_data
-            .get(filename)
-            .and_then(|sheet| sheet.iter().position(|(idx, _)| *idx == master_row))
-        else {
+        let Some(position) = self.sheets_data.get(filename).and_then(|sheet| sheet.position_of(master_row)) else {
             return false;
         };
         let Some(record) = self.remove_master_row(filename, position) else {
@@ -510,59 +687,57 @@ impl MyApp {
         Some(master_row)
     }
 
-    /// Remove the field at `position` from every row's StringRecord in
-    /// master and every filtered/sorted view of `filename` (O(rows)), and
-    /// remove `header_id`'s FileHeader from every open tab's columns Vec for
-    /// that file. Returns each row's value at that position before removal
-    /// (keyed by master_row), for undo to restore.
-    fn remove_column_at(&mut self, filename: &str, position: usize, header_id: ColumnId) -> Vec<(usize, String)> {
-        let values_by_row: Vec<(usize, String)> = self
-            .sheets_data
-            .get(filename)
-            .map(|sheet| {
-                sheet
-                    .iter()
-                    .filter_map(|(idx, record)| record.get(position).map(|v| (*idx, v.to_string())))
-                    .collect()
-            })
-            .unwrap_or_default();
-
-        if let Some(sheet) = self.sheets_data.get_mut(filename) {
-            for (_, record) in sheet.iter_mut() {
-                *record = record.iter().enumerate().filter(|(i, _)| *i != position).map(|(_, f)| f).collect();
-            }
-        }
+    /// Remove the field at `position` from every row of `filename` and
+    /// `header_id`'s FileHeader from every open tab's columns Vec for that
+    /// file. Returns what the sheet needs to put the column back (see
+    /// `restore_column_at`), or `None` if the file isn't loaded.
+    fn remove_column_at(&mut self, filename: &str, position: usize, header_id: ColumnId) -> Option<RemovedColumn> {
+        let removed = self.sheets_data.get_mut(filename)?.remove_column(position);
         for tab in self.tree.iter_all_tabs_mut() {
             if let Some(headers) = tab.1.columns.get_mut(filename) {
                 headers.retain(|h| h.id != header_id);
             }
         }
-
-        values_by_row
+        Some(removed)
     }
 
-    /// Insert `header` at `position` into every open tab's columns Vec for
-    /// `filename`, and insert a field into every row's StringRecord in
-    /// master and every filtered/sorted view at that position -- taken from
-    /// `values_by_row` where a value exists (keyed by master_row), empty
-    /// otherwise. Inverse of `remove_column_at`.
-    fn insert_column_at(
+    /// Put `header` back at `position` in every open tab's columns Vec for
+    /// `filename` and hand `removed` back to the sheet. Exact inverse of
+    /// `remove_column_at`.
+    fn restore_column_at(&mut self, filename: &str, position: usize, header: FileHeader, removed: &RemovedColumn) {
+        if let Some(sheet) = self.sheets_data.get_mut(filename) {
+            sheet.restore_column(position, removed);
+        }
+        self.insert_header_at(filename, position, header);
+    }
+
+    /// Insert a new, empty column named by `header` at `position`. The
+    /// returned record of what the sheet changed lets `uninsert_column_at`
+    /// undo it exactly; `None` if the file isn't loaded.
+    fn insert_column_at(&mut self, filename: &str, position: usize, header: FileHeader) -> Option<InsertedColumn> {
+        let inserted = self.sheets_data.get_mut(filename)?.insert_column(position, &[]);
+        self.insert_header_at(filename, position, header);
+        Some(inserted)
+    }
+
+    /// Exact inverse of `insert_column_at`.
+    fn uninsert_column_at(
         &mut self,
         filename: &str,
         position: usize,
-        header: FileHeader,
-        values_by_row: &[(usize, String)],
-    ) {
-        let values: std::collections::HashMap<usize, &str> =
-            values_by_row.iter().map(|(idx, v)| (*idx, v.as_str())).collect();
-
-        if let Some(sheet) = self.sheets_data.get_mut(filename) {
-            for (idx, record) in sheet.iter_mut() {
-                let mut fields: Vec<&str> = record.iter().collect();
-                fields.insert(position.min(fields.len()), values.get(idx).copied().unwrap_or(""));
-                *record = fields.into_iter().collect();
+        header_id: ColumnId,
+        inserted: &InsertedColumn,
+    ) -> Option<()> {
+        self.sheets_data.get_mut(filename)?.undo_insert_column(position, inserted);
+        for tab in self.tree.iter_all_tabs_mut() {
+            if let Some(headers) = tab.1.columns.get_mut(filename) {
+                headers.retain(|h| h.id != header_id);
             }
         }
+        Some(())
+    }
+
+    fn insert_header_at(&mut self, filename: &str, position: usize, header: FileHeader) {
         for tab in self.tree.iter_all_tabs_mut() {
             if let Some(headers) = tab.1.columns.get_mut(filename) {
                 let insert_at = position.min(headers.len());
@@ -589,11 +764,13 @@ impl MyApp {
         };
         let header = headers[position].clone();
 
-        let values_by_row = self.remove_column_at(filename, position, column_id);
+        let Some(removed) = self.remove_column_at(filename, position, column_id) else {
+            return false;
+        };
 
         self.push_undo(
             filename,
-            UndoEntry::ColumnDelete { filename: filename.to_string(), position, header, values_by_row },
+            UndoEntry::ColumnDelete { filename: filename.to_string(), position, header, removed },
         );
         true
     }
@@ -619,9 +796,12 @@ impl MyApp {
         self.next_col_id.insert(filename.to_string(), column_id + 1);
 
         let header = FileHeader { id: column_id, name: name.to_string(), visible: true, sort: None };
-        self.insert_column_at(filename, position, header, &[]);
+        let inserted = self.insert_column_at(filename, position, header)?;
 
-        self.push_undo(filename, UndoEntry::ColumnInsert { filename: filename.to_string(), column_id });
+        self.push_undo(
+            filename,
+            UndoEntry::ColumnUninsert { filename: filename.to_string(), column_id, inserted },
+        );
         Some(column_id)
     }
 }
@@ -642,7 +822,8 @@ impl MyApp {
 
         self.files_list.push(file_name.clone());
 
-        let (mut reader, headers) = open_csv_file(&file_name);
+        let (mut reader, headers, format) = open_csv_file(&file_name);
+        self.csv_formats.insert(file_name.clone(), format);
 
         let next_col_id = headers.iter().map(|h| h.id).max().map_or(0, |m| m + 1);
         self.next_col_id.insert(file_name.clone(), next_col_id);
@@ -668,13 +849,13 @@ impl MyApp {
         let ctx = ctx.clone();
 
         thread::spawn(move || {
-            let master_data = reader
-                .records()
-                .filter_map(|record| record.ok())
-                .enumerate()
-                .collect::<Vec<_>>();
+            let (master_data, stats) = read_rows(&mut reader);
 
-            chan.send_msg(UiMessage::SetMaster(master_data, file_name.clone()));
+            if let Some(warning) = load_warning(&stats) {
+                crate::toast::show(&ctx, warning);
+            }
+
+            chan.send_msg(UiMessage::SetMaster(Box::new(MemorySheet::new(master_data)), file_name.clone()));
 
             ctx.request_repaint();
         });
@@ -707,15 +888,15 @@ impl MyApp {
                         Some(v) => v.clone(),
                         None => (0..rows.len() as u32).collect(),
                     };
-                    // ponytail: clones master for the worker thread; Arc'd master if this shows up in profiles
-                    let master_clone = self.sheets_data[&filename].clone();
+                    // ponytail: a snapshot copies the rows for the in-memory backend; a lazy backend shares its file
+                    let snapshot = self.sheets_data[&filename].snapshot();
                     let chan = chan.clone();
                     let ctx = ctx.clone();
                     let filename = filename.clone();
                     let epoch = bump_epoch(&mut self.request_epoch, (filename.clone(), tab_id));
 
                     thread::spawn(move || {
-                        let sorted = sort_indices(&master_clone, view, sort_order);
+                        let sorted = snapshot.sort(view, sort_order);
 
                         chan.send_msg(UiMessage::SetDisplayData(sorted, filename, tab_id, epoch));
 
@@ -741,14 +922,14 @@ impl MyApp {
 
             if sheet_tab.id == tab_id {
                 if let Some(master_data) = self.sheets_data.get(&filename) {
-                    let master_clone = master_data.clone();
+                    let snapshot = master_data.snapshot();
                     let chan = chan.clone();
                     let ctx = ctx.clone();
                     let filename = filename.clone();
                     let epoch = bump_epoch(&mut self.request_epoch, (filename.clone(), tab_id));
 
                     thread::spawn(move || {
-                        let filtered = filter_indices(&master_clone, &filter);
+                        let filtered = snapshot.filter(&filter);
 
                         chan.send_msg(UiMessage::SetDisplayData(filtered, filename, tab_id, epoch));
 
@@ -773,7 +954,10 @@ impl MyApp {
         // Handle macOS menu events
         #[cfg(target_os = "macos")]
         if let Ok(event) = MenuEvent::receiver().try_recv() {
-            if event.id.as_ref() == OPEN_FILE_ID {
+            if event.id.as_ref() == COPY_AS_CSV_ID {
+                crate::menu::request_copy_as_csv();
+                ctx.request_repaint();
+            } else if event.id.as_ref() == OPEN_FILE_ID {
                 if let Some(path) = rfd::FileDialog::new()
                     .add_filter("CSV", &["csv"])
                     .pick_file()
@@ -798,7 +982,7 @@ impl MyApp {
         while let Ok(message) = self.worker_chan.1.try_recv() {
             match message {
                 UiMessage::SetMaster(master, file_name) => {
-                    let next_id = master.iter().map(|(idx, _)| *idx).max().map_or(0, |m| m + 1);
+                    let next_id = master.next_row_id();
                     self.next_row_id.insert(file_name.clone(), next_id);
                     self.sheets_data.insert(file_name, master);
                 }
@@ -822,18 +1006,7 @@ impl MyApp {
                 }
                 UiMessage::OpenFile(file, tab) => self.load_file(ctx, file, tab),
                 UiMessage::EditCell(filename, tab_id, row_nr, col_id, new_value) => {
-                    // row_nr is an index into the currently displayed (filtered/sorted)
-                    // view. Resolve it to a stable master row index first, then always
-                    // write through to master -- the filtered view is just a cache.
-                    if let Some(master_row) = self.master_row_at(&filename, tab_id, row_nr) {
-                        if let Some(old_value) = self.read_cell(&filename, master_row, col_id) {
-                            self.write_cell(&filename, master_row, col_id, &new_value);
-                            self.push_undo(
-                                &filename,
-                                UndoEntry::CellEdit { filename: filename.clone(), master_row, col_id, old_value },
-                            );
-                        }
-                    }
+                    self.apply_edit_cell(&filename, tab_id, row_nr, col_id, &new_value);
                 }
                 UiMessage::PasteCells(filename, tab_id, anchor_row, anchor_col, rows) => {
                     let pasted_count = self.apply_paste(&filename, tab_id, anchor_row, anchor_col, &rows);
@@ -843,9 +1016,15 @@ impl MyApp {
                     }
                 }
                 UiMessage::ReplaceAll(filename, tab_id, find, replace, scope) => {
-                    let changed = self.apply_replace_all(&filename, tab_id, &find, &replace, scope);
-                    let plural = if changed == 1 { "" } else { "s" };
-                    crate::toast::show(ctx, format!("Replaced in {changed} cell{plural}"));
+                    self.start_replace_all(ctx, &filename, tab_id, &find, &replace, scope);
+                }
+                UiMessage::ReplacePlanned(filename, job_id, plan) => {
+                    self.replace_planned(ctx, &filename, job_id, plan);
+                }
+                UiMessage::CancelReplace(filename) => {
+                    if let Some(job) = self.replace_jobs.get(&filename) {
+                        job.control.cancel();
+                    }
                 }
                 UiMessage::DeleteRow(filename, tab_id, row_nr) => {
                     if self.apply_delete_row(&filename, tab_id, row_nr) {
@@ -887,7 +1066,12 @@ impl MyApp {
                             .find_map(|(_, tab)| tab.columns.get(&filename))
                             .cloned()
                             .unwrap_or_default();
-                        if let Err(e) = write_csv(&filename, &headers, data) {
+                        if let Err(e) = write_csv(
+                            &filename,
+                            &headers,
+                            data.as_ref(),
+                            self.csv_formats.get(&filename).copied().unwrap_or_default(),
+                        ) {
                             eprintln!("Failed to save {}: {:?}", filename, e);
                         } else {
                             self.history.mark_clean(&filename);
@@ -951,6 +1135,7 @@ impl MyApp {
             }
         }
 
+        self.show_replace_progress(ctx);
         crate::toast::render(ctx);
 
         egui::TopBottomPanel::top("top_panel").show(ctx, |_ui| {
@@ -1063,11 +1248,39 @@ mod tests {
             global_filter: "".to_string(),
             filters: HashMap::new(),
             request_epoch: HashMap::new(),
+            replace_jobs: HashMap::new(),
+            next_job_id: 0,
             history: Default::default(),
             next_row_id: HashMap::new(),
             next_col_id: HashMap::new(),
+            csv_formats: HashMap::new(),
             agent_bridge: agent_bridge::AgentBridge::new(),
         }
+    }
+
+    /// Test shorthand: load `rows` into an in-memory sheet under `name`.
+    trait InsertRows {
+        fn insert_rows(&mut self, name: String, rows: Vec<(usize, StringRecord)>);
+    }
+
+    impl InsertRows for HashMap<String, Box<dyn csv_model::Sheet>> {
+        fn insert_rows(&mut self, name: String, rows: Vec<(usize, StringRecord)>) {
+            self.insert(name, Box::new(MemorySheet::new(rows)));
+        }
+    }
+
+    fn row_ids(app: &MyApp, filename: &str) -> Vec<usize> {
+        let sheet = &app.sheets_data[filename];
+        (0..sheet.len()).filter_map(|i| sheet.row_id(i)).collect()
+    }
+
+    #[test]
+    fn load_warning_is_silent_for_clean_loads_and_names_the_problem_otherwise() {
+        assert_eq!(load_warning(&LoadStats::default()), None);
+        let lossy = load_warning(&LoadStats { lossy_rows: 2, skipped_rows: 0 }).unwrap();
+        assert!(lossy.contains("2 row(s) are not valid UTF-8"));
+        let both = load_warning(&LoadStats { lossy_rows: 1, skipped_rows: 3 }).unwrap();
+        assert!(both.contains("3 row(s) could not be read"));
     }
 
     fn row(idx: usize, fields: &[&str]) -> (usize, StringRecord) {
@@ -1115,7 +1328,7 @@ mod tests {
     #[test]
     fn undo_restores_previous_value_and_pushes_redo() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a"]), row(1, &["b"])],
         );
@@ -1149,7 +1362,7 @@ mod tests {
     #[test]
     fn undo_back_to_clean_marker_is_not_dirty() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a"])]);
         set_columns(&mut app, "f.csv", 1);
         // File just loaded: clean_marker defaults to 0, undo_stack is empty.
         assert!(!app.history.is_dirty(&"f.csv".to_string()));
@@ -1186,7 +1399,7 @@ mod tests {
     #[test]
     fn dirty_tracked_relative_to_save_point_not_zero() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a"])]);
         set_columns(&mut app, "f.csv", 1);
 
         app.write_cell("f.csv", 0, 0, "b");
@@ -1212,7 +1425,7 @@ mod tests {
     #[test]
     fn undo_then_redo_round_trips() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["current"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["current"])]);
         set_columns(&mut app, "f.csv", 1);
         push_undo_entry(&mut app, "f.csv", UndoEntry::CellEdit {
             filename: "f.csv".to_string(),
@@ -1234,7 +1447,7 @@ mod tests {
     #[test]
     fn multiple_undos_restore_in_reverse_order() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["v3"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["v3"])]);
         set_columns(&mut app, "f.csv", 1);
         // Simulate two edits: v1 -> v2 -> v3, each push recording the prior value.
         push_undo_entry(&mut app, "f.csv", UndoEntry::CellEdit {
@@ -1289,7 +1502,7 @@ mod tests {
     #[test]
     fn new_edit_clears_redo_stack() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["b"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["b"])]);
         set_columns(&mut app, "f.csv", 1);
         push_redo_entry(&mut app, "f.csv", UndoEntry::CellEdit {
             filename: "f.csv".to_string(),
@@ -1315,7 +1528,7 @@ mod tests {
     #[test]
     fn paste_writes_grid_starting_at_anchor() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a", "b"]), row(1, &["c", "d"])],
         );
@@ -1344,7 +1557,7 @@ mod tests {
     #[test]
     fn paste_skips_rows_beyond_sheet_bounds() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a"])]);
         set_columns(&mut app, "f.csv", 1);
 
         // Anchor at row 0 with 3 pasted rows, but only 1 row exists.
@@ -1362,7 +1575,7 @@ mod tests {
     #[test]
     fn paste_skips_columns_beyond_header_bounds() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a", "b"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a", "b"])]);
         set_columns(&mut app, "f.csv", 2);
 
         // Pasted row has 3 values but only 2 columns exist.
@@ -1377,7 +1590,7 @@ mod tests {
     #[test]
     fn paste_at_nonzero_anchor_offsets_correctly() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a", "b", "c"]), row(1, &["d", "e", "f"])],
         );
@@ -1395,7 +1608,7 @@ mod tests {
     #[test]
     fn paste_empty_rows_is_noop() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a"])]);
         set_columns(&mut app, "f.csv", 1);
 
         let count = app.apply_paste("f.csv", 1, 0, 0, &[]);
@@ -1407,7 +1620,7 @@ mod tests {
     #[test]
     fn replace_all_columns_across_all_rows_when_no_filter() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["foo", "bar"]), row(1, &["foobar", "baz"])],
         );
@@ -1420,18 +1633,120 @@ mod tests {
         assert_eq!(app.read_cell("f.csv", 0, 1), Some("bar".to_string()));
         assert_eq!(app.read_cell("f.csv", 1, 0), Some("Xbar".to_string()));
         assert_eq!(app.read_cell("f.csv", 1, 1), Some("baz".to_string()));
-        // The whole replace-all is one undoable action.
+        // The whole replace-all is one undoable action, and undoing and redoing
+        // it is exact.
         assert_eq!(undo_len(&app, "f.csv"), 1);
-        match app.history.peek_undo(&"f.csv".to_string()).unwrap() {
-            UndoEntry::Batch(entries) => assert_eq!(entries.len(), 2),
-            other => panic!("expected a Batch, got {:?}", std::mem::discriminant(other)),
+        app.apply_undo("f.csv");
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("foo".to_string()));
+        assert_eq!(app.read_cell("f.csv", 1, 0), Some("foobar".to_string()));
+        assert_eq!(undo_len(&app, "f.csv"), 0);
+        app.apply_redo("f.csv");
+        assert_eq!(app.read_cell("f.csv", 0, 0), Some("X".to_string()));
+        assert_eq!(app.read_cell("f.csv", 1, 0), Some("Xbar".to_string()));
+        assert_eq!(undo_len(&app, "f.csv"), 1);
+    }
+
+    #[test]
+    fn replace_all_on_a_file_backed_sheet_is_a_rule_and_undoes_exactly() {
+        let mut app = test_app();
+        let sheet = FileSheet::new(Arc::new(SyntheticSource::new(200_000)), b',', false).unwrap();
+        app.next_row_id.insert(BIG.to_string(), sheet.next_row_id());
+        app.sheets_data.insert(BIG.to_string(), Box::new(sheet));
+        set_columns(&mut app, BIG, 8);
+        let (changed, mem) = measure(|| app.apply_replace_all(BIG, 1, "user", "USER", ReplaceScope::CurrentColumn(1)));
+        assert_eq!(changed, 200_000, "every row's name column");
+        assert!(app.sheets_data[BIG].edit_bytes() < 4096, "a rule, not 200k edited rows: {}", app.sheets_data[BIG].edit_bytes());
+        assert!(mem.retained < 64 * 1024, "{}", mem.retained);
+        assert_eq!(app.read_cell(BIG, 123_456, 1), Some(format!("USER{:010}", 123_456)));
+        assert_eq!(undo_len(&app, BIG), 1);
+        app.apply_undo(BIG);
+        assert_eq!(app.read_cell(BIG, 123_456, 1), Some(format!("user{:010}", 123_456)));
+        app.apply_redo(BIG);
+        assert_eq!(app.read_cell(BIG, 123_456, 1), Some(format!("USER{:010}", 123_456)));
+    }
+
+    /// Open a file-backed sheet of `rows` synthetic rows as BIG.
+    fn open_big(app: &mut MyApp, rows: usize) {
+        let sheet = FileSheet::new(Arc::new(SyntheticSource::new(rows as u64)), b',', false).unwrap();
+        app.next_row_id.insert(BIG.to_string(), sheet.next_row_id());
+        app.sheets_data.insert(BIG.to_string(), Box::new(sheet));
+        set_columns(app, BIG, 8);
+    }
+
+    /// Run the background replace-all and feed its messages back, as the
+    /// frame loop does, until the job is gone.
+    fn pump_replace(app: &mut MyApp, ctx: &egui::Context) {
+        let started = std::time::Instant::now();
+        while !app.replace_jobs.is_empty() {
+            assert!(started.elapsed().as_secs() < 60, "job never finished");
+            if let Ok(UiMessage::ReplacePlanned(f, id, plan)) = app.worker_chan.1.recv_timeout(std::time::Duration::from_millis(50)) {
+                app.replace_planned(ctx, &f, id, plan);
+            }
         }
+    }
+
+    #[test]
+    fn a_background_replace_all_changes_the_sheet_once_and_undoes_exactly() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        open_big(&mut app, 50_000);
+        app.start_replace_all(&ctx, BIG, 1, "user", "USER", ReplaceScope::CurrentColumn(1));
+        assert_eq!(app.replace_jobs.len(), 1, "running in the background");
+        assert_eq!(app.read_cell(BIG, 7, 1), Some(format!("user{:010}", 7)), "nothing changes until the count is in");
+        pump_replace(&mut app, &ctx);
+        assert_eq!(app.read_cell(BIG, 7, 1), Some(format!("USER{:010}", 7)));
+        assert_eq!(undo_len(&app, BIG), 1);
+        app.apply_undo(BIG);
+        assert_eq!(app.read_cell(BIG, 7, 1), Some(format!("user{:010}", 7)));
+        app.apply_redo(BIG);
+        assert_eq!(app.read_cell(BIG, 7, 1), Some(format!("USER{:010}", 7)));
+    }
+
+    #[test]
+    fn a_cancelled_replace_all_changes_nothing_and_leaves_no_undo_entry() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        open_big(&mut app, 50_000);
+        app.start_replace_all(&ctx, BIG, 1, "user", "USER", ReplaceScope::CurrentColumn(1));
+        app.replace_jobs[BIG].control.cancel();
+        pump_replace(&mut app, &ctx);
+        assert_eq!(app.read_cell(BIG, 7, 1), Some(format!("user{:010}", 7)));
+        assert_eq!(undo_len(&app, BIG), 0);
+        // And a new one can start afterwards.
+        app.start_replace_all(&ctx, BIG, 1, "user", "USER", ReplaceScope::CurrentColumn(1));
+        pump_replace(&mut app, &ctx);
+        assert_eq!(app.read_cell(BIG, 7, 1), Some(format!("USER{:010}", 7)));
+    }
+
+    #[test]
+    fn only_one_replace_all_runs_per_file() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        open_big(&mut app, 50_000);
+        app.start_replace_all(&ctx, BIG, 1, "user", "USER", ReplaceScope::CurrentColumn(1));
+        let first = app.replace_jobs[BIG].id;
+        app.start_replace_all(&ctx, BIG, 1, "city", "CITY", ReplaceScope::CurrentColumn(2));
+        assert_eq!(app.replace_jobs[BIG].id, first, "the second request is refused");
+        pump_replace(&mut app, &ctx);
+        assert_eq!(undo_len(&app, BIG), 1);
+    }
+
+    #[test]
+    fn an_edit_made_while_the_count_runs_is_not_lost_or_double_counted() {
+        let mut app = test_app();
+        let ctx = egui::Context::default();
+        open_big(&mut app, 50_000);
+        app.start_replace_all(&ctx, BIG, 1, "user", "USER", ReplaceScope::CurrentColumn(1));
+        app.apply_edit_cell(BIG, 1, 3, 1, "user-edited");
+        pump_replace(&mut app, &ctx);
+        assert_eq!(app.read_cell(BIG, 3, 1), Some("USER-edited".to_string()), "the edited row is replaced too");
+        assert_eq!(app.read_cell(BIG, 4, 1), Some(format!("USER{:010}", 4)));
     }
 
     #[test]
     fn replace_current_column_only() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["foo", "foo"])],
         );
@@ -1447,7 +1762,7 @@ mod tests {
     #[test]
     fn replace_all_only_touches_filtered_rows_when_filter_active() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["foo"]), row(1, &["foo"]), row(2, &["foo"])],
         );
@@ -1469,7 +1784,7 @@ mod tests {
     #[test]
     fn replace_all_no_match_changes_nothing() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["bar"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["bar"])]);
         set_columns(&mut app, "f.csv", 1);
 
         let count = app.apply_replace_all("f.csv", 1, "foo", "X", ReplaceScope::AllColumns);
@@ -1482,7 +1797,7 @@ mod tests {
     #[test]
     fn replace_all_empty_find_is_noop() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["bar"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["bar"])]);
         set_columns(&mut app, "f.csv", 1);
 
         let count = app.apply_replace_all("f.csv", 1, "", "X", ReplaceScope::AllColumns);
@@ -1494,14 +1809,14 @@ mod tests {
     #[test]
     fn delete_row_removes_by_stable_master_row() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a"]), row(1, &["b"]), row(2, &["c"])],
         );
 
         assert!(app.apply_delete_row("f.csv", 1, 1));
 
-        let remaining: Vec<usize> = app.sheets_data["f.csv"].iter().map(|(idx, _)| *idx).collect();
+        let remaining: Vec<usize> = row_ids(&app, "f.csv");
         assert_eq!(remaining, vec![0, 2]);
         assert!(app.history.is_dirty(&"f.csv".to_string()));
         assert_eq!(undo_len(&app, "f.csv"), 1);
@@ -1510,7 +1825,7 @@ mod tests {
     #[test]
     fn delete_row_also_removes_from_filtered_views() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a"]), row(1, &["b"])],
         );
@@ -1523,13 +1838,13 @@ mod tests {
 
         // 'b' (master row 1) shifted from position 1 to 0.
         assert_eq!(app.filtered_data[&("f.csv".to_string(), 1)], vec![0u32]);
-        assert_eq!(app.sheets_data["f.csv"][0].0, 1);
+        assert_eq!(row_ids(&app, "f.csv")[0], 1);
     }
 
     #[test]
     fn insert_row_shifts_views_so_they_keep_pointing_at_the_same_rows() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"]), row(1, &["b"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a"]), row(1, &["b"])]);
         app.next_row_id.insert("f.csv".to_string(), 2);
         set_columns(&mut app, "f.csv", 1);
         app.filtered_data.insert(("f.csv".to_string(), 1), vec![1u32]); // view shows only 'b'
@@ -1537,13 +1852,13 @@ mod tests {
         app.apply_insert_row("f.csv", 1, Some((0, InsertPosition::Before)));
 
         let view = &app.filtered_data[&("f.csv".to_string(), 1)];
-        assert_eq!(app.sheets_data["f.csv"][view[0] as usize].0, 1);
+        assert_eq!(row_ids(&app, "f.csv")[view[0] as usize], 1);
     }
 
     #[test]
     fn delete_row_missing_row_is_noop() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a"])]);
 
         assert!(!app.apply_delete_row("f.csv", 1, 5));
         assert!(!app.history.any_dirty());
@@ -1552,7 +1867,7 @@ mod tests {
     #[test]
     fn insert_row_assigns_fresh_master_row_id() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a"]), row(1, &["b"])],
         );
@@ -1571,7 +1886,7 @@ mod tests {
     #[test]
     fn insert_row_after_anchor_lands_immediately_below() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a"]), row(1, &["b"]), row(2, &["c"])],
         );
@@ -1583,14 +1898,14 @@ mod tests {
             .apply_insert_row("f.csv", 1, Some((0, InsertPosition::After)))
             .expect("insert should apply");
 
-        let order: Vec<usize> = app.sheets_data["f.csv"].iter().map(|(idx, _)| *idx).collect();
+        let order: Vec<usize> = row_ids(&app, "f.csv");
         assert_eq!(order, vec![0, new_id, 1, 2]);
     }
 
     #[test]
     fn insert_row_before_anchor_lands_immediately_above() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a"]), row(1, &["b"]), row(2, &["c"])],
         );
@@ -1603,14 +1918,14 @@ mod tests {
             .apply_insert_row("f.csv", 1, Some((0, InsertPosition::Before)))
             .expect("insert should apply");
 
-        let order: Vec<usize> = app.sheets_data["f.csv"].iter().map(|(idx, _)| *idx).collect();
+        let order: Vec<usize> = row_ids(&app, "f.csv");
         assert_eq!(order, vec![new_id, 0, 1, 2]);
     }
 
     #[test]
     fn delete_then_undo_restores_row_at_original_position() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a"]), row(1, &["b"]), row(2, &["c"])],
         );
@@ -1622,7 +1937,7 @@ mod tests {
         let result = app.apply_undo("f.csv").expect("undo should restore the row");
         assert_eq!(result.row, Some(1));
         assert_eq!(app.sheets_data["f.csv"].len(), 3);
-        let restored: Vec<usize> = app.sheets_data["f.csv"].iter().map(|(idx, _)| *idx).collect();
+        let restored: Vec<usize> = row_ids(&app, "f.csv");
         assert_eq!(restored, vec![0, 1, 2]);
         assert_eq!(app.read_cell("f.csv", 1, 0), Some("b".to_string()));
     }
@@ -1630,7 +1945,7 @@ mod tests {
     #[test]
     fn insert_then_undo_removes_the_row() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a"])]);
         app.next_row_id.insert("f.csv".to_string(), 1);
         set_columns(&mut app, "f.csv", 1);
 
@@ -1645,7 +1960,7 @@ mod tests {
     #[test]
     fn delete_undo_redo_round_trips() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a"]), row(1, &["b"])],
         );
@@ -1655,7 +1970,7 @@ mod tests {
         app.apply_redo("f.csv");
 
         assert_eq!(app.sheets_data["f.csv"].len(), 1);
-        let remaining: Vec<usize> = app.sheets_data["f.csv"].iter().map(|(idx, _)| *idx).collect();
+        let remaining: Vec<usize> = row_ids(&app, "f.csv");
         assert_eq!(remaining, vec![0]);
     }
 
@@ -1668,7 +1983,7 @@ mod tests {
     fn undo_survives_a_column_position_shift() {
         let mut app = test_app();
         // Three columns: id 0 "name", id 1 "dupa", id 2 "age".
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["alice", "x", "30"])],
         );
@@ -1700,9 +2015,7 @@ mod tests {
                 headers.retain(|h| h.id != 0);
             }
         }
-        for (_, record) in app.sheets_data.get_mut("f.csv").unwrap() {
-            *record = record.iter().skip(1).collect();
-        }
+        app.sheets_data.get_mut("f.csv").unwrap().remove_column(0);
 
         // "dupa" (id 1) is now at position 0, "age" (id 2) at position 1.
         assert_eq!(app.read_cell("f.csv", 0, 1), Some("y".to_string())); // still id 1
@@ -1721,7 +2034,7 @@ mod tests {
     #[test]
     fn delete_column_removes_field_and_header_by_id() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a", "b", "c"]), row(1, &["d", "e", "f"])],
         );
@@ -1746,7 +2059,7 @@ mod tests {
     #[test]
     fn delete_column_missing_id_is_noop() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a"])]);
         set_columns(&mut app, "f.csv", 1);
 
         assert!(!app.apply_delete_column("f.csv", 99));
@@ -1756,7 +2069,7 @@ mod tests {
     #[test]
     fn insert_column_appends_empty_field_with_fresh_id() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a", "b"])],
         );
@@ -1777,7 +2090,7 @@ mod tests {
     #[test]
     fn insert_column_after_specific_id_lands_in_position() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a", "b"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a", "b"])]);
         set_columns(&mut app, "f.csv", 2); // ids 0, 1
         app.next_col_id.insert("f.csv".to_string(), 2);
 
@@ -1794,7 +2107,7 @@ mod tests {
     #[test]
     fn delete_column_then_undo_restores_header_position_and_values() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a", "b", "c"]), row(1, &["d", "e", "f"])],
         );
@@ -1815,25 +2128,86 @@ mod tests {
     #[test]
     fn insert_column_then_undo_removes_it() {
         let mut app = test_app();
-        app.sheets_data.insert("f.csv".to_string(), vec![row(0, &["a"])]);
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a"])]);
         set_columns(&mut app, "f.csv", 1);
         app.next_col_id.insert("f.csv".to_string(), 1);
 
         app.apply_insert_column("f.csv", None, "new");
-        assert_eq!(app.sheets_data["f.csv"][0].1.len(), 2);
+        assert_eq!(app.sheets_data["f.csv"].record(0).unwrap().len(), 2);
 
         app.apply_undo("f.csv");
-        assert_eq!(app.sheets_data["f.csv"][0].1.len(), 1);
+        assert_eq!(app.sheets_data["f.csv"].record(0).unwrap().len(), 1);
         assert_eq!(app.read_cell("f.csv", 0, 0), Some("a".to_string()));
 
         let headers = app.tree.iter_all_tabs().next().unwrap().1.columns.get("f.csv").unwrap();
         assert_eq!(headers.len(), 1);
     }
 
+    fn record_fields(app: &MyApp, file: &str, pos: usize) -> Vec<String> {
+        app.sheets_data[file].record(pos).unwrap().iter().map(str::to_string).collect()
+    }
+
+    #[test]
+    fn undoing_an_inserted_column_restores_short_rows_exactly() {
+        let mut app = test_app();
+        app.sheets_data.insert_rows(
+            "f.csv".to_string(),
+            vec![row(0, &["a", "b", "c"]), row(1, &["d"]), row(2, &["e", "f"])],
+        );
+        set_columns(&mut app, "f.csv", 3);
+        app.next_col_id.insert("f.csv".to_string(), 3);
+
+        app.apply_insert_column("f.csv", None, "new"); // appended: position 3
+        assert_eq!(record_fields(&app, "f.csv", 1), ["d", "", "", ""], "short rows are padded to line up");
+
+        app.apply_undo("f.csv");
+        assert_eq!(record_fields(&app, "f.csv", 0), ["a", "b", "c"]);
+        assert_eq!(record_fields(&app, "f.csv", 1), ["d"], "the padding goes too");
+        assert_eq!(record_fields(&app, "f.csv", 2), ["e", "f"]);
+        assert!(!app.history.is_dirty(&"f.csv".to_string()), "back at the saved state");
+    }
+
+    #[test]
+    fn redo_and_undo_of_an_inserted_column_keep_working() {
+        let mut app = test_app();
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a", "b"]), row(1, &["c"])]);
+        set_columns(&mut app, "f.csv", 2);
+        app.next_col_id.insert("f.csv".to_string(), 2);
+
+        let id = app.apply_insert_column("f.csv", Some(0), "mid").unwrap(); // after column 0
+        assert_eq!(record_fields(&app, "f.csv", 0), ["a", "", "b"]);
+        for round in 0..3 {
+            app.apply_undo("f.csv");
+            assert_eq!(record_fields(&app, "f.csv", 0), ["a", "b"], "round {round}");
+            assert_eq!(record_fields(&app, "f.csv", 1), ["c"], "round {round}");
+            app.apply_redo("f.csv");
+            assert_eq!(record_fields(&app, "f.csv", 0), ["a", "", "b"], "round {round}");
+            let headers = app.tree.iter_all_tabs().next().unwrap().1.columns.get("f.csv").unwrap();
+            assert_eq!(headers.len(), 3);
+            assert_eq!(headers[1].id, id);
+        }
+    }
+
+    #[test]
+    fn deleting_a_column_then_undo_redo_undo_is_exact_for_short_rows() {
+        let mut app = test_app();
+        app.sheets_data.insert_rows("f.csv".to_string(), vec![row(0, &["a", "b", "c"]), row(1, &["d"])]);
+        set_columns(&mut app, "f.csv", 3);
+        assert!(app.apply_delete_column("f.csv", 1));
+        assert_eq!(record_fields(&app, "f.csv", 0), ["a", "c"]);
+        for _ in 0..2 {
+            app.apply_undo("f.csv");
+            assert_eq!(record_fields(&app, "f.csv", 0), ["a", "b", "c"]);
+            assert_eq!(record_fields(&app, "f.csv", 1), ["d"]);
+            app.apply_redo("f.csv");
+            assert_eq!(record_fields(&app, "f.csv", 0), ["a", "c"]);
+        }
+    }
+
     #[test]
     fn delete_column_undo_redo_round_trips() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a", "b"])],
         );
@@ -1843,7 +2217,7 @@ mod tests {
         app.apply_undo("f.csv");
         app.apply_redo("f.csv");
 
-        assert_eq!(app.sheets_data["f.csv"][0].1.len(), 1);
+        assert_eq!(app.sheets_data["f.csv"].record(0).unwrap().len(), 1);
         assert_eq!(app.read_cell("f.csv", 0, 1), Some("b".to_string()));
         let headers = app.tree.iter_all_tabs().next().unwrap().1.columns.get("f.csv").unwrap();
         assert_eq!(headers.len(), 1);
@@ -1855,7 +2229,7 @@ mod tests {
     #[test]
     fn paste_undo_restores_all_cells_in_one_action() {
         let mut app = test_app();
-        app.sheets_data.insert(
+        app.sheets_data.insert_rows(
             "f.csv".to_string(),
             vec![row(0, &["a", "b"]), row(1, &["c", "d"])],
         );
@@ -1888,5 +2262,262 @@ mod tests {
         assert_eq!(app.read_cell("f.csv", 1, 0), Some("z".to_string()));
         assert_eq!(app.read_cell("f.csv", 1, 1), Some("w".to_string()));
         assert!(app.apply_redo("f.csv").is_none());
+    }
+
+    // ---------------------------------------------------------------------
+    // Undo-stack memory on big files. The same scenarios run on a 1M-row
+    // file (always) and on a 5 GB virtual file (`#[ignore]`, scripts/big.sh):
+    // an undo entry's size must depend on the edit, never on the file.
+    // ---------------------------------------------------------------------
+
+    use csv_model::testing::{SyntheticSource, measure, serial};
+    use csv_model::{FileSheet, Sheet};
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    const BIG: &str = "big.csv";
+
+    fn file_app(rows: u64) -> (MyApp, usize) {
+        let mut app = test_app();
+        let (sheet, mem) = measure(|| FileSheet::new(Arc::new(SyntheticSource::new(rows)), b',', false).unwrap());
+        app.next_row_id.insert(BIG.to_string(), sheet.next_row_id());
+        app.sheets_data.insert(BIG.to_string(), Box::new(sheet));
+        set_columns(&mut app, BIG, 8);
+        app.next_col_id.insert(BIG.to_string(), 8);
+        (app, mem.retained as usize)
+    }
+
+    /// Memory held by the undo stack alone (the redo branch is dropped by any
+    /// new edit, which would hide growth).
+    fn history_bytes(app: &MyApp) -> i64 {
+        app.history.undo_entries(&BIG.to_string()).iter().map(UndoEntry::approx_bytes).sum::<usize>() as i64
+    }
+
+    fn cell(app: &MyApp, row: usize, col: usize) -> String {
+        app.sheets_data[BIG].cell(row, col).map(|c| c.into_owned()).unwrap_or_default()
+    }
+
+    /// One measured step: what the undo stack and the process each gained.
+    #[derive(Debug, Clone)]
+    struct Step {
+        what: &'static str,
+        ops: usize,
+        history: i64,
+        retained: i64,
+        secs: f64,
+    }
+
+    impl Step {
+        fn print(&self, rows: u64) {
+            let per = |b: f64| if self.ops == 0 { 0.0 } else { b / self.ops as f64 };
+            eprintln!(
+                "UNDO-MEM {:>11} rows | {:<46} | {:>7} ops | undo stack {:>+11} B ({:>+8.1} B/op) | process {:>+13} B ({:>9.1} B/op) | {:>7.2}s",
+                rows, self.what, self.ops, self.history, per(self.history as f64), self.retained,
+                per(self.retained as f64), self.secs
+            );
+        }
+    }
+
+    fn step(app: &mut MyApp, what: &'static str, ops: usize, f: impl FnOnce(&mut MyApp)) -> Step {
+        let before = history_bytes(app);
+        let t = Instant::now();
+        let ((), mem) = measure(|| f(app));
+        Step { what, ops, history: history_bytes(app) - before, retained: mem.retained, secs: t.elapsed().as_secs_f64() }
+    }
+
+    struct Report {
+        steps: Vec<Step>,
+        /// Memory the sheet held for changes at the height of the edit phase,
+        /// and after every edit had been undone (`Sheet::edit_bytes`).
+        edit_bytes_peak: usize,
+        edit_bytes_after_undo_all: usize,
+        /// Memory the sheet held for a replace-all over every row.
+        every_row_replace_bytes: usize,
+    }
+
+    /// Run every scenario on a file of `rows` rows. Asserts exactness (undo
+    /// and redo give the data back) as it goes.
+    fn undo_memory_scenarios(rows: u64, edits: usize, selected: usize, row_ops: usize) -> Report {
+        let (mut app, open_bytes) = file_app(rows);
+        eprintln!(
+            "UNDO-MEM {rows:>11} rows | opening the sheet (index, nothing edited)          | process {open_bytes:>+13} B ({:.2} B/row)",
+            open_bytes as f64 / rows as f64
+        );
+        let n = rows as usize;
+        let mut steps = Vec::new();
+        let probe = |app: &MyApp, col: usize| -> Vec<String> { [0usize, n / 3, n / 2, n - 1].iter().map(|&r| cell(app, r, col)).collect() };
+        let original = probe(&app, 2);
+
+        // Column delete / insert while nothing is in memory.
+        steps.push(step(&mut app, "delete a column (nothing edited)", 1, |a| {
+            assert!(a.apply_delete_column(BIG, 2));
+        }));
+        assert_ne!(probe(&app, 2), original, "column 2 is gone, so column 3 is now at index 2");
+        steps.push(step(&mut app, "  undo it", 1, |a| {
+            assert!(a.apply_undo(BIG).is_some());
+        }));
+        assert_eq!(probe(&app, 2), original, "undo of the delete is exact");
+        steps.push(step(&mut app, "  redo it", 1, |a| {
+            assert!(a.apply_redo(BIG).is_some());
+        }));
+        assert!(app.apply_undo(BIG).is_some()); // leave the column in place
+        steps.push(step(&mut app, "insert a column at the end (nothing edited)", 1, |a| {
+            assert!(a.apply_insert_column(BIG, None, "extra").is_some());
+        }));
+        assert!(app.apply_undo(BIG).is_some());
+        assert_eq!(app.sheets_data[BIG].record(n / 2).unwrap().len(), 8, "undo of the insert is exact");
+        app.history = Default::default(); // the editing scenarios start from an empty stack
+
+        // Edits, then undo everything, all measured as one block so the
+        // memory left behind by undoing is visible.
+        let mut edit_rows: Vec<usize> = Vec::new();
+        let mut edit_bytes_peak = 0;
+        let mut every_row_extra = 0;
+        let ((), whole) = measure(|| {
+            // Single-cell edits spread over the file. The read caches are filled
+            // first (they are a constant size), so what is measured is the edits.
+            let stride = (n / edits).max(1);
+            for k in 0..edits.min(2_000) {
+                let _ = cell(&app, k * stride, 1);
+            }
+            steps.push(step(&mut app, "single-cell edits", edits, |a| {
+                for k in 0..edits {
+                    assert!(a.apply_edit_cell(BIG, 1, (k * stride) as u64, 1, "an edited text value"));
+                }
+            }));
+            edit_rows = vec![0, (edits / 2) * stride, (edits - 1) * stride];
+
+            // Replace-all over a filtered view: one Batch entry.
+            let view_stride = (n / selected).max(1);
+            let view: Vec<u32> = (0..selected).map(|k| (k * view_stride + 1) as u32).collect();
+            app.filtered_data.insert((BIG.to_string(), 1), view);
+            steps.push(step(&mut app, "replace-all over a filtered view (one rule)", selected, |a| {
+                assert_eq!(a.apply_replace_all(BIG, 1, "user", "USER", ReplaceScope::CurrentColumn(1)), selected);
+            }));
+            app.filtered_data.clear();
+            assert!(cell(&app, 1, 1).starts_with("USER"));
+
+            // Replace-all over EVERY row: a rule, so it costs nothing per row.
+            let held_before = app.sheets_data[BIG].edit_bytes();
+            steps.push(step(&mut app, "replace-all over every row", n, |a| {
+                assert_eq!(a.apply_replace_all(BIG, 1, "city", "CITY", ReplaceScope::CurrentColumn(2)), n);
+            }));
+            every_row_extra = app.sheets_data[BIG].edit_bytes() - held_before;
+            assert!(cell(&app, n / 2, 2).starts_with("CITY"));
+            assert!(cell(&app, 7, 2).starts_with("CITY"));
+
+            // Delete a column while many rows are in memory, then undo it.
+            let col3_before = cell(&app, edit_rows[1], 3);
+            steps.push(step(&mut app, "delete a column (rows are in memory)", 1, |a| {
+                assert!(a.apply_delete_column(BIG, 3));
+            }));
+            steps.push(step(&mut app, "  undo it", 1, |a| {
+                assert!(a.apply_undo(BIG).is_some());
+            }));
+            assert_eq!(cell(&app, edit_rows[1], 3), col3_before, "restored in a row that was edited");
+            assert_eq!(cell(&app, edit_rows[1], 1), "an edited text value", "the edit survived the column round trip");
+
+            // Undo the whole stack, then redo it.
+            edit_bytes_peak = app.sheets_data[BIG].edit_bytes();
+            let entries = app.history.undo_len(&BIG.to_string());
+            steps.push(step(&mut app, "undo the whole stack", entries, |a| {
+                while a.apply_undo(BIG).is_some() {}
+            }));
+            assert_eq!(app.history.undo_len(&BIG.to_string()), 0);
+            assert_eq!(cell(&app, 1, 1), format!("user{:010}", 1), "everything undone: the original text is back");
+            assert_eq!(cell(&app, 0, 1), format!("user{:010}", 0));
+            assert!(cell(&app, n / 2, 2).starts_with("city"), "the replace-all over every row is undone too");
+        });
+        let _ = whole;
+        let edit_bytes_after_undo_all = app.sheets_data[BIG].edit_bytes();
+        steps.push(step(&mut app, "redo the whole stack", edits + 2, |a| {
+            while a.apply_redo(BIG).is_some() {}
+        }));
+        assert_eq!(cell(&app, 0, 1), "an edited text value");
+        while app.apply_undo(BIG).is_some() {}
+
+        // Structural edits last: the first one builds the order list, which
+        // costs memory and time proportional to the file until the piece
+        // table lands.
+        steps.push(step(&mut app, "delete rows", row_ops, |a| {
+            for k in 0..row_ops {
+                assert!(a.apply_delete_row(BIG, 1, (n / 2 + k) as u64));
+            }
+        }));
+        steps.push(step(&mut app, "insert rows", row_ops, |a| {
+            for k in 0..row_ops {
+                assert!(a.apply_insert_row(BIG, 1, Some((k as u64, InsertPosition::After))).is_some());
+            }
+        }));
+        let entries = app.history.undo_len(&BIG.to_string());
+        steps.push(step(&mut app, "undo the row edits", entries, |a| {
+            while a.apply_undo(BIG).is_some() {}
+        }));
+        assert_eq!(app.sheets_data[BIG].len(), n, "row count is back");
+        assert_eq!(cell(&app, n / 2, 0), format!("{:010}", n / 2), "the deleted rows are back in place");
+
+        for s in &steps {
+            s.print(rows);
+        }
+        eprintln!(
+            "UNDO-MEM {rows:>11} rows | memory held for changes: {edit_bytes_peak} B at the peak of the edits, {edit_bytes_after_undo_all} B after undoing every one",
+        );
+        Report { steps, edit_bytes_peak, edit_bytes_after_undo_all, every_row_replace_bytes: every_row_extra }
+    }
+
+    fn per_op(steps: &[Step], what: &str) -> f64 {
+        let s = steps.iter().find(|s| s.what == what).unwrap_or_else(|| panic!("no step {what:?}"));
+        s.history as f64 / s.ops.max(1) as f64
+    }
+
+    /// The budgets every file size must meet (bytes of undo stack per operation).
+    fn assert_undo_budgets(steps: &[Step], rows_in_memory: usize) {
+        assert!(per_op(steps, "delete a column (nothing edited)") <= 4096.0);
+        assert!(per_op(steps, "insert a column at the end (nothing edited)") <= 4096.0);
+        assert!(per_op(steps, "single-cell edits") <= 250.0, "a CellEdit entry: {}", per_op(steps, "single-cell edits"));
+        let scoped = per_op(steps, "replace-all over a filtered view (one rule)");
+        assert!(scoped <= 64.0, "a scoped replace-all costs its row ids, not its cells: {scoped} B/cell");
+        let every = steps.iter().find(|s| s.what == "replace-all over every row").unwrap();
+        // The old text of the rows already in memory has to be kept to undo
+        // exactly; nothing else is proportional to anything.
+        let bound = 4096 + 300 * rows_in_memory as i64;
+        assert!(every.history <= bound, "undo entry for a replace-all over every row: {} B (bound {bound})", every.history);
+        assert!(per_op(steps, "delete rows") <= 600.0, "a RowDelete entry: {}", per_op(steps, "delete rows"));
+        let with_memory = steps.iter().find(|s| s.what == "delete a column (rows are in memory)").unwrap();
+        assert!(with_memory.history <= 4096 + 100 * 15_000, "token for rows in memory: {}", with_memory.history);
+    }
+
+    #[test]
+    fn undo_stack_memory_on_a_one_million_row_file() {
+        let _g = serial();
+        let report = undo_memory_scenarios(1_000_000, 10_000, 5_000, 20);
+        assert_undo_budgets(&report.steps, 10_000);
+        // Undoing every edit gives the sheet's memory back (rows that equal the
+        // file again are dropped), instead of leaving a copy of each.
+        assert!(report.edit_bytes_peak > 1_500_000, "the edits were held in memory: {}", report.edit_bytes_peak);
+        assert!(
+            report.every_row_replace_bytes <= 4096,
+            "a replace-all over every row must not copy rows into memory: {} B",
+            report.every_row_replace_bytes
+        );
+        assert!(
+            report.edit_bytes_after_undo_all <= 64 * 1024,
+            "after undoing everything the sheet still holds {} B for changes",
+            report.edit_bytes_after_undo_all
+        );
+    }
+
+    #[test]
+    #[ignore = "big: 5 GB virtual file; several minutes and 1-2 GB of RAM (scripts/big.sh)"]
+    fn undo_stack_memory_on_a_five_gigabyte_file() {
+        let _g = serial();
+        let small = undo_memory_scenarios(1_000_000, 10_000, 5_000, 20);
+        let big = undo_memory_scenarios(62_500_000, 10_000, 5_000, 20);
+        assert_undo_budgets(&big.steps, 10_000);
+        // The claim: an undo entry's size depends on the edit, not on the file.
+        for what in ["single-cell edits", "replace-all over a filtered view (one rule)", "replace-all over every row", "delete rows", "delete a column (nothing edited)"] {
+            let (a, b) = (per_op(&small.steps, what), per_op(&big.steps, what));
+            assert!((a - b).abs() <= 0.05 * a.max(b) + 8.0, "{what}: {a:.1} B/op on 1M rows vs {b:.1} B/op on 62.5M rows");
+        }
     }
 }

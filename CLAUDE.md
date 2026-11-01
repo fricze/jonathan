@@ -60,13 +60,18 @@ This protocol applies when ending a Beads implementation workflow. It is subordi
 
 ## Build & Test
 
-_Add your build and test commands here_
-
 ```bash
-# Example:
-# npm install
-# npm test
+cargo test --workspace            # all unit, property and budget-guard tests (~30 s)
+scripts/budgets.sh                # release-mode budget table; red "pending" rows are expected
+scripts/budgets.sh --strict       # exit 1 if any budget test fails
+scripts/big.sh                    # undo-stack memory on a 5 GB virtual file (~1 min, ~1.5 GB RAM)
 ```
+
+- Linux needs GTK headers to build the app (`apt-get install libgtk-3-dev`);
+  see `docs/notes/muda-gtk-on-linux.md`.
+- The large-file engine design, budgets and plan: `docs/design/large-file-engine.md`.
+- Budget tests marked `#[ignore = "pending: ..."]` are required by the design
+  and not met yet; remove the `ignore` in the commit that makes one pass.
 
 ## Architecture Overview
 

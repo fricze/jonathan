@@ -1,11 +1,13 @@
-pub use csv_model::{ColumnId, FileHeader, SheetRow, SheetVec, SortOrder, View};
+pub use csv_model::{ColumnId, FileHeader, InsertedColumn, JobControl, MemorySheet, RemovedColumn, ReplacePlan, ReplacedAll, RowScope, Sheet, SheetRow, SortOrder, View};
 pub use selection::SelectionState;
 pub use undo_history::UndoHistory;
 #[cfg(test)]
 use csv::StringRecord;
 use egui::Context;
 use egui_dock::{DockState, NodeIndex, SurfaceIndex};
+use std::borrow::Cow;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use std::sync::mpsc::{Receiver, Sender};
 
@@ -40,7 +42,7 @@ pub enum UiMessage {
     /// same file+tab) can be dropped instead of racing to overwrite the
     /// latest one.
     SetDisplayData(View, String, TabId, u64),
-    SetMaster(SheetVec, String),
+    SetMaster(Box<dyn Sheet>, String),
     /// filename, tab_id, row_nr (in displayed data), column_id, new value.
     /// column_id (not a position) so a stored/replayed edit stays correct
     /// even if a column insert/delete shifts positions in between.
@@ -51,6 +53,11 @@ pub enum UiMessage {
     PasteCells(Filename, TabId, u64, ColumnId, Vec<Vec<String>>),
     /// filename, tab_id, text to find, replacement text, scope
     ReplaceAll(Filename, TabId, String, String, ReplaceScope),
+    /// A background replace-all finished counting: file, job id, the plan
+    /// (None if it was cancelled).
+    ReplacePlanned(Filename, u64, Option<ReplacePlan>),
+    /// Stop the replace-all running on this file.
+    CancelReplace(Filename),
     /// filename, tab_id, row_nr (in displayed data) to delete
     DeleteRow(Filename, TabId, u64),
     /// filename, tab_id, (anchor row_nr in displayed data, Before/After) --
@@ -107,7 +114,7 @@ pub type Filters = HashMap<(Filename, TabId), String>;
 /// The rows a tab displays: master, optionally seen through a `View`.
 #[derive(Clone, Copy)]
 pub struct Rows<'a> {
-    master: &'a SheetVec,
+    master: &'a dyn Sheet,
     view: Option<&'a [u32]>,
 }
 
@@ -116,11 +123,13 @@ impl<'a> Rows<'a> {
         self.view.map_or(self.master.len(), |v| v.len())
     }
 
-    pub fn get(&self, row_nr: usize) -> Option<&'a SheetRow> {
-        match self.view {
-            Some(v) => self.master.get(*v.get(row_nr)? as usize),
-            None => self.master.get(row_nr),
-        }
+    /// Value of the cell at displayed row `row_nr`, field index `col`.
+    pub fn cell(&self, row_nr: usize, col: usize) -> Option<Cow<'a, str>> {
+        let position = match self.view {
+            Some(v) => *v.get(row_nr)? as usize,
+            None => row_nr,
+        };
+        self.master.cell(position, col)
     }
 }
 
@@ -129,19 +138,19 @@ impl<'a> Rows<'a> {
 /// - master data if no filter is active
 /// - nothing if a filter is pending but results haven't arrived yet
 pub fn active_sheet_data<'a>(
-    master: &'a HashMap<Filename, SheetVec>,
+    master: &'a HashMap<Filename, Box<dyn Sheet>>,
     filtered: &'a HashMap<(Filename, TabId), View>,
     filename: &str,
     tab_id: TabId,
     filter_active: bool,
 ) -> Rows<'a> {
     use std::sync::LazyLock;
-    static EMPTY: LazyLock<SheetVec> = LazyLock::new(Vec::new);
+    static EMPTY: LazyLock<MemorySheet> = LazyLock::new(MemorySheet::default);
     match (master.get(filename), filtered.get(&(filename.to_string(), tab_id))) {
-        (Some(m), None) if filter_active => Rows { master: m, view: Some(&[]) },
-        (Some(m), None) => Rows { master: m, view: None },
-        (Some(m), Some(v)) => Rows { master: m, view: Some(v) },
-        _ => Rows { master: &EMPTY, view: None },
+        (Some(m), None) if filter_active => Rows { master: m.as_ref(), view: Some(&[]) },
+        (Some(m), None) => Rows { master: m.as_ref(), view: None },
+        (Some(m), Some(v)) => Rows { master: m.as_ref(), view: Some(v) },
+        _ => Rows { master: &*EMPTY, view: None },
     }
 }
 
@@ -158,6 +167,52 @@ pub fn column_position(headers: &[FileHeader], column_id: ColumnId) -> Option<us
 /// `None` if the position is out of range. Inverse of `column_position`.
 pub fn column_id_at(headers: &[FileHeader], position: usize) -> Option<ColumnId> {
     headers.get(position).map(|h| h.id)
+}
+
+/// What a replace-all was asked to do: the rows (None = every row), the
+/// columns by stable id, and the text.
+#[derive(Clone)]
+pub struct ReplaceSpec {
+    pub filename: Filename,
+    pub rows: Option<Arc<Vec<usize>>>,
+    pub col_ids: Vec<ColumnId>,
+    pub find: String,
+    pub replace: String,
+}
+
+/// A replace-all that changed `changed` cells; `token` undoes it (a rule for a
+/// file-backed sheet, the old values for an in-memory one).
+#[derive(Clone)]
+pub struct ReplaceDone {
+    pub spec: ReplaceSpec,
+    pub changed: usize,
+    pub token: ReplacedAll,
+}
+
+/// An undone replace-all, kept for redo: what to do again, and the token the
+/// sheet made the first time (it remembers what it need not work out again).
+#[derive(Clone)]
+pub struct ReplaceRedo {
+    pub spec: ReplaceSpec,
+    pub token: ReplacedAll,
+}
+
+/// A replace-all being worked out in the background (counting what it changes
+/// takes a pass over the file). The owner watches `control` and may cancel.
+pub struct ReplaceJob {
+    pub id: u64,
+    pub spec: ReplaceSpec,
+    pub control: JobControl,
+}
+
+impl ReplaceSpec {
+    fn heap_bytes(&self) -> usize {
+        self.filename.capacity()
+            + self.rows.as_ref().map_or(0, |r| r.capacity() * std::mem::size_of::<usize>())
+            + self.col_ids.capacity() * std::mem::size_of::<ColumnId>()
+            + self.find.capacity()
+            + self.replace.capacity()
+    }
 }
 
 /// One undoable/redoable change. Applying the reverse of an entry (see
@@ -179,17 +234,32 @@ pub enum UndoEntry {
     /// A row with `master_row` was inserted. Undoing removes it again.
     RowInsert { filename: Filename, master_row: usize },
     /// A column was removed at `position` (its index among headers at the
-    /// time of deletion). Undoing re-inserts `header` there and restores
-    /// `values_by_row`, keyed by master_row, into every row's record at that
-    /// position.
+    /// time of deletion). Undoing re-inserts `header` there and hands
+    /// `removed` back to the sheet, which puts the column's data back (what
+    /// that holds is the sheet's business: values for an in-memory sheet, a
+    /// reference to the file column for a file-backed one).
     ColumnDelete {
         filename: Filename,
         position: usize,
         header: FileHeader,
-        values_by_row: Vec<(usize, String)>,
+        removed: RemovedColumn,
     },
-    /// A column with `column_id` was inserted. Undoing removes it again.
-    ColumnInsert { filename: Filename, column_id: ColumnId },
+    /// Remove the column `column_id` (the reverse of `ColumnDelete`, i.e. a
+    /// redo of the user's delete). Producing it hands back a fresh
+    /// `RemovedColumn` for the `ColumnDelete` that undoes it.
+    ColumnRemove { filename: Filename, column_id: ColumnId },
+    /// The user inserted column `column_id`. Undoing takes it out *and* takes
+    /// back the padding it added to short rows, using the sheet's own record
+    /// of what it changed (`inserted`), so the sheet is exactly as before.
+    ColumnUninsert { filename: Filename, column_id: ColumnId, inserted: InsertedColumn },
+    /// Insert an empty column `header` at `position` (the reverse of
+    /// `ColumnUninsert`, i.e. a redo of the user's insert).
+    ColumnAdd { filename: Filename, position: usize, header: FileHeader },
+    /// A replace-all happened. Undoing hands its token back to the sheet.
+    /// (Boxed: this is a big entry, and every entry pays for the biggest.)
+    ReplaceAll(Box<ReplaceDone>),
+    /// Run that replace-all again (the reverse of `ReplaceAll`, i.e. a redo).
+    ReplaceAgain(Box<ReplaceRedo>),
     /// Multiple entries that should undo/redo as one action (e.g. every
     /// cell changed by a single paste or replace-all). Reversing a batch
     /// reverses each entry in reverse order (so entries that depend on
@@ -198,12 +268,49 @@ pub enum UndoEntry {
     Batch(Vec<UndoEntry>),
 }
 
+impl UndoEntry {
+    /// Memory this entry keeps alive (its own size plus heap data), as an
+    /// estimate; the undo history sums these to bound its size.
+    pub fn approx_bytes(&self) -> usize {
+        std::mem::size_of::<Self>() + self.heap_bytes()
+    }
+
+    fn heap_bytes(&self) -> usize {
+        match self {
+            UndoEntry::CellEdit { filename, old_value, .. } => filename.capacity() + old_value.capacity(),
+            UndoEntry::RowDelete { filename, record, .. } => filename.capacity() + row_bytes(record),
+            UndoEntry::RowInsert { filename, .. } | UndoEntry::ColumnRemove { filename, .. } => filename.capacity(),
+            UndoEntry::ColumnDelete { filename, header, removed, .. } => {
+                filename.capacity() + header.name.capacity() + removed.size_bytes()
+            }
+            UndoEntry::ColumnUninsert { filename, inserted, .. } => filename.capacity() + inserted.size_bytes(),
+            UndoEntry::ColumnAdd { filename, header, .. } => filename.capacity() + header.name.capacity(),
+            UndoEntry::ReplaceAll(done) => {
+                std::mem::size_of::<ReplaceDone>() + done.spec.heap_bytes() + done.token.size_bytes()
+            }
+            UndoEntry::ReplaceAgain(redo) => {
+                std::mem::size_of::<ReplaceRedo>() + redo.spec.heap_bytes() + redo.token.size_bytes()
+            }
+            UndoEntry::Batch(entries) => {
+                entries.capacity() * std::mem::size_of::<UndoEntry>() + entries.iter().map(Self::heap_bytes).sum::<usize>()
+            }
+        }
+    }
+}
+
+/// A row held by an undo entry: the record's text and field ends, plus the
+/// fixed part of a `StringRecord` (a boxed header and two vectors).
+fn row_bytes((_, record): &SheetRow) -> usize {
+    const RECORD_FIXED: usize = 96;
+    RECORD_FIXED + record.as_slice().len() + (record.len() + 1) * std::mem::size_of::<usize>()
+}
+
 pub struct MyApp {
     pub picked_path: Option<String>,
     pub loading: bool,
     pub worker_chan: Chan<UiMessage>,
     pub ui_chan: Chan<Ping>,
-    pub sheets_data: HashMap<String, SheetVec>,
+    pub sheets_data: HashMap<String, Box<dyn Sheet>>,
     // Filtered/sorted views keyed by (filename, tab_id). Each tab can show
     // the same master file filtered or sorted differently.
     pub filtered_data: HashMap<(Filename, TabId), View>,
@@ -219,12 +326,17 @@ pub struct MyApp {
     /// Bumped each time a sort/filter is requested for a (filename, tab_id);
     /// used to drop results from superseded background requests.
     pub request_epoch: HashMap<(Filename, TabId), u64>,
+    /// Replace-alls being counted in the background, one per file.
+    pub replace_jobs: HashMap<Filename, ReplaceJob>,
+    pub next_job_id: u64,
     /// Next master_row id to assign when inserting a row into a file. Seeded
     /// from max(existing master_row) + 1 when the file loads.
     pub next_row_id: HashMap<Filename, usize>,
     /// Next column_id to assign when inserting a column into a file. Seeded
     /// from max(existing FileHeader.id) + 1 when the file loads.
     pub next_col_id: HashMap<Filename, ColumnId>,
+    /// Delimiter / header-row layout sniffed at load, reused on save.
+    pub csv_formats: HashMap<Filename, csv_model::CsvFormat>,
     /// Lets an external MCP-driven agent screenshot and control this app for
     /// testing -- see crates/agent_bridge. Polled once per frame; a
     /// no-op unless something writes to its request directory.
@@ -233,7 +345,7 @@ pub struct MyApp {
 
 pub struct CsvTabViewer<'a> {
     pub added_nodes: &'a mut Vec<(SurfaceIndex, NodeIndex, Filename)>,
-    pub promised_data: &'a HashMap<Filename, SheetVec>,
+    pub promised_data: &'a HashMap<Filename, Box<dyn Sheet>>,
     pub filtered_data: &'a HashMap<(Filename, TabId), View>,
     pub ctx: &'a Context,
     pub sender: &'a Sender<UiMessage>,
@@ -249,33 +361,36 @@ pub struct CsvTabViewer<'a> {
 mod tests {
     use super::*;
 
+    fn master_with(rows: &[&str]) -> HashMap<Filename, Box<dyn Sheet>> {
+        let sheet = MemorySheet::new(
+            rows.iter().enumerate().map(|(i, v)| (i, StringRecord::from(vec![*v]))).collect(),
+        );
+        HashMap::from([("f.csv".to_string(), Box::new(sheet) as Box<dyn Sheet>)])
+    }
+
     #[test]
     fn active_sheet_data_prefers_filtered_view_when_present() {
-        let mut master = HashMap::new();
-        master.insert("f.csv".to_string(), vec![(0usize, StringRecord::from(vec!["m"]))]);
+        let master = master_with(&["m", "n"]);
         let mut filtered: HashMap<(Filename, TabId), View> = HashMap::new();
-        master.get_mut("f.csv").unwrap().push((1, StringRecord::from(vec!["n"])));
         filtered.insert(("f.csv".to_string(), 1usize), vec![1u32]);
 
         let data = active_sheet_data(&master, &filtered, "f.csv", 1, true);
         assert_eq!(data.len(), 1);
-        assert_eq!(data.get(0).unwrap().1.get(0), Some("n"));
+        assert_eq!(data.cell(0, 0).as_deref(), Some("n"));
     }
 
     #[test]
     fn active_sheet_data_falls_back_to_master_when_no_filter_active() {
-        let mut master = HashMap::new();
-        master.insert("f.csv".to_string(), vec![(0usize, StringRecord::from(vec!["m"]))]);
+        let master = master_with(&["m"]);
         let filtered = HashMap::new();
 
         let data = active_sheet_data(&master, &filtered, "f.csv", 1, false);
-        assert_eq!(data.get(0).unwrap().1.get(0), Some("m"));
+        assert_eq!(data.cell(0, 0).as_deref(), Some("m"));
     }
 
     #[test]
     fn active_sheet_data_returns_empty_when_filter_pending() {
-        let mut master = HashMap::new();
-        master.insert("f.csv".to_string(), vec![(0usize, StringRecord::from(vec!["m"]))]);
+        let master = master_with(&["m"]);
         let filtered = HashMap::new();
 
         let data = active_sheet_data(&master, &filtered, "f.csv", 1, true);
@@ -316,5 +431,12 @@ mod tests {
 
         let after_delete = vec![header(5, "a"), header(9, "c")];
         assert_eq!(column_position(&after_delete, 9), Some(1));
+    }
+
+    #[test]
+    fn an_undo_entry_stays_small() {
+        // Every entry on the stack is this big whatever it holds, so a variant
+        // that grows it costs every cell edit. Box big payloads.
+        assert!(std::mem::size_of::<UndoEntry>() <= 112, "{}", std::mem::size_of::<UndoEntry>());
     }
 }

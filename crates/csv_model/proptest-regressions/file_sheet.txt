@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 72e521e859be2811949dcd6a02f6040c147be5fd5b31682fc7f40d112b408dda # shrinks to initial = [[","], [""]], ops = [InsertColumn { col: 3, with_values: false }, Save, Replace { picks: [], cols: [0], find: "a", replace: "" }]

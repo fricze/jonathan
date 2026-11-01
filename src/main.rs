@@ -6,6 +6,12 @@ use std::sync::mpsc;
 
 mod app;
 mod menu;
+
+// Memory tests count allocations exactly (see app.rs, `big` tests).
+#[cfg(test)]
+#[global_allocator]
+static ALLOC: csv_model::testing::CountingAlloc = csv_model::testing::CountingAlloc;
+
 mod new_table;
 mod tabs;
 mod toast;
@@ -85,9 +91,12 @@ fn main() -> eframe::Result {
                     global_filter: "".to_string(),
                     filters: HashMap::new(),
                     request_epoch: HashMap::new(),
+                    replace_jobs: HashMap::new(),
+                    next_job_id: 0,
                     history: Default::default(),
                     next_row_id: HashMap::new(),
                     next_col_id: HashMap::new(),
+                    csv_formats: HashMap::new(),
                     agent_bridge: agent_bridge::AgentBridge::new(),
                 }))
             }),

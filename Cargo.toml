@@ -45,3 +45,12 @@ dioxus-devtools = "=0.7.0-rc.0"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 muda = { version = "0.17", features = [] }
+
+# The data engine and the CSV parsers are CPU-bound; optimising them in dev
+# builds keeps the property and budget tests fast. Assertions stay on.
+[profile.dev.package.csv_model]
+opt-level = 3
+[profile.dev.package.csv]
+opt-level = 3
+[profile.dev.package.csv-core]
+opt-level = 3
