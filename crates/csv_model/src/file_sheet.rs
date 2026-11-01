@@ -14,6 +14,7 @@ use std::sync::{Arc, Mutex};
 use csv::StringRecord;
 
 use crate::lean::LeanParser;
+use crate::pieces::Pieces;
 use crate::{
     InsertedColumn, RemovedColumn, RowIndex, RowIndexBuilder, Sheet, SheetRow, SortOrder, View,
     sort_cells,
@@ -378,10 +379,10 @@ pub struct FileSheet {
     /// makes a snapshot share the copies until either side edits one
     /// (`Arc::make_mut` then copies it).
     edited: HashMap<usize, Arc<StringRecord>>,
-    /// Display order as row ids. `None` means untouched: position == id, and
-    /// nothing is stored. The first insert or remove builds `0..n` and every
-    /// later one edits it. Shared with snapshots until either side edits it.
-    order: Option<Arc<Vec<usize>>>,
+    /// Display order, as runs of consecutive row ids (see `pieces.rs`): one
+    /// run for an untouched file, a few more per insert or remove. Shared with
+    /// snapshots until either side edits it.
+    pieces: Arc<Pieces>,
     /// File rows (ids below the row count) that have been removed.
     removed: HashSet<usize>,
     /// The columns as the user sees them. Rows read from the file are mapped
@@ -438,9 +439,11 @@ impl FileSheet {
             builder.feed(&buf[..n]);
             at += n as u64;
         }
+        let index = builder.finish();
+        let row_count = index.len();
         Ok(FileSheet {
             source,
-            index: Arc::new(builder.finish()),
+            index: Arc::new(index),
             delimiter,
             cache: Arc::new(Mutex::new(RowCache {
                 rows: HashMap::new(),
@@ -453,7 +456,7 @@ impl FileSheet {
                 capacity: block_capacity,
             })),
             edited: HashMap::new(),
-            order: None,
+            pieces: Arc::new(Pieces::identity(row_count)),
             removed: HashSet::new(),
             columns: Arc::new(ColumnMap::default()),
             col_version: 0,
@@ -578,18 +581,9 @@ impl FileSheet {
             .any(|c| finder.find(c).is_some())
     }
 
-    /// True while positions are file rows in file order, which lets scans
-    /// read the file front to back (column changes are handled per row).
-    fn scan_is_streamable(&self) -> bool {
-        self.order.is_none()
-    }
-
     /// Row id at display `position`.
     fn id_at(&self, position: usize) -> Option<usize> {
-        match &self.order {
-            Some(order) => order.get(position).copied(),
-            None => (position < self.index.len()).then_some(position),
-        }
+        self.pieces.id_at(position)
     }
 
     /// Whether `id` names a file row that is still part of the sheet and has
@@ -649,13 +643,6 @@ impl FileSheet {
             ColSource::Added(values) => Some(values.get(&id).cloned().unwrap_or_default()),
         }
     }
-
-    /// The order list, built as `0..n` on first use and copied if a
-    /// snapshot still shares it.
-    fn order_mut(&mut self) -> &mut Vec<usize> {
-        let n = self.index.len();
-        Arc::make_mut(self.order.get_or_insert_with(|| Arc::new((0..n).collect())))
-    }
 }
 
 #[cfg(test)]
@@ -664,14 +651,19 @@ impl FileSheet {
         self.cache.lock().unwrap().rows.len()
     }
 
+    /// More than the single run of an untouched file.
     fn order_is_materialized(&self) -> bool {
-        self.order.is_some()
+        !self.pieces.is_identity(self.index.len())
+    }
+
+    fn order_bytes(&self) -> usize {
+        self.pieces.size_bytes()
     }
 }
 
 impl Sheet for FileSheet {
     fn len(&self) -> usize {
-        self.order.as_ref().map_or(self.index.len(), |o| o.len())
+        self.pieces.len()
     }
 
     fn row_id(&self, position: usize) -> Option<usize> {
@@ -679,17 +671,11 @@ impl Sheet for FileSheet {
     }
 
     fn position_of(&self, row_id: usize) -> Option<usize> {
-        match &self.order {
-            Some(order) => order.iter().position(|&id| id == row_id),
-            None => (row_id < self.index.len()).then_some(row_id),
-        }
+        self.pieces.position_of(row_id)
     }
 
     fn next_row_id(&self) -> usize {
-        match &self.order {
-            Some(order) => order.iter().max().map_or(0, |m| m + 1),
-            None => self.index.len(),
-        }
+        self.pieces.next_id()
     }
 
     fn cell(&self, position: usize, col: usize) -> Option<Cow<'_, str>> {
@@ -723,7 +709,7 @@ impl Sheet for FileSheet {
         // undo, so it stays where it is.
         let id = self.id_at(position)?;
         let record = (*self.row_by_id(id)?).clone();
-        self.order_mut().remove(position);
+        Arc::make_mut(&mut self.pieces).remove_at(position);
         self.edited.remove(&id);
         if id < self.index.len() {
             self.removed.insert(id);
@@ -732,9 +718,7 @@ impl Sheet for FileSheet {
     }
 
     fn insert_row(&mut self, position: usize, (id, record): SheetRow) {
-        let order = self.order_mut();
-        let at = position.min(order.len());
-        order.insert(at, id);
+        Arc::make_mut(&mut self.pieces).insert_at(position, id);
         self.edited.insert(id, Arc::new(record));
     }
 
@@ -853,117 +837,102 @@ impl Sheet for FileSheet {
     }
 
     // Scans bypass the shared caches so they cannot evict what the table is
-    // showing. When the order and columns are untouched (the common case: a
-    // file opened, perhaps a few cells edited) they stream the file through a
-    // large window and parse rows with the lean parser; otherwise they go
-    // row by row through the general path.
+    // showing. They walk the display order run by run: each run of consecutive
+    // ids is a stretch of the file that can be read front to back through a
+    // large window, parsed with the lean parser, and (for filter) searched as
+    // raw bytes first. Rows held in memory are judged from memory instead.
     fn filter(&self, needle: &str) -> View {
         if needle.is_empty() {
             return (0..self.len() as u32).collect();
         }
-        if !self.scan_is_streamable() {
-            return (0..self.len())
-                .filter(|&p| {
-                    self.load_row(p)
-                        .is_some_and(|r| r.iter().any(|c| c.contains(needle)))
-                })
-                .map(|p| p as u32)
-                .collect();
-        }
         let finder = memchr::memmem::Finder::new(needle.as_bytes());
         // A field's text appears verbatim in the row's bytes unless it contains
         // a quote (stored doubled), so a needle without one can rule out a row
-        // by searching bytes alone, no parsing.
+        // by searching bytes alone, no parsing. Added columns hold values that
+        // are not in the bytes at all.
         let prefilter = !needle.as_bytes().contains(&b'"') && !self.columns.has_added_values();
+        // One search per window of many rows is sound when a match cannot span
+        // two rows, i.e. the needle has no line break.
+        let by_window = prefilter && !needle.as_bytes().iter().any(|&b| b == b'\n' || b == b'\r');
+        let mut edited_ids: Vec<usize> = self.edited.keys().copied().collect();
+        edited_ids.sort_unstable();
+        let file_rows = self.index.len();
         let mut parser = LeanParser::new(self.delimiter);
         let mut hits = View::new();
-        if prefilter && !needle.as_bytes().iter().any(|&b| b == b'\n' || b == b'\r') {
-            // One search per window of many rows. A match cannot span two rows
-            // (the needle has no line break), so each match lies in one row;
-            // only those rows are parsed to check a *field* contains it.
-            let mut buf = Vec::new();
-            let mut row = 0usize;
-            while row < self.index.len() {
-                let first = self.index.row_range(row).unwrap();
-                let target = first.start + SCAN_WINDOW;
-                let last = self
-                    .index
-                    .row_at_offset(target.min(self.index.total_len() - 1))
-                    .unwrap_or(row);
-                let last = if last < row || target >= self.index.total_len() {
-                    self.index.len() - 1
-                } else {
-                    last
-                };
-                let end = self.index.row_range(last).unwrap().end;
-                buf.resize((end - first.start) as usize, 0);
-                if !self.read_exact_at(first.start, &mut buf) {
-                    break; // the file went away; report what was found so far
-                }
-                let mut at = 0usize;
-                while let Some(found) = finder.find(&buf[at..]) {
-                    let offset = first.start + (at + found) as u64;
-                    let Some(r) = self.index.row_at_offset(offset) else {
-                        break;
+        for (start, run) in self.pieces.runs() {
+            let first_hit = hits.len();
+            let position = |id: usize| (start + id - run.first) as u32;
+            let file_end = (run.first + run.len).min(file_rows);
+            if by_window {
+                let mut buf = Vec::new();
+                let mut row = run.first;
+                while row < file_end {
+                    // The window: whole rows from `row` up to about SCAN_WINDOW bytes.
+                    let first = self.index.row_range(row).unwrap();
+                    let target = first.start + SCAN_WINDOW;
+                    let last = match self
+                        .index
+                        .row_at_offset(target.min(self.index.total_len() - 1))
+                    {
+                        Some(last) if target < self.index.total_len() => last,
+                        _ => file_rows - 1,
                     };
-                    let range = self.index.row_range(r).unwrap();
-                    if !self.edited.contains_key(&r) {
-                        let bytes = &buf[(range.start - first.start) as usize
-                            ..(range.end - first.start) as usize];
-                        if self.fields_contain(&mut parser, bytes, r, &finder) {
-                            hits.push(r as u32);
+                    let last = last.clamp(row, file_end - 1);
+                    let end = self.index.row_range(last).unwrap().end;
+                    buf.resize((end - first.start) as usize, 0);
+                    if !self.read_exact_at(first.start, &mut buf) {
+                        break; // the file went away; report what was found so far
+                    }
+                    let mut at = 0usize;
+                    while let Some(found) = finder.find(&buf[at..]) {
+                        let offset = first.start + (at + found) as u64;
+                        let Some(id) = self.index.row_at_offset(offset) else {
+                            break;
+                        };
+                        let range = self.index.row_range(id).unwrap();
+                        if !self.edited.contains_key(&id) {
+                            let bytes = &buf[(range.start - first.start) as usize
+                                ..(range.end - first.start) as usize];
+                            if self.fields_contain(&mut parser, bytes, id, &finder) {
+                                hits.push(position(id));
+                            }
                         }
+                        at = (range.end - first.start) as usize; // next row onward
                     }
-                    at = (range.end - first.start) as usize; // next row onward
+                    row = last + 1;
                 }
-                row = last + 1;
-            }
-            // Edited rows are judged by their edited text, never by the file's.
-            hits.extend(
-                self.edited
-                    .iter()
-                    .filter(|(_, rec)| rec.iter().any(|c| c.contains(needle)))
-                    .map(|(&id, _)| id as u32),
-            );
-            hits.sort_unstable();
-            hits.dedup();
-            return hits;
-        }
-        let mut window = ScanWindow::new();
-        for p in 0..self.index.len() {
-            let hit = match self.edited.get(&p) {
-                Some(row) => row.iter().any(|c| c.contains(needle)),
-                None => match self.index.row_range(p).and_then(|r| window.get(self, r)) {
-                    Some(bytes) if !prefilter || finder.find(bytes).is_some() => {
-                        self.fields_contain(&mut parser, bytes, p, &finder)
+            } else {
+                let mut window = ScanWindow::new();
+                for id in run.first..file_end {
+                    if self.edited.contains_key(&id) {
+                        continue;
                     }
-                    _ => false,
-                },
-            };
-            if hit {
-                hits.push(p as u32);
+                    let hit = match self.index.row_range(id).and_then(|r| window.get(self, r)) {
+                        Some(bytes) if !prefilter || finder.find(bytes).is_some() => {
+                            self.fields_contain(&mut parser, bytes, id, &finder)
+                        }
+                        _ => false,
+                    };
+                    if hit {
+                        hits.push(position(id));
+                    }
+                }
             }
+            // Rows held in memory (edited, inserted, put back) are judged by
+            // their own text, never by the file's.
+            let lo = edited_ids.partition_point(|&id| id < run.first);
+            let hi = edited_ids.partition_point(|&id| id < run.first + run.len);
+            for &id in &edited_ids[lo..hi] {
+                if self.edited[&id].iter().any(|c| c.contains(needle)) {
+                    hits.push(position(id));
+                }
+            }
+            hits[first_hit..].sort_unstable();
         }
         hits
     }
 
     fn sort(&self, view: View, sort_by: (usize, SortOrder)) -> View {
-        if !self.scan_is_streamable() {
-            let texts: Vec<(String, u32)> = view
-                .into_iter()
-                .map(|p| {
-                    let text = self
-                        .load_row(p as usize)
-                        .and_then(|r| r.get(sort_by.0).map(str::to_string))
-                        .unwrap_or_default();
-                    (text, p)
-                })
-                .collect();
-            return sort_cells(
-                texts.iter().map(|(t, p)| (t.as_str(), *p)).collect(),
-                sort_by.1,
-            );
-        }
         // Copy the sort column's text into one arena (one allocation, not one
         // per row), then sort `(text, position)` pairs borrowed from it.
         let mut window = ScanWindow::new();
@@ -972,23 +941,25 @@ impl Sheet for FileSheet {
         let mut spans = Vec::with_capacity(view.len());
         for p in view {
             let start = arena.len();
-            match self.edited.get(&(p as usize)) {
-                Some(row) => arena.push_str(row.get(sort_by.0).unwrap_or("")),
-                None => {
-                    let fields = self
-                        .index
-                        .row_range(p as usize)
-                        .and_then(|r| window.get(self, r))
-                        .and_then(|bytes| parser.parse(bytes));
-                    if let Some(fields) = fields {
-                        let cell = if self.columns.is_identity() {
-                            fields.get(sort_by.0)
-                        } else {
-                            let stored: Vec<&[u8]> = fields.iter().collect();
-                            self.columns.logical_field(p as usize, &stored, sort_by.0)
-                        };
-                        if let Some(cell) = cell {
-                            arena.push_str(&String::from_utf8_lossy(cell));
+            if let Some(id) = self.id_at(p as usize) {
+                match self.edited.get(&id) {
+                    Some(row) => arena.push_str(row.get(sort_by.0).unwrap_or("")),
+                    None => {
+                        let fields = self
+                            .index
+                            .row_range(id)
+                            .and_then(|r| window.get(self, r))
+                            .and_then(|bytes| parser.parse(bytes));
+                        if let Some(fields) = fields {
+                            let cell = if self.columns.is_identity() {
+                                fields.get(sort_by.0)
+                            } else {
+                                let stored: Vec<&[u8]> = fields.iter().collect();
+                                self.columns.logical_field(id, &stored, sort_by.0)
+                            };
+                            if let Some(cell) = cell {
+                                arena.push_str(&String::from_utf8_lossy(cell));
+                            }
                         }
                     }
                 }
@@ -1588,6 +1559,44 @@ mod tests {
                 "needle {needle:?}"
             );
         }
+    }
+
+    #[test]
+    fn filter_and_sort_after_deletes_report_positions_in_the_new_order() {
+        // Runs far shorter than a scan window: the search must stop at the end
+        // of each run, not carry on into the rows after a deleted one.
+        let mut rows = big_rows(30_000);
+        let mut sheet = big_sheet(&rows);
+        for pos in [20_000usize, 7, 29_000, 15_000, 15_000, 3] {
+            // the same deletions, applied to the sheet and the naive copy
+            if pos < rows.len() {
+                sheet.remove_row(pos).unwrap();
+                rows.remove(pos);
+            }
+        }
+        assert_eq!(sheet.len(), rows.len());
+        for needle in [
+            "user3",
+            "city96",
+            "comma 4421",
+            "x",
+            "say \"7\"",
+            "0,",
+            "zzz",
+        ] {
+            assert_eq!(
+                sheet.filter(needle),
+                naive_filter(&rows, needle),
+                "needle {needle:?}"
+            );
+        }
+        let view: View = (0..rows.len() as u32).collect();
+        let sorted = sheet.sort(view, (0, SortOrder::Dsc));
+        let want: Vec<u32> = (0..rows.len() as u32).rev().collect();
+        assert_eq!(
+            sorted, want,
+            "ids are numeric, so descending is the reverse of the order"
+        );
     }
 
     #[test]

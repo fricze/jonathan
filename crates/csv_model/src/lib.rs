@@ -7,6 +7,7 @@ use csv::StringRecord;
 
 mod file_sheet;
 mod lean;
+mod pieces;
 mod row_index;
 mod sheet;
 pub mod testing;

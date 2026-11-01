@@ -217,7 +217,31 @@ fn memory_index_is_at_most_a_quarter_byte_per_row() {
 }
 
 #[test]
-#[ignore = "pending: persistent piece table (design 4.2)"]
+fn memory_one_row_delete_allocates_kilobytes_whatever_the_file_size() {
+    let _g = serial();
+    for n in [30_000usize, 300_000] {
+        let (mut sheet, _src) = open(csv_bytes(n));
+        // Warm the read caches so only the delete itself is measured.
+        let _ = (sheet.cell(n / 2, 0), sheet.cell(n / 3, 0));
+        let (row, m) = measure(|| sheet.remove_row(n / 2).unwrap());
+        drop(row);
+        check_le(
+            &format!("first row delete, bytes allocated (file {n} rows)"),
+            m.allocated as f64,
+            8.0 * 1024.0,
+            "bytes",
+        );
+        let (_, m) = measure(|| sheet.remove_row(n / 3).unwrap());
+        check_le(
+            &format!("second row delete, bytes allocated (file {n} rows)"),
+            m.allocated as f64,
+            8.0 * 1024.0,
+            "bytes",
+        );
+    }
+}
+
+#[test]
 fn memory_row_insert_and_remove_do_not_scale_with_file_size() {
     let _g = serial();
     let mut cost = Vec::new();
